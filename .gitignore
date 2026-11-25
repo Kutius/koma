@@ -1,0 +1,8 @@
+/build/
+/.mygo/
+/scratch/
+mygo_windows_*.syso
+*.exe
+*.syso
+.DS_Store
+Thumbs.db
