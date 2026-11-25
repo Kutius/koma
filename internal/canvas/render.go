@@ -29,6 +29,17 @@ func CloneRGBA(src *image.RGBA) *image.RGBA {
 	return dst
 }
 
+// HasRasterAnnotations reports whether anns contains any pixel-modifying effect
+// (Pixelate, Blur, Spotlight) that requires baking into a raster bitmap.
+func HasRasterAnnotations(anns []Annotation) bool {
+	for _, a := range anns {
+		if a.Kind == ToolPixelate || a.Kind == ToolBlur || a.Kind == ToolSpotlight {
+			return true
+		}
+	}
+	return false
+}
+
 // RenderRasterEffects applies all pixel-level annotations (Pixelate, Blur,
 // Spotlight) onto a copy of base. Used both for live canvas caching and export.
 func RenderRasterEffects(base *image.RGBA, anns []Annotation) *image.RGBA {

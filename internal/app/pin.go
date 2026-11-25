@@ -15,23 +15,39 @@ import (
 )
 
 // PinWindow represents a frameless, always-on-top floating screenshot card pinned on the desktop.
+// It retains only compressed PNG bytes on the CPU and releases decoded CPU pixels after the GPU
+// uploads its texture, cutting per-pin RAM from 15-35 MB to ~200-500 KB.
 type PinWindow struct {
-	app      *App
-	win      *mygo.Window
-	img      *image.RGBA
-	bmp      *ui.Bitmap
-	baseW    float64
-	baseH    float64
-	scale    float64
-	opacity  float64
-	hudText  string
-	hudUntil time.Time
+	app            *App
+	win            *mygo.Window
+	pngBytes       []byte
+	bmp            *ui.Bitmap
+	drawnFrames    int
+	pixelsReleased bool
+	baseW          float64
+	baseH          float64
+	scale          float64
+	opacity        float64
+	hudText        string
+	hudUntil       time.Time
 }
 
 // OpenPin spawns a frameless, always-on-top floating screenshot card at (x, y) in DIPs.
 func (a *App) OpenPin(img *image.RGBA, x, y int, scaleFactor float64) {
+	a.OpenPinWithPNG(img, nil, x, y, scaleFactor)
+}
+
+// OpenPinWithPNG spawns a floating pin window reusing pre-encoded PNG bytes when available.
+func (a *App) OpenPinWithPNG(img *image.RGBA, pngBytes []byte, x, y int, scaleFactor float64) {
 	if img == nil {
 		return
+	}
+	if len(pngBytes) == 0 {
+		var err error
+		pngBytes, err = canvas.EncodePNG(img)
+		if err != nil {
+			return
+		}
 	}
 	if scaleFactor <= 0 {
 		scaleFactor = 1.0
@@ -53,14 +69,19 @@ func (a *App) OpenPin(img *image.RGBA, x, y int, scaleFactor float64) {
 		dipH *= fit
 	}
 
+	bmp, err := ui.DecodeBitmap(pngBytes)
+	if err != nil || bmp == nil {
+		bmp = ui.NewBitmap(img)
+	}
+
 	pw := &PinWindow{
-		app:     a,
-		img:     canvas.CloneRGBA(img),
-		bmp:     ui.NewBitmap(img),
-		baseW:   dipW,
-		baseH:   dipH,
-		scale:   1.0,
-		opacity: 1.0,
+		app:      a,
+		pngBytes: pngBytes,
+		bmp:      bmp,
+		baseW:    dipW,
+		baseH:    dipH,
+		scale:    1.0,
+		opacity:  1.0,
 	}
 
 	w := mygo.NewWindow(mygo.WindowOptions{
@@ -90,10 +111,11 @@ func (a *App) OpenPin(img *image.RGBA, x, y int, scaleFactor float64) {
 			}
 		}
 		a.mu.Unlock()
-		pw.img = nil
+		pw.pngBytes = nil
 		pw.bmp = nil
 		pw.win = nil
 		reclaimMemoryAsync()
+		a.scheduleTrayTrim()
 	})
 }
 
@@ -147,8 +169,8 @@ func (p *PinWindow) applyOpacityDelta(delta float64) {
 }
 
 func (p *PinWindow) copyImage() {
-	if pngBytes, err := canvas.EncodePNG(p.img); err == nil {
-		_ = mygo.Clipboard.WriteImage(pngBytes)
+	if len(p.pngBytes) > 0 {
+		_ = mygo.Clipboard.WriteImage(p.pngBytes)
 		p.flashHUD("已复制到剪贴板")
 	}
 }
@@ -221,6 +243,14 @@ func (p *PinWindow) view(c *ui.Context) {
 		card.Draw(func(pt *ui.Painter, r ui.Rect) {
 			if p.bmp != nil {
 				pt.Image(p.bmp, r, ui.FillBox)
+				if pt.Accelerated() && !p.pixelsReleased {
+					if p.drawnFrames >= 1 {
+						p.bmp.ReleasePixels()
+						p.pixelsReleased = true
+					} else {
+						p.drawnFrames++
+					}
+				}
 			}
 			rimCol := ui.RGBA(0, 0, 0, 0.22)
 			if hovered {
@@ -259,7 +289,9 @@ func (p *PinWindow) view(c *ui.Context) {
 					p.copyImage()
 				}
 				if pinIconBtn(c, icons.Pen, "在工作台编辑", false) {
-					p.app.OpenImageInEditor(p.img, "贴图编辑")
+					if img := decodeImageRGBA(p.pngBytes); img != nil {
+						p.app.OpenImageInEditor(img, "贴图编辑")
+					}
 				}
 				if pinIconBtn(c, icons.Close, "关闭 (Esc / 右键)", true) {
 					if p.win != nil {

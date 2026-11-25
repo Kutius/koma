@@ -58,7 +58,7 @@ go tool mygo build
 
 Build outputs:
 - `build/windows-amd64/Koma.exe` (standalone native executable)
-- `build/windows-amd64/koma-setup-0.1.0-amd64.exe` (Windows installer)
+- `build/windows-amd64/koma-setup-0.1.1-amd64.exe` (Windows installer)
 
 ---
 
@@ -129,7 +129,8 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 - **Seamless gradients**: When calling `pt.FillRadialGradient`, always draw over the full canvas rect `r` with normalized `Center` (`0..1`) and generous `Radius` to avoid rectangular clip seams.
 
 ### 4.5 Memory Management (`app.go`, `overlay.go`, `editor.go`, `pin.go`)
-- **History**: Store screenshots as compressed `PNG []byte` (capped at `maxHistoryEntries = 12`) and decode on demand via `HistoryEntry.DecodeImage()`. Never store raw uncompressed `*image.RGBA` in history.
+- See [docs/performance.md](docs/performance.md) for Koma's overarching performance & memory engineering principles (4-layer memory model, window-as-resource-scope, image cold/hot tiering, render hot-path hygiene, and OS/FFI boundary rules).
+- **History**: Store screenshots as compressed `PNG []byte` (capped at `maxHistoryEntries = 12` and `maxHistoryBytes = 24 MiB`) and decode on demand via `HistoryEntry.DecodeImage()`. Never store raw uncompressed `*image.RGBA` in history.
 - **Undo stack**: Share the immutable `e.baseImg` pointer across annotation undo snapshots (`pushUndo`); only `applyCrop` allocates a new `*image.RGBA`. Keep undo stacks capped at `24`.
 - **Release on close**: Clear `bmp`, `pixBmp`, `selEffectBmp`, `capture.Image`, `img` references in `overlaySession.closeAll()`, `PinWindow` `OnClosed`, and `EditorState.ClearDocument()`, followed by `reclaimMemoryAsync()` (`runtime.GC()` + `debug.FreeOSMemory()`).
 
@@ -150,4 +151,4 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 
 1. Run `go test -v -count=1 ./...` and ensure all packages (`koma`, `canvas`, `glasswork`, `winapi`) pass.
 2. When modifying UI, shaders, icons, or layout, dump previews via `KOMA_PREVIEW_DIR` and visually inspect the rendered PNGs (`Home`, `QQ overlay`, `100% fullscreen overlay`, `Studio`) to check contrast, alignment, icon z-order, and absence of border/clip artifacts.
-3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.1.0-amd64.exe` compile cleanly.
+3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.1.1-amd64.exe` compile cleanly.

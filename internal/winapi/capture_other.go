@@ -35,3 +35,4 @@ func CapturePrimaryMonitor() (*image.RGBA, Monitor, error) {
 	return nil, Monitor{}, errors.New("unsupported platform")
 }
 func ListVisibleWindows() []WindowInfo { return nil }
+func TrimWorkingSet()                  {}

@@ -2,6 +2,7 @@ package glasswork
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/egoist/mygo/ui"
 	"github.com/egoist/mygo/ui/shader"
@@ -298,6 +299,10 @@ var (
 	uPressPos      = liquidGlassShader.Uniform("PressPos")
 	uPressAmt      = liquidGlassShader.Uniform("PressAmt")
 	uPressSpread   = liquidGlassShader.Uniform("PressSpread")
+
+	liquidGlassValuesPool = sync.Pool{
+		New: func() any { return liquidGlassShader.NewValues() },
+	}
 )
 
 // Preset distinguishes interactive optical pills/toolbars, frosted content cards, and tinted CTA glass.
@@ -666,8 +671,9 @@ func paintOptical(p *ui.Painter, box ui.Rect, radii [4]float32, is interactiveSu
 	pressLocalX := is.pressX - box.W*0.5
 	pressLocalY := is.pressY - box.H*0.5
 
-	// 2. Render physical Liquid Glass GPU shader!
-	vals := liquidGlassShader.NewValues()
+	// 2. Render physical Liquid Glass GPU shader (reusing pooled Values — Draw copies immediately).
+	vals := liquidGlassValuesPool.Get().(*shader.Values)
+	defer liquidGlassValuesPool.Put(vals)
 	vals.Float(uRadius, rad)
 	vals.Float(uMode, mode)
 	vals.Float(uIsDark, isDark)

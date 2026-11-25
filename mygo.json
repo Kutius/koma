@@ -1,7 +1,7 @@
 {
   "name": "Koma",
   "identifier": "app.koma.capture",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "out": "build",
   "windows": {
     "console": false

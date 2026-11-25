@@ -5,6 +5,7 @@ package winapi
 import (
 	"fmt"
 	"image"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -38,8 +39,10 @@ var (
 	procGetWindowTextLengthW   = user32.NewProc("GetWindowTextLengthW")
 	procGetWindowThreadProcess = user32.NewProc("GetWindowThreadProcessId")
 	procGetWindowLongPtrW      = user32.NewProc("GetWindowLongPtrW")
-	procGetCurrentProcessId    = kernel32.NewProc("GetCurrentProcessId")
-	procDwmGetWindowAttribute  = dwmapi.NewProc("DwmGetWindowAttribute")
+	procGetCurrentProcessId      = kernel32.NewProc("GetCurrentProcessId")
+	procGetCurrentProcess        = kernel32.NewProc("GetCurrentProcess")
+	procSetProcessWorkingSetSize = kernel32.NewProc("SetProcessWorkingSetSize")
+	procDwmGetWindowAttribute    = dwmapi.NewProc("DwmGetWindowAttribute")
 )
 
 const (
@@ -110,32 +113,53 @@ type MonitorCapture struct {
 	Image   *image.RGBA // 0,0 .. W,H in physical pixels
 }
 
+var (
+	enumMonitorsOnce sync.Once
+	enumMonitorsCB   uintptr
+	enumMonitorsMu   sync.Mutex
+	enumMonitorsOut  *[]Monitor
+)
+
+func initEnumMonitorsCB() {
+	enumMonitorsOnce.Do(func() {
+		enumMonitorsCB = syscall.NewCallback(func(hMon, hdc uintptr, lprc *winRect, lParam uintptr) uintptr {
+			out := enumMonitorsOut
+			if out == nil {
+				return 1
+			}
+			var mi monitorInfoEx
+			mi.CbSize = uint32(unsafe.Sizeof(mi))
+			ret, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi)))
+			if ret == 0 {
+				return 1
+			}
+			dpi := 96
+			var dpiX, dpiY uint32
+			if r, _, _ := procGetDpiForMonitor.Call(hMon, mdtEffective, uintptr(unsafe.Pointer(&dpiX)), uintptr(unsafe.Pointer(&dpiY))); r == 0 && dpiX > 0 {
+				dpi = int(dpiX)
+			}
+			*out = append(*out, Monitor{
+				Handle:  hMon,
+				Bounds:  image.Rect(int(mi.RcMonitor.Left), int(mi.RcMonitor.Top), int(mi.RcMonitor.Right), int(mi.RcMonitor.Bottom)),
+				Work:    image.Rect(int(mi.RcWork.Left), int(mi.RcWork.Top), int(mi.RcWork.Right), int(mi.RcWork.Bottom)),
+				DPI:     dpi,
+				Scale:   float64(dpi) / 96.0,
+				Primary: (mi.DwFlags & monitorPrimary) != 0,
+			})
+			return 1
+		})
+	})
+}
+
 // ListMonitors enumerates all active monitors with physical pixel rects and DPI.
 func ListMonitors() []Monitor {
+	initEnumMonitorsCB()
+	enumMonitorsMu.Lock()
 	var mons []Monitor
-	cb := syscall.NewCallback(func(hMon, hdc uintptr, lprc *winRect, lParam uintptr) uintptr {
-		var mi monitorInfoEx
-		mi.CbSize = uint32(unsafe.Sizeof(mi))
-		ret, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi)))
-		if ret == 0 {
-			return 1
-		}
-		dpi := 96
-		var dpiX, dpiY uint32
-		if r, _, _ := procGetDpiForMonitor.Call(hMon, mdtEffective, uintptr(unsafe.Pointer(&dpiX)), uintptr(unsafe.Pointer(&dpiY))); r == 0 && dpiX > 0 {
-			dpi = int(dpiX)
-		}
-		mons = append(mons, Monitor{
-			Handle:  hMon,
-			Bounds:  image.Rect(int(mi.RcMonitor.Left), int(mi.RcMonitor.Top), int(mi.RcMonitor.Right), int(mi.RcMonitor.Bottom)),
-			Work:    image.Rect(int(mi.RcWork.Left), int(mi.RcWork.Top), int(mi.RcWork.Right), int(mi.RcWork.Bottom)),
-			DPI:     dpi,
-			Scale:   float64(dpi) / 96.0,
-			Primary: (mi.DwFlags & monitorPrimary) != 0,
-		})
-		return 1
-	})
-	procEnumDisplayMonitors.Call(0, 0, cb, 0)
+	enumMonitorsOut = &mons
+	procEnumDisplayMonitors.Call(0, 0, enumMonitorsCB, 0)
+	enumMonitorsOut = nil
+	enumMonitorsMu.Unlock()
 	return mons
 }
 
@@ -261,4 +285,16 @@ func CapturePrimaryMonitor() (*image.RGBA, Monitor, error) {
 	b := VirtualDesktopBounds()
 	img, err := CaptureRect(b)
 	return img, Monitor{Bounds: b, Work: b, DPI: 96, Scale: 1, Primary: true}, err
+}
+
+// TrimWorkingSet asks Windows to trim idle pages from the current process's
+// working set (SetProcessWorkingSetSize(-1, -1)). Call only when the app is
+// idle in the system tray with no open windows.
+func TrimWorkingSet() {
+	hProc, _, _ := procGetCurrentProcess.Call()
+	if hProc == 0 {
+		return
+	}
+	negOne := ^uintptr(0)
+	procSetProcessWorkingSetSize.Call(hProc, negOne, negOne)
 }

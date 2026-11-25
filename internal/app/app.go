@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/draw"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
@@ -22,7 +23,10 @@ import (
 	"koma/internal/winapi"
 )
 
-const maxHistoryEntries = 12
+const (
+	maxHistoryEntries = 12
+	maxHistoryBytes   = 24 << 20 // 24 MiB cap across retained compressed history PNGs
+)
 
 // HistoryEntry keeps a compressed PNG screenshot and a small thumbnail in session memory
 // so repeated captures keep RAM footprint tiny (~200-500 KB per capture instead of 15-35 MB).
@@ -38,14 +42,7 @@ type HistoryEntry struct {
 
 // DecodeImage decodes the compressed history PNG back into an *image.RGBA on demand.
 func (h HistoryEntry) DecodeImage() *image.RGBA {
-	if len(h.PNG) == 0 {
-		return nil
-	}
-	img, _, err := image.Decode(bytes.NewReader(h.PNG))
-	if err != nil {
-		return nil
-	}
-	return toRGBA(img)
+	return decodeImageRGBA(h.PNG)
 }
 
 // App coordinates Koma's Studio window, system tray, global shortcuts,
@@ -60,6 +57,7 @@ type App struct {
 	activeOverlay *overlaySession
 	pins          []*PinWindow
 	editor        *EditorState
+	trayTrimTimer *time.Timer
 
 	history       []HistoryEntry
 	nextHistoryID int
@@ -104,7 +102,17 @@ func (a *App) Run() error {
 		a.SyncOpenAtLogin()
 		a.setupTray()
 		a.setupGlobalShortcuts()
-		a.openEditorWindow()
+		a.SyncWindowTheme()
+		// When launched silently at Windows login, stay tray-only without creating a
+		// window or initializing the Direct3D 11 device until the user opens Studio.
+		if !mygo.App.WasOpenedAtLogin() {
+			a.openEditorWindow()
+		} else {
+			a.mu.Lock()
+			a.editorHidden = true
+			a.mu.Unlock()
+			a.scheduleTrayTrim()
+		}
 	})
 
 	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
@@ -203,15 +211,24 @@ func (a *App) setupGlobalShortcuts() {
 	a.reregisterAllGlobalShortcuts()
 }
 
-func (a *App) openEditorWindow() {
-	startHidden := mygo.App.WasOpenedAtLogin()
+func (a *App) openEditorWindow() *mygo.Window {
+	a.mu.Lock()
+	if a.editorWin != nil {
+		w := a.editorWin
+		a.editorHidden = false
+		a.mu.Unlock()
+		return w
+	}
+	a.mu.Unlock()
+
+	a.editor.RestoreFromTray()
+
 	w := mygo.NewWindow(mygo.WindowOptions{
 		Title:          "Koma",
 		Width:          1220,
 		Height:         780,
 		MinWidth:       920,
 		MinHeight:      580,
-		Hidden:         startHidden,
 		TitleBarStyle:  mygo.TitleBarHidden,
 		TitleBarHeight: 44,
 		StateKey:       "koma-studio-v1",
@@ -219,31 +236,51 @@ func (a *App) openEditorWindow() {
 	})
 	a.mu.Lock()
 	a.editorWin = w
-	a.editorHidden = startHidden
+	a.editorHidden = false
 	a.mu.Unlock()
 
 	a.SyncWindowTheme()
 
-	w.OnClose(func(e *mygo.CloseEvent) {
+	// Allow the Studio window to truly close instead of staying hidden with a live
+	// D3D11 swap chain and shared GPU device; OnWindowAllClosed keeps Koma alive
+	// in the system tray, and ensureEditorWindow recreates Studio on demand.
+	w.OnClosed(func() {
 		a.mu.Lock()
+		isCurrent := a.editorWin == w
 		quitting := a.quitting
-		hasTray := a.tray != nil
-		a.mu.Unlock()
-		if !quitting && hasTray {
-			e.PreventDefault()
-			w.Hide()
-			a.mu.Lock()
+		if isCurrent {
+			a.editorWin = nil
 			a.editorHidden = true
-			a.mu.Unlock()
+		}
+		a.mu.Unlock()
+		if isCurrent && !quitting {
+			a.editor.ParkForTray()
+			reclaimMemoryAsync()
+			a.scheduleTrayTrim()
 		}
 	})
+	return w
 }
 
-// Quit exits Koma cleanly, bypassing hide-to-tray interception and closing overlays/pins.
+func (a *App) ensureEditorWindow() *mygo.Window {
+	a.mu.Lock()
+	w := a.editorWin
+	a.mu.Unlock()
+	if w != nil {
+		return w
+	}
+	if !mygo.App.IsReady() {
+		return nil
+	}
+	return a.openEditorWindow()
+}
+
+// Quit exits Koma cleanly, closing Studio, overlays, and pins.
 func (a *App) Quit() {
 	a.mu.Lock()
 	a.quitting = true
 	ov := a.activeOverlay
+	edWin := a.editorWin
 	pins := append([]*PinWindow(nil), a.pins...)
 	a.mu.Unlock()
 
@@ -254,6 +291,9 @@ func (a *App) Quit() {
 		if p.win != nil {
 			p.win.Close()
 		}
+	}
+	if edWin != nil {
+		edWin.Close()
 	}
 	mygo.App.Quit()
 }
@@ -270,8 +310,10 @@ func (a *App) SyncWindowTheme() {
 	if dark {
 		src = mygo.ThemeDark
 	}
-	if w != nil {
+	if mygo.App.IsReady() {
 		mygo.Theme.SetSource(src)
+	}
+	if w != nil {
 		w.SetWindowButtonsTheme(src)
 	}
 }
@@ -296,8 +338,8 @@ func (a *App) SetDarkMode(dark bool) {
 // ShowSettings brings Studio to the front and opens the Liquid Glass Settings sheet.
 func (a *App) ShowSettings() {
 	a.SyncOpenAtLogin()
+	w := a.ensureEditorWindow()
 	a.mu.Lock()
-	w := a.editorWin
 	a.editorHidden = false
 	a.mu.Unlock()
 	if w != nil {
@@ -311,19 +353,64 @@ func (a *App) ShowSettings() {
 	}
 }
 
-// reclaimMemoryAsync returns released screenshot buffers promptly to the OS.
+var (
+	reclaimMu    sync.Mutex
+	reclaimTimer *time.Timer
+)
+
+// reclaimMemoryAsync returns released screenshot buffers promptly to the OS,
+// coalescing rapid consecutive triggers into a single GC + FreeOSMemory pass.
 func reclaimMemoryAsync() {
-	go func() {
-		time.Sleep(180 * time.Millisecond)
+	reclaimMu.Lock()
+	if reclaimTimer != nil {
+		reclaimTimer.Reset(180 * time.Millisecond)
+		reclaimMu.Unlock()
+		return
+	}
+	reclaimTimer = time.AfterFunc(180*time.Millisecond, func() {
+		reclaimMu.Lock()
+		reclaimTimer = nil
+		reclaimMu.Unlock()
 		runtime.GC()
 		debug.FreeOSMemory()
-	}()
+	})
+	reclaimMu.Unlock()
 }
 
-// ShowEditor brings the Koma Studio window to the front.
-func (a *App) ShowEditor() {
+// scheduleTrayTrim schedules a debounced OS working-set trim once all windows
+// have closed and Koma is resting idle in the system tray. If any window opens
+// before the timer fires, the trim is skipped so active UI never stalls.
+func (a *App) scheduleTrayTrim() {
+	const delay = 1200 * time.Millisecond
 	a.mu.Lock()
-	w := a.editorWin
+	if a.quitting {
+		a.mu.Unlock()
+		return
+	}
+	if a.trayTrimTimer != nil {
+		a.trayTrimTimer.Reset(delay)
+		a.mu.Unlock()
+		return
+	}
+	a.trayTrimTimer = time.AfterFunc(delay, func() {
+		a.mu.Lock()
+		a.trayTrimTimer = nil
+		idleInTray := !a.quitting && a.editorWin == nil && a.activeOverlay == nil && len(a.pins) == 0
+		a.mu.Unlock()
+		if !idleInTray {
+			return
+		}
+		runtime.GC()
+		debug.FreeOSMemory()
+		winapi.TrimWorkingSet()
+	})
+	a.mu.Unlock()
+}
+
+// ShowEditor brings the Koma Studio window to the front, recreating it if closed to tray.
+func (a *App) ShowEditor() {
+	w := a.ensureEditorWindow()
+	a.mu.Lock()
 	a.editorHidden = false
 	a.mu.Unlock()
 	if w != nil {
@@ -410,14 +497,15 @@ func (a *App) OpenImageInEditorWithAnnotations(img *image.RGBA, anns []canvas.An
 	if img == nil {
 		return
 	}
-	a.AddHistoryEntry(img, title)
+	pngBytes, _ := canvas.EncodePNG(img)
+	a.AddHistoryEntryWithPNG(img, pngBytes, title)
+	w := a.ensureEditorWindow()
 	a.mu.Lock()
-	w := a.editorWin
 	a.editorHidden = false
 	a.mu.Unlock()
 
 	apply := func() {
-		a.editor.LoadImage(img, title)
+		a.editor.loadOwnedImage(img, pngBytes, title)
 		if len(anns) > 0 {
 			a.editor.annotations = canvas.CloneAnnotations(anns)
 			a.editor.rasterDirty = true
@@ -443,6 +531,22 @@ func (a *App) AddHistoryEntry(img *image.RGBA, title string) {
 	if err != nil {
 		return
 	}
+	a.AddHistoryEntryWithPNG(img, pngBytes, title)
+}
+
+// AddHistoryEntryWithPNG appends a screenshot using already-encoded PNG bytes so callers
+// that just encoded for clipboard or pin avoid a second full PNG compression pass.
+func (a *App) AddHistoryEntryWithPNG(img *image.RGBA, pngBytes []byte, title string) {
+	if img == nil {
+		return
+	}
+	if len(pngBytes) == 0 {
+		var err error
+		pngBytes, err = canvas.EncodePNG(img)
+		if err != nil {
+			return
+		}
+	}
 	thumbRGBA := canvas.MakeThumbnail(img, 240, 150)
 	var thumbBmp *ui.Bitmap
 	if thumbRGBA != nil {
@@ -460,6 +564,15 @@ func (a *App) AddHistoryEntry(img *image.RGBA, title string) {
 		Height:     img.Bounds().Dy(),
 	}
 	a.history = append([]HistoryEntry{entry}, a.history...)
+	a.trimHistoryLocked()
+	w := a.editorWin
+	a.mu.Unlock()
+	if w != nil {
+		w.Update(func() {})
+	}
+}
+
+func (a *App) trimHistoryLocked() {
 	if len(a.history) > maxHistoryEntries {
 		for i := maxHistoryEntries; i < len(a.history); i++ {
 			a.history[i].PNG = nil
@@ -467,10 +580,17 @@ func (a *App) AddHistoryEntry(img *image.RGBA, title string) {
 		}
 		a.history = a.history[:maxHistoryEntries]
 	}
-	w := a.editorWin
-	a.mu.Unlock()
-	if w != nil {
-		w.Update(func() {})
+	totalBytes := 0
+	for _, h := range a.history {
+		totalBytes += len(h.PNG)
+	}
+	// Enforce byte budget while always keeping at least the newest capture.
+	for len(a.history) > 1 && totalBytes > maxHistoryBytes {
+		last := len(a.history) - 1
+		totalBytes -= len(a.history[last].PNG)
+		a.history[last].PNG = nil
+		a.history[last].Thumb = nil
+		a.history = a.history[:last]
 	}
 }
 
@@ -496,12 +616,11 @@ func (a *App) PasteFromClipboard() bool {
 		a.NotifyToast("剪贴板中没有图片")
 		return false
 	}
-	img, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
+	rgba := decodeImageRGBA(data)
+	if rgba == nil {
 		a.NotifyToast("无法解析剪贴板图片")
 		return false
 	}
-	rgba := toRGBA(img)
 	a.OpenImageInEditor(rgba, "剪贴板图片")
 	a.NotifyToast(fmt.Sprintf("已载入剪贴板图片 (%d × %d)", rgba.Bounds().Dx(), rgba.Bounds().Dy()))
 	return true
@@ -511,8 +630,8 @@ func (a *App) PasteFromClipboard() bool {
 func (a *App) PinFromClipboard() {
 	data := mygo.Clipboard.ReadImage()
 	if len(data) > 0 {
-		if img, _, err := image.Decode(bytes.NewReader(data)); err == nil {
-			a.OpenPin(toRGBA(img), 0, 0, 0)
+		if rgba := decodeImageRGBA(data); rgba != nil {
+			a.OpenPin(rgba, 0, 0, 0)
 			return
 		}
 	}
@@ -523,9 +642,12 @@ func (a *App) PinFromClipboard() {
 
 // OpenImageFromDisk opens a native Windows file picker for PNG/JPG images.
 func (a *App) OpenImageFromDisk() {
+	a.mu.Lock()
+	parent := a.editorWin
+	a.mu.Unlock()
 	go func() {
 		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-			Parent: a.editorWin,
+			Parent: parent,
 			Title:  "选择图片",
 			Filters: []mygo.FileFilter{
 				{Name: "图片文件", Extensions: []string{"png", "jpg", "jpeg"}},
@@ -545,12 +667,11 @@ func (a *App) LoadFilePath(path string) {
 		a.NotifyToast("读取文件失败")
 		return
 	}
-	img, _, err := image.Decode(bytes.NewReader(raw))
-	if err != nil {
+	rgba := decodeImageRGBA(raw)
+	if rgba == nil {
 		a.NotifyToast("不支持的图片格式")
 		return
 	}
-	rgba := toRGBA(img)
 	a.OpenImageInEditor(rgba, filepath.Base(path))
 }
 
@@ -609,17 +730,30 @@ func (a *App) NotifyToast(msg string) {
 	}
 }
 
+func decodeImageRGBA(data []byte) *image.RGBA {
+	if len(data) == 0 {
+		return nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil
+	}
+	if r, ok := img.(*image.RGBA); ok && r.Bounds().Min == (image.Point{}) && r.Stride == 4*r.Bounds().Dx() {
+		return r
+	}
+	return toRGBA(img)
+}
+
 func toRGBA(src image.Image) *image.RGBA {
+	if src == nil {
+		return nil
+	}
 	if r, ok := src.(*image.RGBA); ok {
 		return canvas.CloneRGBA(r)
 	}
 	b := src.Bounds()
 	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	for y := 0; y < b.Dy(); y++ {
-		for x := 0; x < b.Dx(); x++ {
-			dst.Set(x, y, src.At(b.Min.X+x, b.Min.Y+y))
-		}
-	}
+	draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
 	return dst
 }
 

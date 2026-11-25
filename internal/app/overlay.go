@@ -47,7 +47,11 @@ type overlayPane struct {
 	display mygo.Display
 	capture winapi.MonitorCapture
 	bmp     *ui.Bitmap
-	pixBmp  *ui.Bitmap
+
+	loupeRGBA   *image.RGBA
+	loupeBmp    *ui.Bitmap
+	lastLoupeSX int
+	lastLoupeSY int
 
 	selEffectRect image.Rectangle
 	selEffectBmp  *ui.Bitmap
@@ -133,11 +137,13 @@ func (s *overlaySession) closeAll() {
 		p.releaseBuffers()
 	}
 	reclaimMemoryAsync()
+	s.app.scheduleTrayTrim()
 }
 
 func (p *overlayPane) releaseBuffers() {
 	p.bmp = nil
-	p.pixBmp = nil
+	p.loupeRGBA = nil
+	p.loupeBmp = nil
 	p.selEffectBmp = nil
 	p.capture.Image = nil
 	p.localWins = nil
@@ -457,7 +463,8 @@ func newOverlayPane(session *overlaySession, d mygo.Display, cap winapi.MonitorC
 		display:        d,
 		capture:        cap,
 		bmp:            ui.NewBitmap(cap.Image),
-		pixBmp:         ui.NewBitmap(cap.Image).Pixelated(),
+		lastLoupeSX:    -1,
+		lastLoupeSY:    -1,
 		localWins:      local,
 		snapEnabled:    true,
 		hoveredWinIdx:  -1,
@@ -557,18 +564,18 @@ func (p *overlayPane) shiftedAnnotations(selPx image.Rectangle) []canvas.Annotat
 }
 
 func (p *overlayPane) hasRasterAnnotations() bool {
-	for _, a := range p.annotations {
-		if a.Kind == canvas.ToolPixelate || a.Kind == canvas.ToolBlur || a.Kind == canvas.ToolSpotlight {
-			return true
-		}
-	}
-	return false
+	return canvas.HasRasterAnnotations(p.annotations)
 }
 
 func (p *overlayPane) ensureRasterCache(viewW, viewH float32) {
 	if !p.hasSelection || !p.hasRasterAnnotations() {
 		p.selEffectBmp = nil
 		p.effectDirty = false
+		return
+	}
+	// Avoid thrashing full-selection CropRGBA + blur/pixelate allocations on every
+	// pointer-move frame while dragging or resizing the selection rectangle.
+	if p.dragMode != dragNone {
 		return
 	}
 	r := p.selectionPxRect(viewW, viewH)
@@ -584,7 +591,16 @@ func (p *overlayPane) ensureRasterCache(viewW, viewH float32) {
 		return
 	}
 	processed := canvas.RenderRasterEffects(cropped, p.shiftedAnnotations(r))
-	p.selEffectBmp = ui.NewBitmap(processed)
+	if p.selEffectBmp != nil {
+		bw, bh := p.selEffectBmp.Size()
+		if bw == processed.Bounds().Dx() && bh == processed.Bounds().Dy() {
+			p.selEffectBmp.Update(processed)
+		} else {
+			p.selEffectBmp = ui.NewBitmap(processed)
+		}
+	} else {
+		p.selEffectBmp = ui.NewBitmap(processed)
+	}
 	p.selEffectRect = r
 	p.effectDirty = false
 }
@@ -639,10 +655,11 @@ func (p *overlayPane) commitCopy(viewW, viewH float32) {
 	}
 	app := p.session.app
 	p.session.closeAll()
-	if b, err := canvas.EncodePNG(finalImg); err == nil {
-		_ = mygo.Clipboard.WriteImage(b)
+	pngBytes, err := canvas.EncodePNG(finalImg)
+	if err == nil {
+		_ = mygo.Clipboard.WriteImage(pngBytes)
 	}
-	app.AddHistoryEntry(finalImg, "快捷截图")
+	app.AddHistoryEntryWithPNG(finalImg, pngBytes, "快捷截图")
 	app.NotifyToast(fmt.Sprintf("已复制 %d × %d 到剪贴板", finalImg.Bounds().Dx(), finalImg.Bounds().Dy()))
 }
 
@@ -672,8 +689,9 @@ func (p *overlayPane) commitPin(viewW, viewH float32) {
 	}
 	app := p.session.app
 	p.session.closeAll()
-	app.AddHistoryEntry(finalImg, "桌面贴图")
-	app.OpenPin(finalImg, pinX, pinY, scale)
+	pngBytes, _ := canvas.EncodePNG(finalImg)
+	app.AddHistoryEntryWithPNG(finalImg, pngBytes, "桌面贴图")
+	app.OpenPinWithPNG(finalImg, pngBytes, pinX, pinY, scale)
 }
 
 func (p *overlayPane) commitSave(viewW, viewH float32) {
@@ -1545,10 +1563,31 @@ func (p *overlayPane) drawGlassworkLoupe(pt *ui.Painter, r ui.Rect) {
 	sx := winapi.ClampInt(px-half, 0, max(0, iw-gridCells))
 	sy := winapi.ClampInt(py-half, 0, max(0, ih-gridCells))
 	dstGrid := ui.Rect{X: lx + 7, Y: ly + 7, W: gridDim, H: gridDim}
-	srcGrid := ui.Rect{X: float32(sx), Y: float32(sy), W: gridCells, H: gridCells}
+
+	if p.loupeRGBA == nil {
+		p.loupeRGBA = image.NewRGBA(image.Rect(0, 0, gridCells, gridCells))
+	}
+	if p.loupeBmp == nil || sx != p.lastLoupeSX || sy != p.lastLoupeSY {
+		srcImg := p.capture.Image
+		for row := 0; row < gridCells; row++ {
+			srcY := winapi.ClampInt(sy+row, 0, ih-1)
+			dOff := row * p.loupeRGBA.Stride
+			for col := 0; col < gridCells; col++ {
+				srcX := winapi.ClampInt(sx+col, 0, iw-1)
+				sOff := srcY*srcImg.Stride + srcX*4
+				copy(p.loupeRGBA.Pix[dOff+col*4:dOff+col*4+4], srcImg.Pix[sOff:sOff+4])
+			}
+		}
+		if p.loupeBmp == nil {
+			p.loupeBmp = ui.NewBitmap(p.loupeRGBA).Pixelated()
+		} else {
+			p.loupeBmp.Update(p.loupeRGBA)
+		}
+		p.lastLoupeSX, p.lastLoupeSY = sx, sy
+	}
 
 	pt.Clip(dstGrid, 11, func() {
-		pt.ImageRegion(p.pixBmp, srcGrid, dstGrid, ui.ImageOptions{})
+		pt.Image(p.loupeBmp, dstGrid, ui.FillBox)
 		gridLine := ui.RGBA(255, 255, 255, 0.14)
 		for i := 1; i < gridCells; i++ {
 			off := float32(i * cellSize)

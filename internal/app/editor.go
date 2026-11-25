@@ -4,15 +4,37 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"github.com/egoist/mygo/ui/shader"
 
 	"koma/internal/canvas"
 	"koma/internal/glasswork"
 	"koma/internal/icons"
 	"koma/internal/winapi"
+)
+
+var (
+	dotGridShader = shader.MustCompile(`package main
+
+var DotColor vec4
+
+func Fragment(dst vec4, pos vec2) vec4 {
+	cell := mod(pos, vec2(28.0, 28.0)) - vec2(14.75, 14.75)
+	d := length(cell)
+	aa := max(0.75/pixelScale(), 0.35)
+	a := 1.0 - smoothstep(0.75-aa, 0.75+aa, d)
+	alpha := a * DotColor.a
+	return vec4(DotColor.rgb*alpha, alpha)
+}
+`)
+	uDotColor         = dotGridShader.Uniform("DotColor")
+	dotGridValuesPool = sync.Pool{
+		New: func() any { return dotGridShader.NewValues() },
+	}
 )
 
 // EditorState holds all state for Koma's Glasswork Liquid Glass Companion Studio.
@@ -21,6 +43,7 @@ type EditorState struct {
 
 	title       string
 	baseImg     *image.RGBA
+	basePNG     []byte // compressed backing copy so ParkForTray drops uncompressed RGBA cleanly
 	annotations []canvas.Annotation
 	nextAnnID   int
 	nextCounter int
@@ -28,9 +51,10 @@ type EditorState struct {
 	undoStack []canvas.Snapshot
 	redoStack []canvas.Snapshot
 
-	rasterImg   *image.RGBA
-	rasterBmp   *ui.Bitmap
-	rasterDirty bool
+	rasterImg       *image.RGBA
+	rasterBmp       *ui.Bitmap
+	rasterBmpOnBase bool
+	rasterDirty     bool
 
 	tool        canvas.Tool
 	colorIdx    int
@@ -166,13 +190,22 @@ func (e *EditorState) commitHotkey(action HotkeyAction, acc string) {
 	}
 }
 
-// LoadImage replaces the active document with img and fits it cleanly to viewport.
+// LoadImage replaces the active document with an independent copy of img and fits it cleanly to viewport.
 func (e *EditorState) LoadImage(img *image.RGBA, title string) {
 	if img == nil {
 		return
 	}
+	e.loadOwnedImage(canvas.CloneRGBA(img), nil, title)
+}
+
+// loadOwnedImage takes ownership of an already-fresh *image.RGBA without cloning it a second time.
+func (e *EditorState) loadOwnedImage(img *image.RGBA, pngBytes []byte, title string) {
+	if img == nil {
+		return
+	}
 	e.title = title
-	e.baseImg = canvas.CloneRGBA(img)
+	e.baseImg = img
+	e.basePNG = pngBytes
 	e.annotations = nil
 	e.undoStack = nil
 	e.redoStack = nil
@@ -180,6 +213,8 @@ func (e *EditorState) LoadImage(img *image.RGBA, title string) {
 	e.selectedIdx = -1
 	e.drawing = false
 	e.hasCrop = false
+	e.rasterImg = nil
+	e.rasterBmpOnBase = false
 	e.rasterDirty = true
 	e.fitPending = true
 	e.lastMeasX, e.lastMeasY = -1, -1
@@ -189,8 +224,10 @@ func (e *EditorState) LoadImage(img *image.RGBA, title string) {
 // ClearDocument releases active document buffers when returning to Home stage.
 func (e *EditorState) ClearDocument() {
 	e.baseImg = nil
+	e.basePNG = nil
 	e.rasterImg = nil
 	e.rasterBmp = nil
+	e.rasterBmpOnBase = false
 	e.annotations = nil
 	e.undoStack = nil
 	e.redoStack = nil
@@ -198,6 +235,42 @@ func (e *EditorState) ClearDocument() {
 	e.drawing = false
 	e.hasCrop = false
 	reclaimMemoryAsync()
+}
+
+// ParkForTray releases uncompressed RGBA buffers, GPU bitmaps, and undo snapshots
+// when the Studio window is closed to the system tray, keeping only compressed PNG
+// bytes (~200-500 KB) so reopening Studio restores the document and annotations seamlessly.
+func (e *EditorState) ParkForTray() {
+	if e.baseImg != nil && len(e.basePNG) == 0 {
+		if encoded, err := canvas.EncodePNG(e.baseImg); err == nil {
+			e.basePNG = encoded
+		}
+	}
+	e.baseImg = nil
+	e.rasterImg = nil
+	e.rasterBmp = nil
+	e.rasterBmpOnBase = false
+	e.rasterDirty = true
+	e.undoStack = nil
+	e.redoStack = nil
+	e.selectedIdx = -1
+	e.drawing = false
+	e.hasCrop = false
+}
+
+// RestoreFromTray inflates the parked compressed PNG back into baseImg when Studio reopens.
+func (e *EditorState) RestoreFromTray() {
+	if e.baseImg != nil || len(e.basePNG) == 0 {
+		return
+	}
+	if img := decodeImageRGBA(e.basePNG); img != nil {
+		e.baseImg = img
+		e.rasterImg = nil
+		e.rasterBmp = nil
+		e.rasterBmpOnBase = false
+		e.rasterDirty = true
+		e.fitPending = true
+	}
 }
 
 // SetToast displays a floating Glasswork confirmation pill.
@@ -243,6 +316,10 @@ func (e *EditorState) undo() {
 	e.redoStack = append(e.redoStack, cur)
 	prev := e.undoStack[len(e.undoStack)-1]
 	e.undoStack = e.undoStack[:len(e.undoStack)-1]
+	if prev.Image != e.baseImg {
+		e.basePNG = nil
+		e.rasterBmpOnBase = false
+	}
 	e.baseImg = prev.Image
 	e.annotations = prev.Annotations
 	e.nextCounter = prev.NextCounter
@@ -262,6 +339,10 @@ func (e *EditorState) redo() {
 	e.undoStack = append(e.undoStack, cur)
 	next := e.redoStack[len(e.redoStack)-1]
 	e.redoStack = e.redoStack[:len(e.redoStack)-1]
+	if next.Image != e.baseImg {
+		e.basePNG = nil
+		e.rasterBmpOnBase = false
+	}
 	e.baseImg = next.Image
 	e.annotations = next.Annotations
 	e.nextCounter = next.NextCounter
@@ -269,23 +350,55 @@ func (e *EditorState) redo() {
 	e.rasterDirty = true
 }
 
+func (e *EditorState) setRasterBitmap(src *image.RGBA) {
+	if src == nil {
+		e.rasterBmp = nil
+		return
+	}
+	if e.rasterBmp != nil {
+		bw, bh := e.rasterBmp.Size()
+		if bw == src.Bounds().Dx() && bh == src.Bounds().Dy() {
+			e.rasterBmp.Update(src)
+			return
+		}
+	}
+	e.rasterBmp = ui.NewBitmap(src)
+}
+
 func (e *EditorState) rebuildCaches() {
 	if e.baseImg == nil {
 		return
 	}
-	if e.rasterDirty || e.rasterImg == nil {
-		e.rasterImg = canvas.RenderRasterEffects(e.baseImg, e.annotations)
-		e.rasterBmp = ui.NewBitmap(e.rasterImg)
-		e.rasterDirty = false
+	if !e.rasterDirty && e.rasterBmp != nil {
+		return
 	}
+	if !canvas.HasRasterAnnotations(e.annotations) {
+		// No pixel-modifying effects: share baseImg directly instead of keeping
+		// a duplicate 10-35 MB full-resolution RGBA copy in e.rasterImg!
+		e.rasterImg = nil
+		if !e.rasterBmpOnBase || e.rasterBmp == nil {
+			e.setRasterBitmap(e.baseImg)
+			e.rasterBmpOnBase = true
+		}
+		e.rasterDirty = false
+		return
+	}
+	e.rasterImg = canvas.RenderRasterEffects(e.baseImg, e.annotations)
+	e.setRasterBitmap(e.rasterImg)
+	e.rasterBmpOnBase = false
+	e.rasterDirty = false
 }
 
 // ExportComposite returns the final export-ready image with raster effects and vector annotations.
 func (e *EditorState) ExportComposite() *image.RGBA {
-	if e.baseImg == nil {
+	base := e.baseImg
+	if base == nil && len(e.basePNG) > 0 {
+		base = decodeImageRGBA(e.basePNG)
+	}
+	if base == nil {
 		return nil
 	}
-	return canvas.RenderComposite(e.baseImg, e.annotations)
+	return canvas.RenderComposite(base, e.annotations)
 }
 
 func (e *EditorState) copyComposite() {
@@ -311,7 +424,10 @@ func (e *EditorState) saveComposite() {
 	if comp == nil {
 		return
 	}
-	go e.app.SaveImageWithDialog(comp, e.app.editorWin)
+	e.app.mu.Lock()
+	parent := e.app.editorWin
+	e.app.mu.Unlock()
+	go e.app.SaveImageWithDialog(comp, parent)
 }
 
 func (e *EditorState) pinComposite() {
@@ -343,6 +459,8 @@ func (e *EditorState) applyCrop() {
 	}
 	e.pushUndo()
 	e.baseImg = winapi.CropRGBA(e.baseImg, r)
+	e.basePNG = nil
+	e.rasterBmpOnBase = false
 	dx, dy := -float32(r.Min.X), -float32(r.Min.Y)
 	for i := range e.annotations {
 		e.annotations[i].Translate(dx, dy)
@@ -845,7 +963,7 @@ func (e *EditorState) renderAppleHomeStage(c *ui.Context, tk appleTokens) {
 					})
 					if card.Clicked() {
 						if img := it.DecodeImage(); img != nil {
-							e.LoadImage(img, it.Title)
+							e.loadOwnedImage(img, it.PNG, it.Title)
 						}
 					}
 				}
@@ -1328,7 +1446,7 @@ func (e *EditorState) renderFloatingHistoryDrawer(c *ui.Context, tk appleTokens)
 						if hov {
 							if appleMiniBtn(c, tk, icons.Pin, "贴图") {
 								if img := it.DecodeImage(); img != nil {
-									e.app.OpenPin(img, 0, 0, 0)
+									e.app.OpenPinWithPNG(img, it.PNG, 0, 0, 0)
 								}
 							}
 							if appleMiniBtn(c, tk, icons.Trash, "移除") {
@@ -1339,7 +1457,7 @@ func (e *EditorState) renderFloatingHistoryDrawer(c *ui.Context, tk appleTokens)
 				})
 				if card.Clicked() {
 					if img := it.DecodeImage(); img != nil {
-						e.LoadImage(img, it.Title)
+						e.loadOwnedImage(img, it.PNG, it.Title)
 					}
 				}
 			}
@@ -1995,6 +2113,15 @@ func (e *EditorState) renderLiquidSwitchRow(c *ui.Context, tk appleTokens, key, 
 }
 
 func drawSubtleDotGrid(pt *ui.Painter, r ui.Rect, col ui.Color) {
+	// On GPU, render the entire dot grid in a single shader draw op instead of
+	// emitting 1,200-4,600 separate Fill ops into Scene/Differ every frame.
+	if pt.Accelerated() {
+		vals := dotGridValuesPool.Get().(*shader.Values)
+		defer dotGridValuesPool.Put(vals)
+		vals.Color(uDotColor, col)
+		dotGridShader.Draw(pt, r, shader.Options{Values: vals})
+		return
+	}
 	const step float32 = 28
 	for y := r.Y + 14; y < r.Y+r.H; y += step {
 		for x := r.X + 14; x < r.X+r.W; x += step {
