@@ -22,6 +22,10 @@
 
 基于纯 Go 与 **MyGo**（Direct3D 11 原生渲染，零 CGO、零 WebView/Electron），体积约 13 MB，常驻托盘低内存占用，把 Apple Liquid Glass 物理光学材质、弹簧微动效与 Solar Duotone 图标语言带到日常截屏里。
 
+<p align="center">
+  <img src="docs/images/cover.png" alt="Koma Cover" width="100%" />
+</p>
+
 ## 预览
 
 | 原位截屏与标注 | 极简主界面 |
