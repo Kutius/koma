@@ -489,6 +489,19 @@ func (e *EditorState) fitToViewport(viewW, viewH float32) {
 	padBottom := float32(126)
 	availW := max(float32(120), viewW-padX*2)
 	availH := max(float32(120), viewH-padTop-padBottom)
+
+	// Tall long screenshots fit comfortably to width and align to the top so text stays crisp
+	// and immediately readable instead of shrinking into a thin vertical strip.
+	fitW := min(float32(1.0), availW/float32(dw))
+	if float32(dh) > float32(dw)*2.0 && float32(dh)*fitW > availH*1.35 {
+		z := clamp32(min(float32(1.0), (availW*0.72)/float32(dw)), 0.25, 1.0)
+		e.zoom = z
+		e.panX = (viewW - float32(dw)*z) * 0.5
+		e.panY = padTop + 16
+		e.fitPending = false
+		return
+	}
+
 	z := min(availW/float32(dw), availH/float32(dh))
 	if z > 1.0 {
 		z = 1.0
@@ -821,6 +834,9 @@ func (e *EditorState) renderFloatingTopChrome(c *ui.Context, tk appleTokens) {
 		if appleIconBtn(c, tk, icons.CaptureArea, "区域截图", FormatHotkeyTooltip("区域截图", e.app.Hotkey(HotkeyArea)), false) {
 			e.app.StartAreaCapture(true)
 		}
+		if appleIconBtn(c, tk, icons.LongCapture, "长截图", "滚动长截图", false) {
+			e.app.StartLongCapture(true)
+		}
 		if appleIconBtn(c, tk, icons.CaptureScreen, "全屏截图", FormatHotkeyTooltip("全屏截图", e.app.Hotkey(HotkeyFull)), false) {
 			e.app.CaptureFullscreen(true)
 		}
@@ -927,6 +943,9 @@ func (e *EditorState) renderAppleHomeStage(c *ui.Context, tk appleTokens) {
 			Material(tk.glass).
 			AlignItems(ui.Center).
 			Children(func() {
+				if appleDockPillBtn(c, tk, icons.LongCapture, "长截图") {
+					e.app.StartLongCapture(true)
+				}
 				if appleDockPillBtn(c, tk, icons.CaptureScreen, "全屏") {
 					e.app.CaptureFullscreen(true)
 				}
@@ -1498,7 +1517,14 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			return true
 
 		case ui.InputScroll:
-			if ev.Mods&ui.Ctrl != 0 || !ev.Precise {
+			dw, dh, _, _ := e.docDisplaySize()
+			tallScroll := ev.Mods&ui.Ctrl == 0 && !ev.Precise && dh > dw*2 && float32(dh)*e.zoom > e.lastViewH-160
+			if tallScroll {
+				e.panY -= ev.DY
+				minPanY := e.lastViewH - 140 - float32(dh)*e.zoom
+				maxPanY := float32(92)
+				e.panY = clamp32(e.panY, minPanY, maxPanY)
+			} else if ev.Mods&ui.Ctrl != 0 || !ev.Precise {
 				if ev.DY < 0 {
 					e.zoomAround(ev.X, ev.Y, 1.15)
 				} else if ev.DY > 0 {
@@ -1838,6 +1864,7 @@ func (e *EditorState) renderHelpSheet(c *ui.Context, tk appleTokens) {
 						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyDelay)), "延时 3 秒截图")
 						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyPin)), "贴图剪贴板")
 						appleHelpRow(c, tk, "双击选区 / Enter", "完成并复制")
+						appleHelpRow(c, tk, "L（选区后）", "滚动长截图")
 						appleHelpRow(c, tk, "右键单击", "重选 / 退出")
 						appleHelpRow(c, tk, "Space / C / M", "吸附 / 取色 / 测距")
 					})

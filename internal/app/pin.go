@@ -26,6 +26,9 @@ type PinWindow struct {
 	pixelsReleased bool
 	baseW          float64
 	baseH          float64
+	imgAspect      float64
+	tallScroll     bool
+	scrollY        float32
 	scale          float64
 	opacity        float64
 	hudText        string
@@ -59,14 +62,26 @@ func (a *App) OpenPinWithPNG(img *image.RGBA, pngBytes []byte, x, y int, scaleFa
 	iw, ih := img.Bounds().Dx(), img.Bounds().Dy()
 	dipW := math.Max(96, float64(iw)/scaleFactor)
 	dipH := math.Max(64, float64(ih)/scaleFactor)
+	imgAspect := float64(ih) / math.Max(1, float64(iw))
+	tallScroll := false
 
 	work := mygo.Screen.PrimaryDisplay().WorkArea
 	if work.Width > 0 && work.Height > 0 {
 		maxW := float64(work.Width) * 0.78
 		maxH := float64(work.Height) * 0.78
-		fit := math.Min(1.0, math.Min(maxW/dipW, maxH/dipH))
-		dipW *= fit
-		dipH *= fit
+		if ih > iw*2 && dipH > maxH {
+			// Tall long screenshots stay readable at width and scroll vertically inside the pin card.
+			tallScroll = true
+			if dipW > maxW*0.62 {
+				dipW = maxW * 0.62
+			}
+			dipW = math.Max(220, dipW)
+			dipH = maxH
+		} else {
+			fit := math.Min(1.0, math.Min(maxW/dipW, maxH/dipH))
+			dipW *= fit
+			dipH *= fit
+		}
 	}
 
 	bmp, err := ui.DecodeBitmap(pngBytes)
@@ -75,13 +90,15 @@ func (a *App) OpenPinWithPNG(img *image.RGBA, pngBytes []byte, x, y int, scaleFa
 	}
 
 	pw := &PinWindow{
-		app:      a,
-		pngBytes: pngBytes,
-		bmp:      bmp,
-		baseW:    dipW,
-		baseH:    dipH,
-		scale:    1.0,
-		opacity:  1.0,
+		app:        a,
+		pngBytes:   pngBytes,
+		bmp:        bmp,
+		baseW:      dipW,
+		baseH:      dipH,
+		imgAspect:  imgAspect,
+		tallScroll: tallScroll,
+		scale:      1.0,
+		opacity:    1.0,
 	}
 
 	w := mygo.NewWindow(mygo.WindowOptions{
@@ -217,7 +234,18 @@ func (p *PinWindow) view(c *ui.Context) {
 		card.HandleInput(func(ev ui.InputEvent) bool {
 			switch ev.Kind {
 			case ui.InputScroll:
-				if ev.Mods&(ui.Alt|ui.Ctrl) != 0 {
+				if ev.Mods&ui.Alt != 0 {
+					if ev.DY < 0 {
+						p.applyOpacityDelta(0.08)
+					} else if ev.DY > 0 {
+						p.applyOpacityDelta(-0.08)
+					}
+				} else if p.tallScroll && ev.Mods&ui.Ctrl == 0 {
+					b := card.Bounds()
+					contentH := b.W * float32(p.imgAspect)
+					maxScroll := max(float32(0), contentH-b.H)
+					p.scrollY = clamp32(p.scrollY+ev.DY, 0, maxScroll)
+				} else if ev.Mods&ui.Ctrl != 0 && !p.tallScroll {
 					if ev.DY < 0 {
 						p.applyOpacityDelta(0.08)
 					} else if ev.DY > 0 {
@@ -242,7 +270,24 @@ func (p *PinWindow) view(c *ui.Context) {
 
 		card.Draw(func(pt *ui.Painter, r ui.Rect) {
 			if p.bmp != nil {
-				pt.Image(p.bmp, r, ui.FillBox)
+				if p.tallScroll {
+					contentH := r.W * float32(p.imgAspect)
+					maxScroll := max(float32(0), contentH-r.H)
+					sy := clamp32(p.scrollY, 0, maxScroll)
+					pt.Clip(r, 11, func() {
+						pt.Image(p.bmp, ui.Rect{X: r.X, Y: r.Y - sy, W: r.W, H: contentH}, ui.FillBox)
+						if maxScroll > 4 && r.H > 40 {
+							ratio := clamp32(r.H/contentH, 0.08, 1.0)
+							thumbH := max(24, r.H*ratio)
+							thumbY := r.Y + 6 + (r.H-thumbH-12)*(sy/maxScroll)
+							thumbR := ui.Rect{X: r.X + r.W - 8, Y: thumbY, W: 4.5, H: thumbH}
+							pt.Fill(ui.Rect{X: thumbR.X - 1, Y: thumbR.Y - 1, W: thumbR.W + 2, H: thumbR.H + 2}, ui.RGBA(0, 0, 0, 0.34), 3.2)
+							pt.Fill(thumbR, ui.RGBA(255, 255, 255, 0.86), 2.25)
+						}
+					})
+				} else {
+					pt.Image(p.bmp, r, ui.FillBox)
+				}
 				if pt.Accelerated() && !p.pixelsReleased {
 					if p.drawnFrames >= 1 {
 						p.bmp.ReleasePixels()

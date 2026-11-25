@@ -2,6 +2,7 @@ package main
 
 import (
 	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,7 +30,7 @@ func TestFullscreenToolbarPlacementAlwaysVisible(t *testing.T) {
 		{"top_edge_selection", 100, 0, 700, 500, 860, 520, false},
 	}
 
-	const mainW, subW float32 = 636, 440
+	const mainW, subW float32 = 672, 440
 	for _, tc := range cases {
 		barX, barY, subX, subY, _ := app.ComputeToolbarLayout(tc.x0, tc.y0, tc.x1, tc.y1, tc.viewW, tc.viewH, mainW, subW, tc.showSub)
 		if barX < 16 || barX+mainW > tc.viewW-15 {
@@ -49,6 +50,46 @@ func TestFullscreenToolbarPlacementAlwaysVisible(t *testing.T) {
 	}
 }
 
+func TestScrollOverlayPlacementAlwaysVisible(t *testing.T) {
+	cases := []struct {
+		name           string
+		x0, y0, x1, y1 float32
+		viewW, viewH   float32
+	}{
+		{"mid_screen", 140, 72, 720, 532, 1120, 680},
+		{"right_edge", 520, 72, 1100, 532, 1120, 680},
+		{"left_edge", 12, 72, 620, 532, 1120, 680},
+		{"near_fullscreen", 4, 4, 1916, 1076, 1920, 1080},
+		{"exact_fullscreen", 0, 0, 1920, 1080, 1920, 1080},
+	}
+
+	const barW float32 = 376
+	for _, tc := range cases {
+		barR, prevR, showPrev := app.ComputeScrollOverlayLayout(tc.x0, tc.y0, tc.x1, tc.y1, tc.viewW, tc.viewH, barW)
+		if barR.X < 16 || barR.X+barR.W > tc.viewW-15 {
+			t.Errorf("%s: bar X=[%.1f, %.1f] outside [16, %.1f]", tc.name, barR.X, barR.X+barR.W, tc.viewW-16)
+		}
+		if barR.Y < 16 || barR.Y+barR.H > tc.viewH-15 {
+			t.Errorf("%s: bar Y=[%.1f, %.1f] outside [16, %.1f]", tc.name, barR.Y, barR.Y+barR.H, tc.viewH-16)
+		}
+		if !showPrev {
+			t.Errorf("%s: expected live preview card to be visible", tc.name)
+			continue
+		}
+		if prevR.X < 16 || prevR.X+prevR.W > tc.viewW-15 {
+			t.Errorf("%s: preview X=[%.1f, %.1f] outside [16, %.1f]", tc.name, prevR.X, prevR.X+prevR.W, tc.viewW-16)
+		}
+		if prevR.Y < 16 || prevR.Y+prevR.H > tc.viewH-15 {
+			t.Errorf("%s: preview Y=[%.1f, %.1f] outside [16, %.1f]", tc.name, prevR.Y, prevR.Y+prevR.H, tc.viewH-16)
+		}
+		overlapX := prevR.X < barR.X+barR.W && prevR.X+prevR.W > barR.X
+		overlapY := prevR.Y < barR.Y+barR.H && prevR.Y+prevR.H > barR.Y
+		if overlapX && overlapY {
+			t.Errorf("%s: preview %+v overlaps control bar %+v", tc.name, prevR, barR)
+		}
+	}
+}
+
 func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	dumpDir := os.Getenv("KOMA_PREVIEW_DIR")
 
@@ -60,12 +101,19 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !ttHome.HasText("区域截图") {
 		t.Fatalf("expected primary Chinese capture CTA, got texts: %q", ttHome.Texts())
 	}
+	if !ttHome.HasText("长截图") {
+		t.Fatalf("expected 长截图 pill on Home stage, got texts: %q", ttHome.Texts())
+	}
 	savePreview(t, dumpDir, "v3_01_home_glasswork.png", ttHome.Image())
 
 	// 2. QQ-style In-Place Overlay: verify EVERY toolbar button click actually triggers!
 	sample := app.GenerateSampleCanvas()
 	ov := app.NewTestOverlayView(a, sample, canvas.ToolSelect)
 	ttOv := ui.NewTester(ov.View, 860, 520)
+
+	if _, ok := ttOv.Find("长截图"); !ok {
+		t.Fatalf("expected 长截图 button on QQ overlay toolbar")
+	}
 
 	if err := ttOv.Click("箭头"); err != nil {
 		t.Fatalf("overlay click 箭头 failed: %v", err)
@@ -227,11 +275,83 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	}
 	ed.CloseSettings()
 
+	// 6. Live Scrolling Capture Overlay: verify live preview stitching, auto-scroll toggle, and visual layout
+	scrollFrames := generateTestScrollFrames(580, 460)
+	sc := app.NewTestScrollView(a, scrollFrames)
+	if sc.StitchedHeight() <= 460 {
+		t.Fatalf("expected stitched height > 460 after feeding scrolled frames, got %d", sc.StitchedHeight())
+	}
+	ttScroll := ui.NewTester(sc.View, 1120, 680)
+	if !ttScroll.HasText("自动滚动") || !ttScroll.HasText("完成") {
+		t.Fatalf("expected 自动滚动 & 完成 on scroll control bar, got texts: %q", ttScroll.Texts())
+	}
+	if err := ttScroll.Click("自动滚动"); err != nil {
+		t.Fatalf("scroll overlay click 自动滚动 failed: %v", err)
+	}
+	if !sc.AutoScrolling() {
+		t.Fatalf("expected AutoScrolling() == true after clicking 自动滚动")
+	}
+	savePreview(t, dumpDir, "v3_09_scroll_overlay.png", ttScroll.Image())
+	// Capture area interior MUST remain fully transparent (A==0) so the live desktop shows through!
+	if px := ttScroll.Image().RGBAAt(400, 300); px.A != 0 {
+		t.Fatalf("expected transparent capture interior (A=0), got %+v", px)
+	}
+	if err := ttScroll.Click("暂停滚动"); err != nil {
+		t.Fatalf("scroll overlay click 暂停滚动 failed: %v", err)
+	}
+	if sc.AutoScrolling() {
+		t.Fatalf("expected AutoScrolling() == false after clicking 暂停")
+	}
+	if err := ttScroll.Click("取消"); err != nil {
+		t.Fatalf("scroll overlay click 取消 failed: %v", err)
+	}
+	if !sc.Closed() {
+		t.Fatalf("expected scroll session Closed() == true after clicking 取消")
+	}
+
 	if os.Getenv("KOMA_GEN_ICON") == "1" {
 		if err := os.WriteFile(filepath.Join("resources", "icon.png"), icons.AppIconPNG(512), 0o644); err != nil {
 			t.Fatalf("write icon.png: %v", err)
 		}
 	}
+}
+
+func generateTestScrollFrames(w, h int) []*image.RGBA {
+	const totalH = 1280
+	page := image.NewRGBA(image.Rect(0, 0, w, totalH))
+	for y := 0; y < totalH; y++ {
+		cardIdx := y / 100
+		localY := y % 100
+		for x := 0; x < w; x++ {
+			c := color.RGBA{R: 242, G: 245, B: 252, A: 255}
+			if x >= 18 && x < w-18 && localY >= 10 && localY < 88 {
+				c = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+				if localY < 32 {
+					c = color.RGBA{
+						R: uint8(35 + (cardIdx*47)%170),
+						G: uint8(95 + (cardIdx*73)%130),
+						B: uint8(190 + (cardIdx*29)%60),
+						A: 255,
+					}
+				} else if localY%16 >= 4 && localY%16 <= 9 && x > 36 && x < w-50-((cardIdx*37+localY*11)%140) {
+					if ((x/6 + cardIdx*13 + localY*7) % 5) != 0 {
+						c = color.RGBA{R: 30, G: 41, B: 59, A: 255}
+					}
+				}
+			}
+			page.SetRGBA(x, y, c)
+		}
+	}
+	offsets := []int{0, 180, 380, 580, 780}
+	frames := make([]*image.RGBA, 0, len(offsets))
+	for _, off := range offsets {
+		f := image.NewRGBA(image.Rect(0, 0, w, h))
+		for y := 0; y < h; y++ {
+			copy(f.Pix[y*f.Stride:(y+1)*f.Stride], page.Pix[(off+y)*page.Stride:(off+y)*page.Stride+w*4])
+		}
+		frames = append(frames, f)
+	}
+	return frames
 }
 
 func savePreview(t *testing.T, dir, name string, img *image.RGBA) {

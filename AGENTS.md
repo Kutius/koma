@@ -58,7 +58,7 @@ go tool mygo build
 
 Build outputs:
 - `build/windows-amd64/Koma.exe` (standalone native executable)
-- `build/windows-amd64/koma-setup-0.1.1-amd64.exe` (Windows installer)
+- `build/windows-amd64/koma-setup-0.2.0-amd64.exe` (Windows installer)
 
 ---
 
@@ -75,14 +75,18 @@ koma/
     ├── app/
     │   ├── app.go                # App lifecycle, system tray, global shortcuts, compressed PNG history, theme sync, GC reclaim
     │   ├── overlay.go            # Per-monitor DPI fullscreen frozen capture overlay, QQ in-place tools, loupe, ComputeToolbarLayout
+    │   ├── scroll.go             # 3-window non-activating live scrolling capture (frame, preview, bar), 25fps capture loop, wheel forwarding
     │   ├── editor.go             # Minimalist Home stage & Studio editor, floating bottom dock, history drawer, help sheet
-    │   ├── pin.go                # Always-on-top frameless desktop Pin windows (scroll zoom, Alt+scroll opacity)
+    │   ├── pin.go                # Always-on-top frameless desktop Pin windows (scroll zoom / tall scroll, Alt+scroll opacity)
     │   └── sample.go             # Synthetic dashboard canvas & demo annotations used by tests
     ├── canvas/
     │   ├── types.go              # Tool enum, Annotation model, Snapshot, Apple HIG palette
     │   ├── painter.go            # Live GPU vector annotation rendering inside ui.Painter
     │   ├── render.go             # Export compositor: 3-pass separable blur, pixelate, spotlight, SVG CJK/Unicode rasterization
     │   └── render_test.go        # Composite & PNG encoding tests
+    ├── stitch/
+    │   ├── stitcher.go           # Zero-alloc incremental vertical long-screenshot stitcher (sticky header/footer/scrollbar resilience, 16,000px cap)
+    │   └── stitcher_test.go      # Exact shift, sticky bands, upward/too-fast, and preview rendering tests
     ├── glasswork/
     │   ├── glasswork.go          # Physical Liquid Glass Kage GPU shader (PresetLens, PresetCard, PresetTinted) + BuildMaterial
     │   ├── motion.go             # Bilalgursen spring physics, ApplyLiquidButton, SlidingLens, flicker-free panel transitions
@@ -90,9 +94,10 @@ koma/
     │   ├── adapt_test.go         # Light/dark adaptation unit tests
     │   └── motion_test.go        # Spring convergence, rubberband stretch volume conservation, transition invariants
     ├── icons/
-    │   └── icons.go              # 34 Solar Icons IconPair{Idle: Line Duotone, Active: Bold Duotone} + procedural AppIconPNG
+    │   └── icons.go              # Solar Icons IconPair{Idle: Line Duotone, Active: Bold Duotone} + procedural AppIconPNG
     └── winapi/
         ├── capture_windows.go    # Pure-Go GDI BitBlt multi-monitor capture, EnumDisplayMonitors, Per-Monitor DPI v2
+        ├── scroll_windows.go     # Reusable GDI ScreenGrabber, ActivateWindowAt (Z-order focus handoff), ScrollWindowAt, global Esc check
         ├── capture_other.go      # Non-Windows compile stubs
         ├── windows_windows.go    # DWM visible window enumeration (DWMWA_EXTENDED_FRAME_BOUNDS, cloaked filtering)
         ├── measure.go            # Shottr-style 4-ray perceptual edge-distance pixel ruler
@@ -126,6 +131,7 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 ### 4.4 Windows Lifecycle & Native Theme Contrast (`internal/app/app.go`, `editor.go`)
 - **System tray quit**: `mygo.App.Quit()` triggers `OnClose` on every open window (including hidden windows), and any `e.PreventDefault()` cancels quitting. `editorWin.OnClose` MUST check `!a.quitting` before hiding to tray, and both tray Quit (`a.Quit()`) and `mygo.App.OnBeforeQuit` must set `a.quitting = true`.
 - **Native caption buttons (Min / Max / Close)**: Always call `a.SyncWindowTheme()` (`mygo.Theme.SetSource` + `w.SetWindowButtonsTheme`) on window creation and whenever toggling dark/light mode so Windows caption glyphs stay dark on light mode and white on dark mode even when the Windows OS theme differs. Do not combine `VibrancyMica` with custom full-bleed painted backgrounds.
+- **Transparent MyGo windows (`scroll.go`)**: `c.SetTheme(...)` unconditionally sets `c.Root()` to an opaque background (`#18181B` / `#F5F5F7`) every frame. Every `Transparent: true` window MUST call `c.Root().Background(ui.Transparent)` immediately after `c.SetTheme(...)`, or it renders as an opaque black/white screen. For live scrolling capture, use three compact `Hidden: true` + `ShowInactive()` + `SetContentProtection(true)` windows (`frameWin` with permanent `IgnoreMouseEvents: true`, `previewWin`, `barWin`) and hand foreground focus via `winapi.ActivateWindowAt` before closing the frozen overlay.
 - **Seamless gradients**: When calling `pt.FillRadialGradient`, always draw over the full canvas rect `r` with normalized `Center` (`0..1`) and generous `Radius` to avoid rectangular clip seams.
 
 ### 4.5 Memory Management (`app.go`, `overlay.go`, `editor.go`, `pin.go`)
@@ -149,6 +155,6 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 
 ## 5. Verification Checklist Before Finishing Changes
 
-1. Run `go test -v -count=1 ./...` and ensure all packages (`koma`, `canvas`, `glasswork`, `winapi`) pass.
-2. When modifying UI, shaders, icons, or layout, dump previews via `KOMA_PREVIEW_DIR` and visually inspect the rendered PNGs (`Home`, `QQ overlay`, `100% fullscreen overlay`, `Studio`) to check contrast, alignment, icon z-order, and absence of border/clip artifacts.
-3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.1.1-amd64.exe` compile cleanly.
+1. Run `go test -v -count=1 ./...` and ensure all packages (`koma`, `app`, `canvas`, `stitch`, `glasswork`, `winapi`) pass.
+2. When modifying UI, shaders, icons, or layout, dump previews via `KOMA_PREVIEW_DIR` and visually inspect the rendered PNGs (`Home`, `QQ overlay`, `100% fullscreen overlay`, `Studio`, `Scroll overlay`) to check contrast, alignment, icon z-order, and absence of border/clip artifacts.
+3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.2.0-amd64.exe` compile cleanly.

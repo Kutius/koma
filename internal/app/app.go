@@ -55,6 +55,7 @@ type App struct {
 	editorHidden  bool
 	quitting      bool
 	activeOverlay *overlaySession
+	activeScroll  *scrollSession
 	pins          []*PinWindow
 	editor        *EditorState
 	trayTrimTimer *time.Timer
@@ -138,6 +139,10 @@ func (a *App) buildTrayMenu() *mygo.Menu {
 			Label:       "区域截图",
 			Accelerator: a.Hotkey(HotkeyArea),
 			Click:       func(*mygo.MenuItem, *mygo.Window) { a.StartAreaCapture(true) },
+		},
+		{
+			Label: "长截图",
+			Click: func(*mygo.MenuItem, *mygo.Window) { a.StartLongCapture(true) },
 		},
 		{
 			Label:       "全屏截图",
@@ -280,12 +285,16 @@ func (a *App) Quit() {
 	a.mu.Lock()
 	a.quitting = true
 	ov := a.activeOverlay
+	sc := a.activeScroll
 	edWin := a.editorWin
 	pins := append([]*PinWindow(nil), a.pins...)
 	a.mu.Unlock()
 
 	if ov != nil {
 		ov.closeAll()
+	}
+	if sc != nil {
+		sc.close()
 	}
 	for _, p := range pins {
 		if p.win != nil {
@@ -395,7 +404,7 @@ func (a *App) scheduleTrayTrim() {
 	a.trayTrimTimer = time.AfterFunc(delay, func() {
 		a.mu.Lock()
 		a.trayTrimTimer = nil
-		idleInTray := !a.quitting && a.editorWin == nil && a.activeOverlay == nil && len(a.pins) == 0
+		idleInTray := !a.quitting && a.editorWin == nil && a.activeOverlay == nil && a.activeScroll == nil && len(a.pins) == 0
 		a.mu.Unlock()
 		if !idleInTray {
 			return
@@ -424,6 +433,14 @@ func (a *App) clearOverlaySession(s *overlaySession) {
 	a.mu.Lock()
 	if a.activeOverlay == s {
 		a.activeOverlay = nil
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) clearScrollSession(s *scrollSession) {
+	a.mu.Lock()
+	if a.activeScroll == s {
+		a.activeScroll = nil
 	}
 	a.mu.Unlock()
 }
@@ -677,6 +694,12 @@ func (a *App) LoadFilePath(path string) {
 
 // SaveImageWithDialog opens a native Save dialog and writes PNG or JPEG.
 func (a *App) SaveImageWithDialog(img *image.RGBA, parent *mygo.Window) {
+	a.SaveImageWithDialogPNG(img, nil, parent)
+}
+
+// SaveImageWithDialogPNG opens a native Save dialog and writes PNG (reusing
+// pre-encoded pngBytes when provided to avoid duplicate encoding) or JPEG.
+func (a *App) SaveImageWithDialogPNG(img *image.RGBA, pngBytes []byte, parent *mygo.Window) {
 	if img == nil {
 		return
 	}
@@ -705,7 +728,11 @@ func (a *App) SaveImageWithDialog(img *image.RGBA, parent *mygo.Window) {
 		if ext == "" {
 			savePath += ".png"
 		}
-		encoded, err = canvas.EncodePNG(img)
+		if len(pngBytes) > 0 {
+			encoded = pngBytes
+		} else {
+			encoded, err = canvas.EncodePNG(img)
+		}
 	}
 	if err != nil {
 		a.NotifyToast("图片编码失败")

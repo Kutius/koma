@@ -184,3 +184,25 @@ func TestWinAPICallbackReuse(t *testing.T) {
 	}
 	winapi.TrimWorkingSet()
 }
+
+func TestScrollSessionCloseReleasesBuffers(t *testing.T) {
+	a := New()
+	img := GenerateSampleCanvas()
+	h := NewTestScrollView(a, []*image.RGBA{img})
+	tt := ui.NewTester(h.View, 1120, 680)
+	tt.Frame()
+
+	weakPreview := weak.Make(h.session.previewReady)
+	weakBmp := weak.Make(h.session.previewBmp)
+	weakStitcher := weak.Make(h.session.stitcher)
+
+	h.session.close()
+	tt = nil
+
+	runtime.GC()
+	runtime.GC()
+	if weakPreview.Value() != nil || weakBmp.Value() != nil || weakStitcher.Value() != nil {
+		t.Fatalf("expected scroll session close() to release stitcher, previewRGBA, and previewBmp")
+	}
+	runtime.KeepAlive(h)
+}

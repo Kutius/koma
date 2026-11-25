@@ -19,6 +19,7 @@ type overlaySession struct {
 	app      *App
 	panes    []*overlayPane
 	windows  []winapi.WindowInfo
+	longMode bool
 	closedMu sync.Mutex
 	closed   bool
 }
@@ -155,8 +156,18 @@ func (p *overlayPane) releaseBuffers() {
 // StartAreaCapture freezes all monitors instantaneously, detects desktop windows
 // via DWM, and launches Glasswork Liquid Glass QQ-style capture overlays.
 func (a *App) StartAreaCapture(hideEditorFirst bool) {
+	a.startAreaCaptureMode(hideEditorFirst, false)
+}
+
+// StartLongCapture opens the capture overlay in direct long-screenshot mode:
+// once a window or region is selected, it transitions straight into live scrolling capture.
+func (a *App) StartLongCapture(hideEditorFirst bool) {
+	a.startAreaCaptureMode(hideEditorFirst, true)
+}
+
+func (a *App) startAreaCaptureMode(hideEditorFirst bool, longMode bool) {
 	a.mu.Lock()
-	if a.activeOverlay != nil {
+	if a.activeOverlay != nil || a.activeScroll != nil {
 		a.mu.Unlock()
 		return
 	}
@@ -182,8 +193,9 @@ func (a *App) StartAreaCapture(hideEditorFirst bool) {
 		displays := mygo.Screen.Displays()
 
 		session := &overlaySession{
-			app:     a,
-			windows: winList,
+			app:      a,
+			windows:  winList,
+			longMode: longMode,
 		}
 		a.mu.Lock()
 		a.activeOverlay = session
@@ -257,7 +269,7 @@ func ComputeToolbarLayout(x0, y0, x1, y1, viewW, viewH, mainW, subW float32, sho
 		gap      float32 = 8
 	)
 	if mainW < 520 {
-		mainW = 636
+		mainW = 672
 	}
 	if subW < 180 {
 		subW = 420
@@ -705,6 +717,36 @@ func (p *overlayPane) commitSave(viewW, viewH float32) {
 	go app.SaveImageWithDialog(finalImg, nil)
 }
 
+func (p *overlayPane) commitLongCapture(viewW, viewH float32) {
+	relPx := p.selectionPxRect(viewW, viewH)
+	if relPx.Dx() < 24 || relPx.Dy() < 24 {
+		return
+	}
+	x0, y0, x1, y1 := p.normSel()
+	firstFrame := winapi.CropRGBA(p.capture.Image, relPx)
+	physRect := relPx.Add(p.capture.Monitor.Bounds.Min)
+	selDip := ui.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
+	disp := p.display
+	app := p.session.app
+
+	// Hand foreground focus directly to the target window underneath the selected
+	// region WHILE Koma's overlay still holds the Windows foreground lock!
+	cx := (physRect.Min.X + physRect.Max.X) / 2
+	cy := (physRect.Min.Y + physRect.Max.Y) / 2
+	winapi.ActivateWindowAt(cx, cy)
+
+	p.session.closeAll()
+	go func() {
+		sleepMs(40)
+		app.StartScrollCapture(ScrollCaptureParams{
+			Display:    disp,
+			SelDip:     selDip,
+			PhysRect:   physRect,
+			FirstFrame: firstFrame,
+		})
+	}()
+}
+
 func (p *overlayPane) resetSelection() {
 	p.hasSelection = false
 	p.hasBarKind = false
@@ -802,6 +844,10 @@ func (p *overlayPane) view(c *ui.Context) {
 		}
 		if c.Shortcut(ui.Ctrl, ui.KeyS) {
 			p.commitSave(viewW, viewH)
+			return
+		}
+		if c.Shortcut(0, ui.KeyL) && !c.FocusTakesText() {
+			p.commitLongCapture(viewW, viewH)
 			return
 		}
 		if c.Shortcut(ui.Ctrl, ui.KeyZ) && !c.FocusTakesText() {
@@ -1131,6 +1177,9 @@ func (p *overlayPane) view(c *ui.Context) {
 							lw := p.localWins[p.hoveredWinIdx]
 							p.selX0, p.selY0, p.selX1, p.selY1 = lw.x0, lw.y0, lw.x1, lw.y1
 							p.hasSelection = true
+							if p.session.longMode {
+								p.commitLongCapture(viewW, viewH)
+							}
 							return true
 						}
 						p.hasSelection = false
@@ -1138,6 +1187,9 @@ func (p *overlayPane) view(c *ui.Context) {
 					}
 					p.selX0, p.selY0, p.selX1, p.selY1 = x0, y0, x1, y1
 					p.hasSelection = true
+					if p.session.longMode {
+						p.commitLongCapture(viewW, viewH)
+					}
 				} else if mode != dragNone {
 					p.selX0, p.selY0, p.selX1, p.selY1 = p.normSel()
 				}
@@ -1240,6 +1292,9 @@ func (p *overlayPane) view(c *ui.Context) {
 					}
 					badge = fmt.Sprintf("%s  ·  %d × %d", winSnapTitle, pxW, pxH)
 				}
+				if p.session.longMode {
+					badge = "长截图 · " + badge
+				}
 				span := ui.Span{Text: badge, Size: 12, Weight: 600, Color: ui.Hex("#FFFFFF")}
 				tw, th := pt.MeasureText(0, span)
 				badgeW, badgeH := tw+22, th+10
@@ -1303,7 +1358,7 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 
 	mainW := p.measuredMainW
 	if mainW < 520 {
-		mainW = 636
+		mainW = 672
 	}
 	subW := p.measuredSubW
 	if subW < 180 {
@@ -1375,6 +1430,9 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 
 		glassSep(c, inks)
 
+		if glassToolBtn(c, inks, icons.LongCapture, "长截图", "滚动长截图 (L)", false, false) {
+			p.commitLongCapture(viewW, viewH)
+		}
 		if glassToolBtn(c, inks, icons.Pin, "贴图", "贴图到桌面", false, false) {
 			p.commitPin(viewW, viewH)
 		}

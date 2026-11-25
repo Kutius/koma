@@ -36,3 +36,19 @@ func CapturePrimaryMonitor() (*image.RGBA, Monitor, error) {
 }
 func ListVisibleWindows() []WindowInfo { return nil }
 func TrimWorkingSet()                  {}
+
+const WheelDelta = 120
+
+type ScreenGrabber struct{}
+
+func NewScreenGrabber(image.Rectangle) (*ScreenGrabber, error) {
+	return nil, errors.New("unsupported platform")
+}
+func (*ScreenGrabber) GrabInto(*image.RGBA) (*image.RGBA, error) {
+	return nil, errors.New("unsupported platform")
+}
+func (*ScreenGrabber) Close()                                {}
+func ScrollWindowAt(int, int, int, bool) bool                { return false }
+func ActivateWindowAt(int, int) bool                         { return false }
+func GetCursorPosPx() (int, int, bool)                       { return 0, 0, false }
+func IsEscapePressed() bool                                  { return false }
