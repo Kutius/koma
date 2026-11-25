@@ -30,11 +30,7 @@
 
 | 原位截屏与标注 | 极简主界面 |
 | :---: | :---: |
-| ![原位截屏与标注](docs/images/overlay.png) | ![极简主界面](docs/images/home.png) |
-
-<p align="center">
-  <img src="docs/images/studio-dark.png" alt="深色编辑工作台" width="88%" />
-</p>
+| ![原位截屏与标注](docs/images/overlay-light.png) | ![极简主界面](docs/images/home.png) |
 
 ## 特性
 
