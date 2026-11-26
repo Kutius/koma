@@ -273,6 +273,16 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if a.Hotkey(app.HotkeyArea) != app.DefaultHotkeyArea || a.Hotkey(app.HotkeyFull) != app.DefaultHotkeyFull {
 		t.Fatalf("expected default hotkeys after 恢复默认, got area=%q full=%q", a.Hotkey(app.HotkeyArea), a.Hotkey(app.HotkeyFull))
 	}
+
+	// Verify software update controls inside Settings sheet
+	updateChecks := 0
+	a.SetTestUpdateState("", func() { updateChecks++ })
+	if err := ttSettings.Click("检查更新"); err != nil {
+		t.Fatalf("click 检查更新 failed: %v", err)
+	}
+	if updateChecks != 1 {
+		t.Fatalf("expected CheckForUpdates count = 1, got %d", updateChecks)
+	}
 	ed.CloseSettings()
 
 	// 6. Live Scrolling Capture Overlay: verify live preview stitching, auto-scroll toggle, and visual layout

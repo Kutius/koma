@@ -99,13 +99,14 @@ type EditorState struct {
 	lastMeasX   int
 	lastMeasY   int
 
-	historyOpen       bool
-	helpOpen          bool
-	settingsOpen      bool
-	openAtLoginToggle bool
-	recordingHotkey   HotkeyAction
-	settingsErr       string
-	hotkeyRecHandles  [4]ui.Handle
+	historyOpen            bool
+	helpOpen               bool
+	settingsOpen           bool
+	openAtLoginToggle      bool
+	autoCheckUpdatesToggle bool
+	recordingHotkey        HotkeyAction
+	settingsErr            string
+	hotkeyRecHandles       [4]ui.Handle
 	toastMsg          string
 	toastUntil        time.Time
 	brandBmp          *ui.Bitmap
@@ -143,13 +144,20 @@ func (e *EditorState) SettingsOpen() bool { return e.settingsOpen }
 // RecordingHotkey reports which hotkey action is currently listening for input ("" if none).
 func (e *EditorState) RecordingHotkey() HotkeyAction { return e.recordingHotkey }
 
-// OpenSettings syncs OS startup state and opens the Settings sheet.
+// OpenSettings syncs OS startup and updater state and opens the Settings sheet.
 func (e *EditorState) OpenSettings() {
 	e.app.SyncOpenAtLogin()
+	e.app.SyncUpdaterState()
 	e.openAtLoginToggle = e.app.OpenAtLogin()
+	e.autoCheckUpdatesToggle = e.app.AutomaticUpdateChecks()
 	e.helpOpen = false
 	e.settingsOpen = true
 	e.settingsErr = ""
+}
+
+// SyncUpdaterState refreshes Settings toggles after background updater state changes.
+func (e *EditorState) SyncUpdaterState() {
+	e.autoCheckUpdatesToggle = e.app.AutomaticUpdateChecks()
 }
 
 // CloseSettings closes the Settings sheet and restores paused global shortcuts.
@@ -1384,9 +1392,14 @@ func (e *EditorState) renderThemeAndHelpBtns(c *ui.Context, tk appleTokens) {
 	if themeBtn.Clicked() {
 		e.app.ToggleDarkMode()
 	}
+	availUpdate := e.app.AvailableUpdate()
+	settingsTip := "设置 (Ctrl+,)"
+	if availUpdate != "" {
+		settingsTip = fmt.Sprintf("设置 · 发现新版本 v%s (Ctrl+,)", availUpdate)
+	}
 	settingsBtn := ui.Box(c.Key("settings-toggle-btn")).Size(24, 24).Center().Radius(12).
 		Role(ui.RoleButton).Label("设置").
-		Cursor(ui.CursorPointer).Tooltip("设置 (Ctrl+,)")
+		Cursor(ui.CursorPointer).Tooltip(settingsTip)
 	sCol := tk.textSecondary
 	if e.settingsOpen {
 		settingsBtn.Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder)
@@ -1400,6 +1413,10 @@ func (e *EditorState) renderThemeAndHelpBtns(c *ui.Context, tk appleTokens) {
 	sGlyph := icons.Settings.For(e.settingsOpen || settingsBtn.Hovered() || settingsBtn.Pressed())
 	settingsBtn.Children(func() {
 		ui.Icon(c, sGlyph).Size(15, 15).TextColor(sCol).ContentTransition(ui.ContentTransition{})
+		if availUpdate != "" && !e.settingsOpen {
+			ui.Box(c).Absolute().Top(2).Right(2).Size(6, 6).Radius(3).
+				Background(tk.accent).PassThrough()
+		}
 	})
 	if settingsBtn.Clicked() {
 		if e.settingsOpen {
@@ -1898,7 +1915,7 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 		}
 		scrim.Children(func() {
 			sheet := ui.Column(c.Key("settings-sheet")).
-				Width(492).Padding(24).Gap(18).Radius(28).
+				Width(492).Padding(22).Gap(14).Radius(28).
 				Material(glasswork.Card(tk.glass.Kind)).
 				Transition(glasswork.PanelTransition(0, 12))
 			sheet.Clicked()
@@ -2084,6 +2101,73 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 							}
 						})
 					}
+				})
+
+				// Section 3: Software Updates
+				ui.Column(c).Gap(8).Children(func() {
+					ui.Text(c, "软件更新").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
+
+					e.renderLiquidSwitchRow(c, tk, "settings-autocheck", "自动检查更新", &e.autoCheckUpdatesToggle, func(on bool) {
+						e.app.SetAutomaticUpdateChecks(on)
+						if on {
+							e.SetToast("已开启每日自动检查更新")
+						} else {
+							e.SetToast("已关闭自动检查更新")
+						}
+					})
+
+					avail := e.app.AvailableUpdate()
+					verLabel := "v" + e.app.AppVersion()
+					ui.Row(c.Key("settings-update-row")).
+						Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(8).
+						Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+						ui.Row(c).AlignItems(ui.Center).Gap(8).Grow(1).Children(func() {
+							ui.Text(c, "当前版本").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine()
+							ui.Box(c).Padding(2, 8, 2, 8).Radius(8).
+								Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline).Children(func() {
+								ui.Text(c, verLabel).FontSize(11.5).FontWeight(600).TextColor(tk.textSecondary).SingleLine()
+							})
+							if avail != "" {
+								ui.Box(c).Padding(2, 8, 2, 8).Radius(8).
+									Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder).Children(func() {
+									ui.Textf(c, "新版本 v%s", avail).FontSize(11.5).FontWeight(600).TextColor(tk.inks.Accent).SingleLine()
+								})
+							}
+						})
+
+						btnLabel := "检查更新"
+						btnTip := "从 GitHub Releases 检查 Koma 新版本"
+						if avail != "" {
+							btnLabel = "立即更新"
+							btnTip = fmt.Sprintf("查看并安装 Koma v%s", avail)
+						}
+						checkBtn := ui.Row(c.Key("settings-check-update")).
+							Height(28).Padding(0, 12, 0, 10).Gap(5).Radius(14).
+							AlignItems(ui.Center).Shrink(0).
+							Role(ui.RoleButton).Label(btnLabel).
+							Cursor(ui.CursorPointer).Tooltip(btnTip)
+						btnFg := tk.textPrimary
+						if avail != "" {
+							checkBtn.Material(glasswork.Tinted(tk.accent))
+							btnFg = ui.Hex("#FFFFFF")
+						} else {
+							if checkBtn.Hovered() {
+								checkBtn.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+								btnFg = tk.inks.Accent
+							} else {
+								checkBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+							}
+							checkBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+						}
+						glasswork.ApplyLiquidButton(checkBtn, glasswork.CompactButtonOpts())
+						checkBtn.Children(func() {
+							ui.Icon(c, icons.Restart.For(avail != "" || checkBtn.Pressed())).Size(14, 14).Shrink(0).TextColor(btnFg).ContentTransition(ui.ContentTransition{})
+							ui.Text(c, btnLabel).FontSize(11.5).FontWeight(600).TextColor(btnFg).SingleLine().Shrink(0)
+						})
+						if checkBtn.Clicked() {
+							e.app.CheckForUpdates()
+						}
+					})
 				})
 
 				if e.settingsErr != "" {

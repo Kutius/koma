@@ -27,7 +27,10 @@ const (
 	scrollStateMaxHeight
 )
 
-const scrollShadowPad float32 = 12
+const (
+	scrollShadowPad     float32 = 12
+	scrollBarTooltipPad float32 = 44
+)
 
 // ScrollCaptureParams describes the screen region selected for live scrolling capture.
 type ScrollCaptureParams struct {
@@ -194,24 +197,17 @@ func (a *App) StartScrollCapture(params ScrollCaptureParams) {
 	}
 
 	// 3. Compact floating Liquid Glass Control Bar window.
-	bx0 := clamp32(s.barCardR.X-scrollShadowPad, 0, max(0, dispW-40))
-	by0 := clamp32(s.barCardR.Y-scrollShadowPad, 0, max(0, dispH-40))
-	bx1 := clamp32(s.barCardR.X+s.barCardR.W+scrollShadowPad, bx0+40, dispW)
-	by1 := clamp32(s.barCardR.Y+s.barCardR.H+scrollShadowPad, by0+40, dispH)
-	// Guarantee zero transparent-margin intrusion into selDip when placed below/above it.
-	if s.barCardR.Y >= s.selDip.Y+s.selDip.H {
-		by0 = max(by0, s.selDip.Y+s.selDip.H+2)
-	} else if s.barCardR.Y+s.barCardR.H <= s.selDip.Y {
-		by1 = min(by1, s.selDip.Y-2)
-	}
-	s.barWinOffX, s.barWinOffY = bx0, by0
+	// Reserve scrollBarTooltipPad on the open vertical side so button tooltips render at
+	// full height without squashing or flickering between the top and bottom edges.
+	barWinR := computeScrollBarWindowRect(s.selDip, s.barCardR, dispW, dispH)
+	s.barWinOffX, s.barWinOffY = barWinR.X, barWinR.Y
 
 	bw := mygo.NewWindow(mygo.WindowOptions{
 		Title:         "Koma 长截图工具栏",
-		X:             disp.X + int(math.Floor(float64(bx0))),
-		Y:             disp.Y + int(math.Floor(float64(by0))),
-		Width:         max(120, int(math.Ceil(float64(bx1-bx0)))),
-		Height:        max(56, int(math.Ceil(float64(by1-by0)))),
+		X:             disp.X + int(barWinR.X),
+		Y:             disp.Y + int(barWinR.Y),
+		Width:         int(barWinR.W),
+		Height:        int(barWinR.H),
 		Frameless:     true,
 		Transparent:   true,
 		AlwaysOnTop:   true,
@@ -816,19 +812,31 @@ func ComputeScrollOverlayLayout(x0, y0, x1, y1, viewW, viewH, barW float32) (bar
 	}
 
 	// 1. Place control bar: below selection -> above selection -> docked inside bottom.
+	// Reserve scrollBarTooltipPad on the open side so hover tooltips inside barWin have
+	// full height without clipping or oscillating between top and bottom edges.
 	maxBarX := max(margin, viewW-barW-margin)
 	barX := clamp32(x1-barW, margin, maxBarX)
 	var barY float32
 	switch {
-	case y1+gap+barH <= viewH-margin:
+	case y1+gap+barH <= viewH-scrollBarTooltipPad:
 		barY = y1 + gap
-	case y0-gap-barH >= margin:
+	case y0-gap-barH >= scrollBarTooltipPad:
 		barY = y0 - gap - barH
 	default:
 		barY = y1 - barH - margin
 	}
 	barY = clamp32(barY, margin, max(margin, viewH-barH-margin))
 	barRect = ui.Rect{X: barX, Y: barY, W: barW, H: barH}
+
+	// Vertical clearance between the preview card and the bar on whichever side barWin
+	// expands for tooltips so barWin's transparent tooltip band never covers previewWin.
+	barTopGap := gap
+	barBottomGap := gap
+	if barRect.Y >= y1 {
+		barBottomGap = max(gap, scrollBarTooltipPad)
+	} else {
+		barTopGap = max(gap, scrollBarTooltipPad)
+	}
 
 	// 2. Place live preview card beside the capture box without overlapping the control bar.
 	if viewW < prevW+margin*2+60 || viewH < minPrev+margin*2 {
@@ -847,20 +855,20 @@ func ComputeScrollOverlayLayout(x0, y0, x1, y1, viewW, viewH, barW float32) (bar
 		prevX = x0 - gap - prevW
 	default:
 		prevX = viewW - prevW - margin
-		if prevY+prevH+gap > barY && barY > margin+minPrev+gap {
-			prevH = min(prevH, barY-gap-margin)
-			prevY = max(margin, barY-gap-prevH)
+		if prevY+prevH+barTopGap > barY && barY > margin+minPrev+barTopGap {
+			prevH = min(prevH, barY-barTopGap-margin)
+			prevY = max(margin, barY-barTopGap-prevH)
 		}
 	}
 
 	horizOverlap := prevX < barRect.X+barRect.W && prevX+prevW > barRect.X
-	vertOverlap := prevY < barRect.Y+barRect.H+8 && prevY+prevH > barRect.Y-8
+	vertOverlap := prevY < barRect.Y+barRect.H+barBottomGap && prevY+prevH > barRect.Y-barTopGap
 	if horizOverlap && vertOverlap {
-		if barRect.Y-gap-minPrev >= margin {
-			prevH = min(prevH, barRect.Y-gap-margin)
-			prevY = barRect.Y - gap - prevH
-		} else if barRect.Y+barRect.H+gap+minPrev <= viewH-margin {
-			prevY = barRect.Y + barRect.H + gap
+		if barRect.Y-barTopGap-minPrev >= margin {
+			prevH = min(prevH, barRect.Y-barTopGap-margin)
+			prevY = barRect.Y - barTopGap - prevH
+		} else if barRect.Y+barRect.H+barBottomGap+minPrev <= viewH-margin {
+			prevY = barRect.Y + barRect.H + barBottomGap
 			prevH = min(prevH, viewH-margin-prevY)
 		}
 	}
@@ -869,6 +877,53 @@ func ComputeScrollOverlayLayout(x0, y0, x1, y1, viewW, viewH, barW float32) (bar
 	prevY = clamp32(prevY, margin, max(margin, viewH-prevH-margin))
 	previewRect = ui.Rect{X: prevX, Y: prevY, W: prevW, H: prevH}
 	return barRect, previewRect, true
+}
+
+// computeScrollBarWindowRect sizes the compact transparent window hosting the scroll
+// control bar, adding scrollBarTooltipPad on the open vertical side (never intruding
+// into selDip) so MyGo hover tooltips render at full height without top/bottom flicker.
+func computeScrollBarWindowRect(selDip, barCardR ui.Rect, dispW, dispH float32) ui.Rect {
+	padTop := scrollShadowPad
+	padBottom := scrollShadowPad
+	belowSel := barCardR.Y >= selDip.Y+selDip.H
+	aboveSel := barCardR.Y+barCardR.H <= selDip.Y
+
+	switch {
+	case belowSel && dispH-(barCardR.Y+barCardR.H) >= scrollBarTooltipPad:
+		padBottom = scrollBarTooltipPad
+	case aboveSel && barCardR.Y >= scrollBarTooltipPad:
+		padTop = scrollBarTooltipPad
+	default:
+		spaceAbove := barCardR.Y
+		spaceBelow := dispH - (barCardR.Y + barCardR.H)
+		if belowSel {
+			spaceAbove = min(spaceAbove, max(float32(0), barCardR.Y-(selDip.Y+selDip.H+2)))
+		} else if aboveSel {
+			spaceBelow = min(spaceBelow, max(float32(0), (selDip.Y-2)-(barCardR.Y+barCardR.H)))
+		}
+		if spaceAbove >= spaceBelow {
+			padTop = min(scrollBarTooltipPad, max(scrollShadowPad, spaceAbove))
+		} else {
+			padBottom = min(scrollBarTooltipPad, max(scrollShadowPad, spaceBelow))
+		}
+	}
+
+	bx0 := clamp32(barCardR.X-scrollShadowPad, 0, max(0, dispW-40))
+	by0 := clamp32(barCardR.Y-padTop, 0, max(0, dispH-40))
+	bx1 := clamp32(barCardR.X+barCardR.W+scrollShadowPad, bx0+40, dispW)
+	by1 := clamp32(barCardR.Y+barCardR.H+padBottom, by0+40, dispH)
+	// Guarantee zero transparent-margin intrusion into selDip when placed below/above it.
+	if belowSel {
+		by0 = max(by0, selDip.Y+selDip.H+2)
+	} else if aboveSel {
+		by1 = min(by1, selDip.Y-2)
+	}
+
+	x := float32(math.Floor(float64(bx0)))
+	y := float32(math.Floor(float64(by0)))
+	w := float32(max(120, int(math.Ceil(float64(bx1-x)))))
+	h := float32(max(56, int(math.Ceil(float64(by1-y)))))
+	return ui.Rect{X: x, Y: y, W: w, H: h}
 }
 
 func (s *scrollSession) syncPreviewBitmap() (scaledTotalH int) {

@@ -139,3 +139,58 @@ func TestOpenAtLoginStateHeadless(t *testing.T) {
 		t.Fatalf("expected OpenAtLogin false after disable")
 	}
 }
+
+func TestUpdaterStateAndSettingsControlsHeadless(t *testing.T) {
+	a := New()
+	if v := a.AppVersion(); v == "" {
+		t.Fatalf("expected non-empty AppVersion")
+	}
+	if !a.AutomaticUpdateChecks() {
+		t.Fatalf("expected AutomaticUpdateChecks initially true")
+	}
+	if got := a.trayUpdateLabel(); got != "检查更新…" {
+		t.Fatalf("initial trayUpdateLabel = %q, want 检查更新…", got)
+	}
+
+	checks := 0
+	a.SetTestUpdateState("", func() { checks++ })
+
+	ed := NewEditorState(a)
+	ed.OpenSettings()
+	tt := ui.NewTester(ed.View, 1220, 780)
+
+	if !tt.HasText("v" + a.AppVersion()) {
+		t.Fatalf("expected current version v%s in settings sheet, got %q", a.AppVersion(), tt.Texts())
+	}
+	if err := tt.Click("自动检查更新"); err != nil {
+		t.Fatalf("click 自动检查更新 switch failed: %v", err)
+	}
+	if a.AutomaticUpdateChecks() {
+		t.Fatalf("expected AutomaticUpdateChecks() == false after toggling off")
+	}
+	if err := tt.Click("检查更新"); err != nil {
+		t.Fatalf("click 检查更新 failed: %v", err)
+	}
+	if checks != 1 {
+		t.Fatalf("expected CheckForUpdates callback count = 1, got %d", checks)
+	}
+
+	// Simulate an available update discovered by a background check
+	a.SetTestUpdateState("v0.3.0", func() { checks++ })
+	if got := a.AvailableUpdate(); got != "0.3.0" {
+		t.Fatalf("AvailableUpdate = %q, want 0.3.0", got)
+	}
+	if got := a.trayUpdateLabel(); got != "发现新版本 v0.3.0…" {
+		t.Fatalf("trayUpdateLabel with update = %q, want 发现新版本 v0.3.0…", got)
+	}
+	tt.Frame()
+	if !tt.HasText("新版本 v0.3.0") {
+		t.Fatalf("expected 新版本 v0.3.0 badge in settings sheet, got %q", tt.Texts())
+	}
+	if err := tt.Click("立即更新"); err != nil {
+		t.Fatalf("click 立即更新 failed: %v", err)
+	}
+	if checks != 2 {
+		t.Fatalf("expected CheckForUpdates callback count = 2, got %d", checks)
+	}
+}

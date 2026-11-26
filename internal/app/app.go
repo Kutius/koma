@@ -70,6 +70,13 @@ type App struct {
 	hotkeysPaused  bool
 	delayCountdown int
 
+	// Auto-updater state (backed by MyGo's native updater plugin when running)
+	updaterReady     bool
+	autoCheckUpdates bool
+	availableUpdate  string
+	lastUpdateCheck  time.Time
+	checkUpdatesHook func()
+
 	// Global hotkey accelerators ("" means disabled)
 	hotkeyArea  string
 	hotkeyFull  string
@@ -80,11 +87,12 @@ type App struct {
 // New creates and initializes a Koma application state.
 func New() *App {
 	a := &App{
-		darkMode:    false, // Crisp Apple Light Studio default (toggleable to Space Graphite Dark)
-		hotkeyArea:  DefaultHotkeyArea,
-		hotkeyFull:  DefaultHotkeyFull,
-		hotkeyDelay: DefaultHotkeyDelay,
-		hotkeyPin:   DefaultHotkeyPin,
+		darkMode:         false, // Crisp Apple Light Studio default (toggleable to Space Graphite Dark)
+		autoCheckUpdates: true,
+		hotkeyArea:       DefaultHotkeyArea,
+		hotkeyFull:       DefaultHotkeyFull,
+		hotkeyDelay:      DefaultHotkeyDelay,
+		hotkeyPin:        DefaultHotkeyPin,
 	}
 	a.editor = NewEditorState(a)
 	return a
@@ -93,6 +101,7 @@ func New() *App {
 // Run starts the Koma desktop application lifecycle.
 func (a *App) Run() error {
 	mygo.App.SetName("Koma")
+	a.setupUpdater()
 
 	// Stay resident in the system tray when windows close so hotkeys stay instant.
 	mygo.App.OnWindowAllClosed(func() {})
@@ -101,6 +110,7 @@ func (a *App) Run() error {
 		a.initSettingsPath()
 		_ = a.LoadSettings()
 		a.SyncOpenAtLogin()
+		a.SyncUpdaterState()
 		a.setupTray()
 		a.setupGlobalShortcuts()
 		a.SyncWindowTheme()
@@ -167,6 +177,10 @@ func (a *App) buildTrayMenu() *mygo.Menu {
 		{
 			Label: "设置…",
 			Click: func(*mygo.MenuItem, *mygo.Window) { a.ShowSettings() },
+		},
+		{
+			Label: a.trayUpdateLabel(),
+			Click: func(*mygo.MenuItem, *mygo.Window) { a.CheckForUpdates() },
 		},
 		mygo.Separator(),
 		{
