@@ -26,6 +26,10 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${args[@]}"
           fi
 
+  verify:
+    needs: draft-release
+    uses: ./.github/workflows/ci.yml
+
   build:
     needs: draft-release
     name: ${{ matrix.name }}
@@ -55,3 +59,73 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" build/windows-amd64/Koma.exe \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify required release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for required in \
+            "Koma.exe" \
+            "SHA256SUMS" \
+            "koma-setup-${ver}-amd64.exe" \
+            "koma-setup-${ver}-arm64.exe" \
+            "update-windows-amd64.json" \
+            "update-windows-arm64.json"; do
+            if ! printf '%s\n' "$assets" | grep -Fxq "$required"; then
+              echo "Missing required release asset: $required" >&2
+              exit 1
+            fi
+          done
+      - name: Generate release notes and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          notes_file="$(mktemp)"
+
+          changelog_body="$(awk -v ver="$ver" '
+            $0 == "## " ver { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e '/./,$!d')"
+
+          {
+            echo "## Koma ${GITHUB_REF_NAME}"
+            echo ""
+            if [ -n "$changelog_body" ]; then
+              printf '%s\n' "$changelog_body"
+            else
+              echo "- Maintenance release ${GITHUB_REF_NAME}."
+            fi
+            echo ""
+            echo "### 下载说明"
+            echo ""
+            echo "- **便携版（免安装）**：直接下载 \`Koma.exe\` 运行（Windows x64）。"
+            echo "- **安装程序**：下载 \`koma-setup-${ver}-amd64.exe\`（x64）或 \`koma-setup-${ver}-arm64.exe\`（ARM64）。"
+            echo "- **已安装旧版本用户**：可直接通过应用内「检查更新」自动下载差分增量包升级。"
+
+            prev_tag="$(git tag --list 'v*' --sort=-v:refname | awk -v cur="$GITHUB_REF_NAME" '$0 == cur { seen=1; next } seen { print; exit }')"
+            if [ -n "$prev_tag" ]; then
+              echo ""
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${prev_tag}...${GITHUB_REF_NAME}"
+            fi
+          } > "$notes_file"
+
+          args=(--draft=false --title "Koma ${GITHUB_REF_NAME}" --notes-file "$notes_file")
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            args+=(--prerelease --latest=false)
+          else
+            args+=(--latest)
+          fi
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${args[@]}"
