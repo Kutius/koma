@@ -12,7 +12,7 @@ import (
 	"koma/internal/icons"
 )
 
-const defaultAppVersion = "0.3.6"
+const defaultAppVersion = "0.3.7"
 
 // setupUpdater registers MyGo's native (zero-WebView) updater plugin and keeps
 // Koma's tray menu and Studio settings synchronized with background checks.

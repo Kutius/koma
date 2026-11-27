@@ -345,6 +345,19 @@ func TestOCRResultWindowHeadless(t *testing.T) {
 	if _, ok := tt.Find("仅复制"); !ok {
 		t.Fatalf("expected 仅复制 button in OCR result window")
 	}
+	if _, ok := tt.Find("关闭"); !ok {
+		t.Fatalf("expected 关闭 button in OCR result window")
+	}
+	// Clicking inside the TextArea must remain editable even though the outer
+	// ocr-card is a DragWindow handle (rune count badge increases from 20 to 21).
+	if !tt.HasText("2 行 · 20 字") {
+		t.Fatalf("expected initial OCR rune count badge '2 行 · 20 字', got texts: %q", tt.Texts())
+	}
+	tt.ClickAt(200, 140)
+	tt.Type("!")
+	if !tt.HasText("2 行 · 21 字") {
+		t.Fatalf("expected OCR textarea to stay editable inside DragWindow card (21 chars), got texts: %q", tt.Texts())
+	}
 }
 
 func TestSettingsOCRControlsHeadless(t *testing.T) {
