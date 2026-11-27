@@ -1,8 +1,10 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -192,5 +194,143 @@ func TestUpdaterStateAndSettingsControlsHeadless(t *testing.T) {
 	}
 	if checks != 2 {
 		t.Fatalf("expected CheckForUpdates callback count = 2, got %d", checks)
+	}
+}
+
+func TestSettingsSelectControlsHeadless(t *testing.T) {
+	a := New()
+	a.SetSettingsPath(filepath.Join(t.TempDir(), "settings.json"))
+	a.SetOCRDataDir(t.TempDir())
+
+	ed := NewEditorState(a)
+	ed.OpenSettings()
+	tt := ui.NewTester(ed.View, 1220, 780)
+
+	// 1. Appearance Select: defaults to 跟随系统, open and switch 跟随系统 -> 深色 -> 跟随系统
+	if got := a.ThemeMode(); got != ThemeModeSystem {
+		t.Fatalf("expected initial ThemeMode == ThemeModeSystem, got %q", got)
+	}
+	if err := tt.Click("选择外观"); err != nil {
+		t.Fatalf("click 选择外观 failed: %v", err)
+	}
+	if !tt.HasText("跟随系统") || !tt.HasText("浅色") || !tt.HasText("深色") {
+		t.Fatalf("expected 跟随系统/浅色/深色 options after opening 外观 select, got %q", tt.Texts())
+	}
+	if err := tt.Click("深色"); err != nil {
+		t.Fatalf("click 深色 option failed: %v", err)
+	}
+	if a.ThemeMode() != ThemeModeDark || !a.IsDarkMode() {
+		t.Fatalf("expected ThemeModeDark / dark=true after selecting 深色, got mode=%q dark=%v", a.ThemeMode(), a.IsDarkMode())
+	}
+	tt.Advance(500 * time.Millisecond)
+
+	// Switch back to 跟随系统 and verify OS theme changes propagate live
+	if err := tt.Click("选择外观"); err != nil {
+		t.Fatalf("re-open 选择外观 failed: %v", err)
+	}
+	if err := tt.Click("跟随系统"); err != nil {
+		t.Fatalf("click 跟随系统 option failed: %v", err)
+	}
+	if a.ThemeMode() != ThemeModeSystem || a.IsDarkMode() {
+		t.Fatalf("expected ThemeModeSystem / light when systemDark=false, got mode=%q dark=%v", a.ThemeMode(), a.IsDarkMode())
+	}
+	a.SetSystemDarkForTest(true)
+	if !a.IsDarkMode() {
+		t.Fatalf("expected IsDarkMode() == true when system switches dark in ThemeModeSystem")
+	}
+	a.SetSystemDarkForTest(false)
+	if a.IsDarkMode() {
+		t.Fatalf("expected IsDarkMode() == false when system switches light in ThemeModeSystem")
+	}
+	tt.Advance(500 * time.Millisecond)
+
+	// 2. Escape closes ONLY an open Select popup, keeping the Settings sheet open
+	if err := tt.Click("选择外观"); err != nil {
+		t.Fatalf("re-open 选择外观 failed: %v", err)
+	}
+	if !ed.anySettingsSelectOpen() {
+		t.Fatalf("expected anySettingsSelectOpen() == true")
+	}
+	tt.Key(0, ui.KeyEscape)
+	if ed.anySettingsSelectOpen() {
+		t.Fatalf("expected Escape to close open Select popup")
+	}
+	if !ed.SettingsOpen() {
+		t.Fatalf("expected Settings sheet to stay open after Escape dismissed Select popup")
+	}
+	tt.Advance(500 * time.Millisecond)
+
+	// 3. Default Format Select: switch PNG -> JPEG
+	if err := tt.Click("选择默认格式"); err != nil {
+		t.Fatalf("click 选择默认格式 failed: %v", err)
+	}
+	if err := tt.Click("JPEG"); err != nil {
+		t.Fatalf("click JPEG option failed: %v", err)
+	}
+	if got := a.SaveFormat(); got != SaveFormatJPEG {
+		t.Fatalf("SaveFormat() = %q, want %q", got, SaveFormatJPEG)
+	}
+	tt.Advance(500 * time.Millisecond)
+
+	// 4. OCR Engine Select: opens and lists 系统原生 + PP-OCRv6 (with 需下载 badge when uninstalled)
+	if err := tt.Click("选择识别引擎"); err != nil {
+		t.Fatalf("click 选择识别引擎 failed: %v", err)
+	}
+	if !tt.HasText("需下载") {
+		t.Fatalf("expected 需下载 badge for uninstalled PP-OCRv6 option, got %q", tt.Texts())
+	}
+	tt.Key(0, ui.KeyEscape)
+	tt.Advance(500 * time.Millisecond)
+
+	// Second Escape (no select open) closes the Settings sheet
+	tt.Key(0, ui.KeyEscape)
+	if ed.SettingsOpen() {
+		t.Fatalf("expected Escape with no open select to close Settings sheet")
+	}
+}
+
+func TestThemeModeSystemPersistenceAndLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Persisting ThemeModeSystem round-trips cleanly and follows OS theme
+	cfgSystem := filepath.Join(dir, "system.json")
+	a := New()
+	a.SetSettingsPath(cfgSystem)
+	a.SetThemeMode(ThemeModeSystem)
+
+	b := New()
+	b.SetSettingsPath(cfgSystem)
+	if err := b.LoadSettings(); err != nil {
+		t.Fatalf("LoadSettings(system): %v", err)
+	}
+	if b.ThemeMode() != ThemeModeSystem {
+		t.Fatalf("reloaded ThemeMode = %q, want system", b.ThemeMode())
+	}
+	b.SetSystemDarkForTest(true)
+	if !b.IsDarkMode() {
+		t.Fatalf("expected ThemeModeSystem to follow system dark=true")
+	}
+	// Quick toggle switches to explicit opposite mode and stops following system
+	b.ToggleDarkMode()
+	if b.ThemeMode() != ThemeModeLight || b.IsDarkMode() {
+		t.Fatalf("after ToggleDarkMode from system-dark: mode=%q dark=%v, want light/false", b.ThemeMode(), b.IsDarkMode())
+	}
+	b.SetSystemDarkForTest(true)
+	if b.IsDarkMode() {
+		t.Fatalf("explicit ThemeModeLight must ignore system dark changes")
+	}
+
+	// 2. Legacy settings.json with only dark_mode migrates cleanly to light/dark
+	cfgLegacy := filepath.Join(dir, "legacy.json")
+	if err := os.WriteFile(cfgLegacy, []byte(`{"dark_mode": true}`), 0o644); err != nil {
+		t.Fatalf("write legacy settings: %v", err)
+	}
+	c := New()
+	c.SetSettingsPath(cfgLegacy)
+	if err := c.LoadSettings(); err != nil {
+		t.Fatalf("LoadSettings(legacy): %v", err)
+	}
+	if c.ThemeMode() != ThemeModeDark || !c.IsDarkMode() {
+		t.Fatalf("legacy dark_mode=true migrated to mode=%q dark=%v, want dark/true", c.ThemeMode(), c.IsDarkMode())
 	}
 }

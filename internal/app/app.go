@@ -71,6 +71,8 @@ type App struct {
 
 	// Preferences & settings
 	settingsPath   string
+	themeMode      ThemeMode
+	systemDark     bool
 	darkMode       bool
 	openAtLogin    bool
 	hotkeysPaused  bool
@@ -107,7 +109,9 @@ type App struct {
 // New creates and initializes a Koma application state.
 func New() *App {
 	a := &App{
-		darkMode:         false, // Crisp Apple Light Studio default (toggleable to Space Graphite Dark)
+		themeMode:        ThemeModeSystem,
+		systemDark:       false,
+		darkMode:         false,
 		autoCheckUpdates: true,
 		saveFormat:       SaveFormatPNG,
 		ocrEngine:        ocr.EngineSystem,
@@ -124,11 +128,38 @@ func New() *App {
 	return a
 }
 
-// IsDarkMode reports whether Koma is currently using dark appearance.
+// IsDarkMode reports whether Koma is currently using dark appearance (resolving system mode).
 func (a *App) IsDarkMode() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.darkMode
+}
+
+// ThemeMode returns the user's configured appearance preference ("system", "light", or "dark").
+func (a *App) ThemeMode() ThemeMode {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return normalizeThemeMode(string(a.themeMode))
+}
+
+func (a *App) resolveDarkLocked() bool {
+	switch normalizeThemeMode(string(a.themeMode)) {
+	case ThemeModeDark:
+		return true
+	case ThemeModeLight:
+		return false
+	default:
+		return a.systemDark
+	}
+}
+
+// SetSystemDarkForTest simulates an OS-level light/dark theme change in headless tests.
+func (a *App) SetSystemDarkForTest(dark bool) {
+	a.mu.Lock()
+	a.systemDark = dark
+	a.darkMode = a.resolveDarkLocked()
+	a.mu.Unlock()
+	a.invalidateThemedWindows()
 }
 
 // Run starts the Koma desktop application lifecycle.
@@ -147,6 +178,9 @@ func (a *App) Run() error {
 		a.setupTray()
 		a.setupGlobalShortcuts()
 		a.SyncWindowTheme()
+		mygo.Theme.OnUpdated(func() {
+			a.RefreshSystemTheme()
+		})
 		// When launched silently at Windows login, stay tray-only without creating a
 		// window or initializing the Direct3D 11 device until the user opens Studio.
 		if !mygo.App.WasOpenedAtLogin() {
@@ -400,41 +434,124 @@ func (a *App) Quit() {
 	mygo.App.Quit()
 }
 
-// SyncWindowTheme aligns Windows native caption buttons (min/max/close) and menus
-// with Koma's light/dark appearance so top-right controls always have razor-sharp contrast.
+// SyncWindowTheme aligns Windows native caption buttons (min/max/close), menus,
+// and effective system theme state with Koma's appearance preference.
 func (a *App) SyncWindowTheme() {
 	a.mu.Lock()
-	dark := a.darkMode
+	mode := normalizeThemeMode(string(a.themeMode))
 	w := a.editorWin
 	a.mu.Unlock()
 
-	src := mygo.ThemeLight
-	if dark {
+	src := mygo.ThemeSystem
+	switch mode {
+	case ThemeModeLight:
+		src = mygo.ThemeLight
+	case ThemeModeDark:
 		src = mygo.ThemeDark
 	}
+
 	if mygo.App.IsReady() {
 		mygo.Theme.SetSource(src)
+		if mode == ThemeModeSystem {
+			sysDark := mygo.Theme.IsDark()
+			a.mu.Lock()
+			a.systemDark = sysDark
+			a.darkMode = a.resolveDarkLocked()
+			a.mu.Unlock()
+		}
+	}
+
+	a.mu.Lock()
+	dark := a.darkMode
+	if w == nil {
+		w = a.editorWin
+	}
+	a.mu.Unlock()
+
+	btnTheme := mygo.ThemeLight
+	if dark {
+		btnTheme = mygo.ThemeDark
 	}
 	if w != nil {
-		w.SetWindowButtonsTheme(src)
+		w.SetWindowButtonsTheme(btnTheme)
 	}
 }
 
-// ToggleDarkMode switches between high-contrast light and dark modes and updates native window controls.
-func (a *App) ToggleDarkMode() {
+// RefreshSystemTheme updates Koma's live appearance when the Windows OS theme changes.
+func (a *App) RefreshSystemTheme() {
 	a.mu.Lock()
-	dark := !a.darkMode
+	mode := normalizeThemeMode(string(a.themeMode))
 	a.mu.Unlock()
-	a.SetDarkMode(dark)
+	if mode != ThemeModeSystem || !mygo.App.IsReady() {
+		return
+	}
+	sysDark := mygo.Theme.IsDark()
+	a.mu.Lock()
+	prev := a.darkMode
+	a.systemDark = sysDark
+	a.darkMode = a.resolveDarkLocked()
+	changed := a.darkMode != prev
+	w := a.editorWin
+	a.mu.Unlock()
+
+	btnTheme := mygo.ThemeLight
+	if sysDark {
+		btnTheme = mygo.ThemeDark
+	}
+	if w != nil {
+		w.SetWindowButtonsTheme(btnTheme)
+	}
+	if changed {
+		a.invalidateThemedWindows()
+	}
 }
 
-// SetDarkMode sets Koma's light/dark appearance, syncs native window chrome, and persists the preference.
-func (a *App) SetDarkMode(dark bool) {
+func (a *App) invalidateThemedWindows() {
 	a.mu.Lock()
-	a.darkMode = dark
+	edWin := a.editorWin
+	ocrW := a.ocrWin
+	a.mu.Unlock()
+	if edWin != nil {
+		edWin.Update(func() {})
+	}
+	if ocrW != nil {
+		ocrW.mu.Lock()
+		ow := ocrW.win
+		ocrW.mu.Unlock()
+		if ow != nil {
+			ow.Update(func() {})
+		}
+	}
+}
+
+// ToggleDarkMode switches between light and dark modes (overriding system mode for immediate feedback).
+func (a *App) ToggleDarkMode() {
+	if a.IsDarkMode() {
+		a.SetThemeMode(ThemeModeLight)
+	} else {
+		a.SetThemeMode(ThemeModeDark)
+	}
+}
+
+// SetThemeMode sets Koma's appearance mode ("system", "light", or "dark"), syncs OS chrome, and persists it.
+func (a *App) SetThemeMode(mode ThemeMode) {
+	mode = normalizeThemeMode(string(mode))
+	a.mu.Lock()
+	a.themeMode = mode
+	a.darkMode = a.resolveDarkLocked()
 	a.mu.Unlock()
 	a.SyncWindowTheme()
+	a.invalidateThemedWindows()
 	_ = a.SaveSettings()
+}
+
+// SetDarkMode sets an explicit light/dark appearance, syncs native window chrome, and persists the preference.
+func (a *App) SetDarkMode(dark bool) {
+	if dark {
+		a.SetThemeMode(ThemeModeDark)
+	} else {
+		a.SetThemeMode(ThemeModeLight)
+	}
 }
 
 // ShowSettings brings Studio to the front and opens the Liquid Glass Settings sheet.

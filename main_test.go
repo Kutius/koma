@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -262,13 +263,27 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 		t.Fatalf("after canceling 全屏截图 hotkey, got %q, want empty", got)
 	}
 	// Capture preview while the confirmation Toast is floating above Settings
-	ttSettings.Frame()
+	ttSettings.Advance(450 * time.Millisecond)
 	savePreview(t, dumpDir, "v3_07_settings_light.png", ttSettings.Image())
 
 	if dumpDir != "" {
+		// Dump Settings with Liquid Glass Select open (both mid-stretch neck & settled open) in Light & Dark modes
+		_ = ttSettings.Click("选择外观")
+		ttSettings.Advance(45 * time.Millisecond)
+		savePreview(t, dumpDir, "v3_07b_settings_select_stretch_light.png", ttSettings.Image())
+		ttSettings.Advance(450 * time.Millisecond)
+		savePreview(t, dumpDir, "v3_07c_settings_select_open_light.png", ttSettings.Image())
+		ttSettings.Key(0, ui.KeyEscape)
+		ttSettings.Advance(450 * time.Millisecond)
+
 		a.SetDarkMode(true)
 		ttSettingsDark := ui.NewTester(ed.View, 1220, 780)
 		savePreview(t, dumpDir, "v3_08_settings_dark.png", ttSettingsDark.Image())
+		_ = ttSettingsDark.Click("选择识别引擎")
+		ttSettingsDark.Advance(450 * time.Millisecond)
+		savePreview(t, dumpDir, "v3_08b_settings_select_open_dark.png", ttSettingsDark.Image())
+		ttSettingsDark.Key(0, ui.KeyEscape)
+		ttSettingsDark.Advance(450 * time.Millisecond)
 		a.SetDarkMode(false)
 	}
 

@@ -106,6 +106,15 @@ type EditorState struct {
 	openAtLoginToggle      bool
 	autoCheckUpdatesToggle bool
 	quickSaveToggle        bool
+	themeChoice            ThemeMode
+	themeChoiceSynced      ThemeMode
+	themeSelectOpen        bool
+	formatChoice           string
+	formatChoiceSynced     string
+	formatSelectOpen       bool
+	ocrEngineChoice        ocr.Engine
+	ocrEngineSynced        ocr.Engine
+	ocrEngineSelectOpen    bool
 	recordingHotkey        HotkeyAction
 	settingsErr            string
 	hotkeyRecHandles       [5]ui.Handle
@@ -153,9 +162,35 @@ func (e *EditorState) OpenSettings() {
 	e.openAtLoginToggle = e.app.OpenAtLogin()
 	e.autoCheckUpdatesToggle = e.app.AutomaticUpdateChecks()
 	e.quickSaveToggle = e.app.QuickSave()
+	e.syncSettingsSelectChoices()
+	e.themeSelectOpen = false
+	e.formatSelectOpen = false
+	e.ocrEngineSelectOpen = false
 	e.helpOpen = false
 	e.settingsOpen = true
 	e.settingsErr = ""
+}
+
+func (e *EditorState) syncSettingsSelectChoices() {
+	curTheme := e.app.ThemeMode()
+	if e.themeChoice == "" || curTheme != e.themeChoiceSynced {
+		e.themeChoice = curTheme
+		e.themeChoiceSynced = curTheme
+	}
+	curFmt := e.app.SaveFormat()
+	if e.formatChoice == "" || curFmt != e.formatChoiceSynced {
+		e.formatChoice = curFmt
+		e.formatChoiceSynced = curFmt
+	}
+	curOCR := e.app.OCREngine()
+	if e.ocrEngineChoice == "" || curOCR != e.ocrEngineSynced {
+		e.ocrEngineChoice = curOCR
+		e.ocrEngineSynced = curOCR
+	}
+}
+
+func (e *EditorState) anySettingsSelectOpen() bool {
+	return e.themeSelectOpen || e.formatSelectOpen || e.ocrEngineSelectOpen
 }
 
 // SyncUpdaterState refreshes Settings toggles after background updater state changes.
@@ -166,6 +201,9 @@ func (e *EditorState) SyncUpdaterState() {
 // CloseSettings closes the Settings sheet and restores paused global shortcuts.
 func (e *EditorState) CloseSettings() {
 	e.stopRecordingHotkey()
+	e.themeSelectOpen = false
+	e.formatSelectOpen = false
+	e.ocrEngineSelectOpen = false
 	e.settingsOpen = false
 	e.settingsErr = ""
 }
@@ -555,7 +593,7 @@ type appleTokens struct {
 }
 
 func (e *EditorState) tokens() appleTokens {
-	if e.app.darkMode {
+	if e.app.IsDarkMode() {
 		g := glasswork.Dark()
 		g.Density = 0.56
 		g.Floor = 0.38
@@ -597,7 +635,7 @@ func (e *EditorState) tokens() appleTokens {
 
 // View renders the full-bleed canvas with floating Glasswork liquid glass chrome.
 func (e *EditorState) View(c *ui.Context) {
-	if e.app.darkMode {
+	if e.app.IsDarkMode() {
 		c.SetTheme(ui.DarkTheme())
 	} else {
 		c.SetTheme(ui.LightTheme())
@@ -679,6 +717,11 @@ func (e *EditorState) View(c *ui.Context) {
 func (e *EditorState) handleShortcuts(c *ui.Context) {
 	// While recording a global shortcut, let the focused recorder receive every keystroke.
 	if e.recordingHotkey != "" {
+		return
+	}
+	// While a Settings Liquid Glass Select popup is open, let it handle Escape / Arrow / Enter keys
+	// without closing the Settings sheet underneath.
+	if e.settingsOpen && e.anySettingsSelectOpen() {
 		return
 	}
 	if c.Shortcut(ui.Ctrl, ui.KeyComma) {
@@ -1380,7 +1423,7 @@ func (e *EditorState) renderHomeCornerControls(c *ui.Context, tk appleTokens) {
 func (e *EditorState) renderThemeAndHelpBtns(c *ui.Context, tk appleTokens) {
 	themeIcon := icons.Moon.Active
 	themeTip := "切换深色石墨外观"
-	if e.app.darkMode {
+	if e.app.IsDarkMode() {
 		themeIcon = icons.Sun.Active
 		themeTip = "切换浅色瓷白外观"
 	}
@@ -1910,6 +1953,7 @@ func (e *EditorState) renderHelpSheet(c *ui.Context, tk appleTokens) {
 }
 
 func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
+	e.syncSettingsSelectChoices()
 	ui.Overlay(c, func() {
 		scrimAnim := glasswork.AnimColorFade
 		scrim := ui.Box(c.Key("settings-scrim")).Absolute().Top(0).Left(0).Right(0).Bottom(0).Background(ui.RGBA(0, 0, 0, 0.36)).Center().
@@ -1961,16 +2005,30 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 								}
 							})
 
-							ui.Row(c).Height(38).Padding(0, 12, 0, 12).Radius(13).
+							ui.Row(c.Key("settings-theme-row")).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).
 								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
 								ui.Text(c, "外观").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
-								ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-									if appleSubChipScoped(c, tk, "浅色", !e.app.darkMode, "settings-theme") {
-										e.app.SetDarkMode(false)
-									}
-									if appleSubChipScoped(c, tk, "深色", e.app.darkMode, "settings-theme") {
-										e.app.SetDarkMode(true)
-									}
+								glasswork.Select(c, glasswork.SelectProps[ThemeMode]{
+									Key:      "settings-theme-select",
+									Label:    "选择外观",
+									Tooltip:  "跟随系统或切换浅色/深色外观",
+									Selected: &e.themeChoice,
+									Open:     &e.themeSelectOpen,
+									Width:    132,
+									Height:   28,
+									Kind:     tk.glass.Kind,
+									Accent:   tk.accent,
+									AlignEnd: true,
+									Options: []glasswork.SelectOption[ThemeMode]{
+										{Value: ThemeModeSystem, Label: "跟随系统"},
+										{Value: ThemeModeLight, Label: "浅色"},
+										{Value: ThemeModeDark, Label: "深色"},
+									},
+									OnSelect: func(m ThemeMode) {
+										e.themeChoiceSynced = m
+										e.app.SetThemeMode(m)
+									},
 								})
 							})
 						})
@@ -1988,18 +2046,29 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 								}
 							})
 
-							curFmt := e.app.SaveFormat()
 							ui.Row(c.Key("settings-format-row")).
-								Height(38).Padding(0, 12, 0, 12).Radius(13).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).
 								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
 								ui.Text(c, "默认格式").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
-								ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-									if appleSubChipScoped(c, tk, "PNG", curFmt == SaveFormatPNG, "settings-format") {
-										e.app.SetSaveFormat(SaveFormatPNG)
-									}
-									if appleSubChipScoped(c, tk, "JPEG", curFmt == SaveFormatJPEG, "settings-format") {
-										e.app.SetSaveFormat(SaveFormatJPEG)
-									}
+								glasswork.Select(c, glasswork.SelectProps[string]{
+									Key:      "settings-format-select",
+									Label:    "选择默认格式",
+									Tooltip:  "选择截图默认导出格式",
+									Selected: &e.formatChoice,
+									Open:     &e.formatSelectOpen,
+									Width:    132,
+									Height:   28,
+									Kind:     tk.glass.Kind,
+									Accent:   tk.accent,
+									AlignEnd: true,
+									Options: []glasswork.SelectOption[string]{
+										{Value: SaveFormatPNG, Label: "PNG"},
+										{Value: SaveFormatJPEG, Label: "JPEG"},
+									},
+									OnSelect: func(v string) {
+										e.formatChoiceSynced = v
+										e.app.SetSaveFormat(v)
+									},
 								})
 							})
 
@@ -2257,26 +2326,53 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 						ui.Column(c).Gap(8).Children(func() {
 							ui.Text(c, "文字识别").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
 
+							ppocrBadge := ""
+							if ocrSt.Downloading {
+								ppocrBadge = "下载中"
+							} else if !ocrSt.Installed {
+								ppocrBadge = "需下载"
+							}
 							ui.Row(c.Key("settings-ocr-engine-row")).
-								Height(38).Padding(0, 12, 0, 12).Radius(13).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).
 								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
 								ui.Text(c, "识别引擎").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
-								ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-									if appleSubChipScoped(c, tk, "系统原生", ocrSt.Engine == ocr.EngineSystem, "settings-ocr-engine") {
-										e.app.SetOCREngine(ocr.EngineSystem)
-										e.SetToast("已切换为系统原生文字识别")
-									}
-									if appleSubChipScoped(c, tk, "PP-OCRv6", ocrSt.Engine == ocr.EnginePPOCRv6, "settings-ocr-engine") {
+								glasswork.Select(c, glasswork.SelectProps[ocr.Engine]{
+									Key:      "settings-ocr-engine-select",
+									Label:    "选择识别引擎",
+									Tooltip:  "选择离线文字识别引擎",
+									Selected: &e.ocrEngineChoice,
+									Open:     &e.ocrEngineSelectOpen,
+									Width:    148,
+									Height:   28,
+									Kind:     tk.glass.Kind,
+									Accent:   tk.accent,
+									AlignEnd: true,
+									Options: []glasswork.SelectOption[ocr.Engine]{
+										{Value: ocr.EngineSystem, Label: "系统原生"},
+										{Value: ocr.EnginePPOCRv6, Label: "PP-OCRv6", Badge: ppocrBadge},
+									},
+									OnSelect: func(eng ocr.Engine) {
+										if eng == ocr.EngineSystem {
+											e.ocrEngineSynced = ocr.EngineSystem
+											e.app.SetOCREngine(ocr.EngineSystem)
+											e.SetToast("已切换为系统原生文字识别")
+											return
+										}
 										if ocrSt.Installed {
+											e.ocrEngineSynced = ocr.EnginePPOCRv6
 											e.app.SetOCREngine(ocr.EnginePPOCRv6)
 											e.SetToast("已切换为本地 PP-OCRv6 高精度识别")
 										} else if !ocrSt.Downloading {
+											e.ocrEngineChoice = ocrSt.Engine
+											e.ocrEngineSynced = ocrSt.Engine
 											e.app.StartPPOCRDownload()
 											e.SetToast("开始按需下载 PP-OCRv6 本地模型…")
 										} else {
+											e.ocrEngineChoice = ocrSt.Engine
+											e.ocrEngineSynced = ocrSt.Engine
 											e.SetToast("PP-OCRv6 模型正在下载中…")
 										}
-									}
+									},
 								})
 							})
 

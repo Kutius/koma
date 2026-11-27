@@ -247,6 +247,16 @@ var (
 		`<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.72"><path d="M3 8.5V7C3 4.79 4.79 3 7 3H8.5M15.5 3H17C19.21 3 21 4.79 21 7V8.5M21 15.5V17C21 19.21 19.21 21 17 21H15.5M8.5 21H7C4.79 21 3 19.21 3 17V15.5" opacity=".5"/><path d="M7.5 9H16.5M7.5 12.2H14.5M7.5 15.4H12.5"/></g>`,
 		`<path fill="currentColor" d="M3 7C3 4.79 4.79 3 7 3H17C19.21 3 21 4.79 21 7V17C21 19.21 19.21 21 17 21H7C4.79 21 3 19.21 3 17V7Z" opacity=".46"/><path fill="currentColor" d="M7.5 8.25H16.5C16.91 8.25 17.25 8.59 17.25 9C17.25 9.41 16.91 9.75 16.5 9.75H7.5C7.09 9.75 6.75 9.41 6.75 9C6.75 8.59 7.09 8.25 7.5 8.25ZM7.5 11.45H14.5C14.91 11.45 15.25 11.79 15.25 12.2C15.25 12.61 14.91 12.95 14.5 12.95H7.5C7.09 12.95 6.75 12.61 6.75 12.2C6.75 11.79 7.09 11.45 7.5 11.45ZM7.5 14.65H12.5C12.91 14.65 13.25 14.99 13.25 15.4C13.25 15.81 12.91 16.15 12.5 16.15H7.5C7.09 16.15 6.75 15.81 6.75 15.4C6.75 14.99 7.09 14.65 7.5 14.65Z"/>`,
 	)
+	// ChevronDown: solar:alt-arrow-down-line-duotone / bold rounded chevron
+	ChevronDown = pair(
+		`<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.85"><path d="M18.5 9.25L12 15.25L5.5 9.25"/><path d="M16.2 7.4L12 11.2L7.8 7.4" opacity=".36"/></g>`,
+		`<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.25"><path d="M18.5 9.25L12 15.25L5.5 9.25"/><path d="M16.2 7.4L12 11.2L7.8 7.4" opacity=".45"/></g>`,
+	)
+	// CheckMark: crisp rounded checkmark for compact menu/select option selection
+	CheckMark = pair(
+		`<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.1" d="M5.5 12.75L10 17.25L18.75 7.5"/>`,
+		`<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.45" d="M5.5 12.75L10 17.25L18.75 7.5"/>`,
+	)
 )
 
 // AppIconPNG generates Koma's Liquid Glass + Solar squircle app icon PNG (size×size)

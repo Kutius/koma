@@ -58,7 +58,7 @@ go tool mygo build
 
 Build outputs:
 - `build/windows-amd64/Koma.exe` (standalone native executable)
-- `build/windows-amd64/koma-setup-0.3.1-amd64.exe` (Windows installer)
+- `build/windows-amd64/koma-setup-0.3.2-amd64.exe` (Windows installer)
 
 ---
 
@@ -158,4 +158,4 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 
 1. Run `go test -v -count=1 ./...` and ensure all packages (`koma`, `app`, `canvas`, `stitch`, `glasswork`, `winapi`) pass.
 2. When modifying UI, shaders, icons, or layout, dump previews via `KOMA_PREVIEW_DIR` and visually inspect the rendered PNGs (`Home`, `QQ overlay`, `100% fullscreen overlay`, `Studio`, `Scroll overlay`) to check contrast, alignment, icon z-order, and absence of border/clip artifacts.
-3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.3.1-amd64.exe` compile cleanly.
+3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.3.2-amd64.exe` compile cleanly.

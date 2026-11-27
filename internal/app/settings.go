@@ -40,6 +40,26 @@ const (
 	SaveFormatJPEG = "jpg"
 )
 
+// ThemeMode selects Koma's appearance mode: follow Windows system theme, forced light, or forced dark.
+type ThemeMode string
+
+const (
+	ThemeModeSystem ThemeMode = "system"
+	ThemeModeLight  ThemeMode = "light"
+	ThemeModeDark   ThemeMode = "dark"
+)
+
+func normalizeThemeMode(m string) ThemeMode {
+	switch strings.ToLower(strings.TrimSpace(m)) {
+	case "light":
+		return ThemeModeLight
+	case "dark":
+		return ThemeModeDark
+	default:
+		return ThemeModeSystem
+	}
+}
+
 type hotkeyMeta struct {
 	Action  HotkeyAction
 	Label   string
@@ -57,7 +77,8 @@ var hotkeyOrder = []hotkeyMeta{
 // persistedSettings uses pointer fields so an explicitly cleared ("") shortcut
 // is preserved across restarts rather than overwritten by defaults.
 type persistedSettings struct {
-	DarkMode    *bool   `json:"dark_mode,omitempty"`
+	ThemeMode   *string `json:"theme_mode,omitempty"`
+	DarkMode    *bool   `json:"dark_mode,omitempty"` // legacy boolean fallback
 	HotkeyArea  *string `json:"hotkey_area,omitempty"`
 	HotkeyLong  *string `json:"hotkey_long,omitempty"`
 	HotkeyFull  *string `json:"hotkey_full,omitempty"`
@@ -108,9 +129,16 @@ func (a *App) LoadSettings() error {
 		return err
 	}
 	a.mu.Lock()
-	if ps.DarkMode != nil {
-		a.darkMode = *ps.DarkMode
+	if ps.ThemeMode != nil {
+		a.themeMode = normalizeThemeMode(*ps.ThemeMode)
+	} else if ps.DarkMode != nil {
+		if *ps.DarkMode {
+			a.themeMode = ThemeModeDark
+		} else {
+			a.themeMode = ThemeModeLight
+		}
 	}
+	a.darkMode = a.resolveDarkLocked()
 	if ps.HotkeyArea != nil {
 		a.hotkeyArea = strings.TrimSpace(*ps.HotkeyArea)
 	}
@@ -146,6 +174,7 @@ func (a *App) LoadSettings() error {
 func (a *App) SaveSettings() error {
 	a.mu.Lock()
 	path := a.settingsPath
+	themeMode := string(normalizeThemeMode(string(a.themeMode)))
 	dark := a.darkMode
 	hkArea := a.hotkeyArea
 	hkLong := a.hotkeyLong
@@ -165,6 +194,7 @@ func (a *App) SaveSettings() error {
 		return err
 	}
 	ps := persistedSettings{
+		ThemeMode:   &themeMode,
 		DarkMode:    &dark,
 		HotkeyArea:  &hkArea,
 		HotkeyLong:  &hkLong,
