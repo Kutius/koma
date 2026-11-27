@@ -57,12 +57,6 @@ func dim3(k vec3) vec3 {
 	return pow(clamp(k, vec3(0.0), vec3(1.0)), vec3(1.0/2.2))
 }
 
-func domeHeight(p vec2, b vec2, r float, bevel float) float {
-	d := roundRect(p, b, r)
-	t := pow(clamp(-d/max(bevel, 1.0), 0.0, 1.0), 1.0/1.4)
-	return sqrt(max(0.0, 1.0-(1.0-t)*(1.0-t)))
-}
-
 func Fragment(dst vec4, pos vec2) vec4 {
 	sz := rectSize()
 	hb := sz * 0.5
@@ -92,19 +86,28 @@ func Fragment(dst vec4, pos vec2) vec4 {
 		bevel = min(bevel, max(12.0, rU*1.2))
 	}
 
-	// Curved dome height field + 3D surface normal (bilalgursen engine.ts lines 1108-1114).
+	// Analytical curved dome height field & 3D surface normal via chain rule:
+	// h(d) = sqrt(1 - (1 - t)^2), t = (-d/bevel)^(1/1.4).
+	// Reusing dist and SDF gradient dir cuts 3 full roundRect evaluations per pixel!
 	eps := 1.25
-	h := domeHeight(local, halfU, rU, bevel)
-	hx1 := domeHeight(local+vec2(eps, 0.0), halfU, rU, bevel)
-	hy1 := domeHeight(local+vec2(0.0, eps), halfU, rU, bevel)
-	gradH := vec2(hx1-h, hy1-h) / eps
-	normal := normalize(vec3(-gradH.x*42.0, -gradH.y*42.0, 1.0))
-	depth := clamp(1.0-h, 0.0, 1.0)
-
-	// Outward shape direction from SDF gradient.
 	gx := roundRect(local+vec2(eps, 0.0), halfU, rU) - dist
 	gy := roundRect(local+vec2(0.0, eps), halfU, rU) - dist
 	dir := normalize(vec2(gx, gy) + vec2(1e-5, 1e-5))
+
+	invBevel := 1.0 / max(bevel, 1.0)
+	u := clamp(-dist*invBevel, 0.0, 1.0)
+	t := pow(u, 1.0/1.4)
+	omt := 1.0 - t
+	h := sqrt(max(0.0, 1.0-omt*omt))
+	depth := clamp(1.0-h, 0.0, 1.0)
+
+	// dh/dd = -(omt / max(h, 0.08)) * (1/1.4) * pow(max(u, 1e-4), 1/1.4 - 1) * invBevel
+	dhdd := 0.0
+	if u > 0.0002 && u < 0.999 {
+		dtdU := (1.0 / 1.4) * pow(u, (1.0/1.4)-1.0)
+		dhdd = -(omt / max(h, 0.08)) * dtdU * invBevel
+	}
+	normal := normalize(vec3(-dir.x*dhdd*42.0, -dir.y*dhdd*42.0, 1.0))
 
 	edge := 1.0 - smoothstep(0.0, bevel*EdgeBand, -dist)
 	ny := local.y / max(halfU.y, 1.0)
@@ -204,9 +207,10 @@ func Fragment(dst vec4, pos vec2) vec4 {
 		back := left
 
 		// Mirror colorful surroundings outside the rim into the curved bevel crescent!
+		// Early-out for interior pixels (-dist >= mirrorDepth) skips 2 texture fetches per pixel.
 		rimCol := vec3(1.0)
-		if MirrorAmt > 0.01 && Mode < 0.5 {
-			mirrorDepth := min(halfU.x, halfU.y) * 0.58
+		mirrorDepth := min(halfU.x, halfU.y) * 0.58
+		if MirrorAmt > 0.01 && Mode < 0.5 && -dist < mirrorDepth {
 			into := clamp(-dist/max(mirrorDepth, 1.0), 0.0, 1.0)
 			reachDip := clamp(sz.y*0.48, 18.0, 56.0)
 			lookDip := reachDip * (1.0 - into)
@@ -276,6 +280,190 @@ func Fragment(dst vec4, pos vec2) vec4 {
 }
 `)
 
+// zeroBackdropGlassShader renders optical Liquid Glass pills and tinted prominent CTAs
+// WITHOUT calling backdropSample, so D3D11 executes them inline in the active render pass
+// (zero render-target switches, zero backbuffer copies, zero Gaussian blur passes!).
+// Ideal for tinted CTA buttons, nested Select triggers inside already-frosted cards, and
+// 120Hz moving overlay badges.
+var zeroBackdropGlassShader = shader.MustCompile(`package main
+
+var Radius float
+var IsDark float
+var BaseAlpha float     // translucent body alpha (e.g. 0.92 tinted CTA, 0.62 nested pill)
+var RimStrength float
+var InnerStrength float
+var TopRefl float
+var Caustic float
+var BorderAlpha float
+var BorderWidth float
+var TintColor vec4
+var LightPos vec2
+var LightMix float
+var PressPos vec2
+var PressAmt float
+var PressSpread float
+
+func roundRect(p vec2, b vec2, r float) float {
+	q := abs(p) - b + vec2(r, r)
+	return length(max(q, vec2(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r
+}
+
+func dim1(k float) float {
+	return pow(clamp(k, 0.0, 1.0), 1.0/2.2)
+}
+
+func dim3(k vec3) vec3 {
+	return pow(clamp(k, vec3(0.0), vec3(1.0)), vec3(1.0/2.2))
+}
+
+func Fragment(dst vec4, pos vec2) vec4 {
+	sz := rectSize()
+	hb := sz * 0.5
+	localDip := pos - hb
+
+	refH := clamp(min(sz.x, sz.y), 24.0, 72.0)
+	unit := refH / 120.0
+	local := localDip / unit
+	halfU := hb / unit
+	rU := min(Radius/unit, min(halfU.x, halfU.y)-0.5)
+	if rU < 0.0 {
+		rU = 0.0
+	}
+
+	dist := roundRect(local, halfU, rU)
+	aa := max(1.0/(unit*pixelScale()), 0.5)
+	mask := 1.0 - smoothstep(-aa, aa, dist)
+	if mask <= 0.001 {
+		return vec4(0.0)
+	}
+
+	bevel := 50.4
+	if rU < halfU.y*0.85 {
+		bevel = min(bevel, max(12.0, rU*1.2))
+	}
+
+	eps := 1.25
+	gx := roundRect(local+vec2(eps, 0.0), halfU, rU) - dist
+	gy := roundRect(local+vec2(0.0, eps), halfU, rU) - dist
+	dir := normalize(vec2(gx, gy) + vec2(1e-5, 1e-5))
+
+	invBevel := 1.0 / max(bevel, 1.0)
+	u := clamp(-dist*invBevel, 0.0, 1.0)
+	t := pow(u, 1.0/1.4)
+	omt := 1.0 - t
+	h := sqrt(max(0.0, 1.0-omt*omt))
+	depth := clamp(1.0-h, 0.0, 1.0)
+	dhdd := 0.0
+	if u > 0.0002 && u < 0.999 {
+		dtdU := (1.0 / 1.4) * pow(u, (1.0/1.4)-1.0)
+		dhdd = -(omt / max(h, 0.08)) * dtdU * invBevel
+	}
+	normal := normalize(vec3(-dir.x*dhdd*42.0, -dir.y*dhdd*42.0, 1.0))
+
+	edge := 1.0 - smoothstep(0.0, bevel*0.35, -dist)
+	ny := local.y / max(halfU.y, 1.0)
+	nx := local.x / max(halfU.x, 1.0)
+	ly := local.y
+
+	glass := TintColor.rgb
+	alpha := BaseAlpha * (1.0 - edge*0.14)
+
+	if TopRefl > 0.001 {
+		top := (1.0-smoothstep(-0.05, 0.75, ny))*(1.0-nx*0.12)*TopRefl*0.6 + 0.02*(TopRefl/0.30)
+		glass *= dim3(vec3(1.0) - vec3(1.0, 1.0, 0.72)*top)
+	}
+
+	up := clamp(-dir.y, 0.0, 1.0)
+	right := clamp(dir.x, 0.0, 1.0)
+	left := clamp(-dir.x, 0.0, 1.0)
+	down := clamp(dir.y, 0.0, 1.0)
+
+	if InnerStrength > 0.001 {
+		innerBand := smoothstep(bevel*-0.19, bevel*-0.024, dist)
+		glass *= dim1(1.0 - innerBand*(up+left*0.6+right*0.3+down*0.15)*InnerStrength*2.2)
+		deepBand := smoothstep(bevel*-0.73, bevel*-0.13, dist)
+		glass *= dim1(1.0 - deepBand*left*InnerStrength*2.0)
+		ringU := (dist + bevel*0.45) / max(bevel*0.26, 1.0)
+		ring := exp(-ringU * ringU)
+		glass *= dim1(1.0 - ring*(right*0.9+up*0.5+left*0.4+down*0.3)*InnerStrength*1.5)
+	}
+
+	if RimStrength > 0.001 {
+		fresnel := pow(clamp(1.0-normal.z, 0.0, 1.0), 6.0)
+		devPxU := 1.0 / (unit * pixelScale())
+		rimW := max(devPxU*0.95, 0.85)
+		rimLine := 1.0 - smoothstep(0.0, rimW*1.35, abs(dist+rimW*1.5))
+		fall := exp(-(ly / 30.0) * (ly / 30.0))
+		studio := right*right*fall*0.90 + down*down*0.20 + left*left*0.55
+		cursorSpot := 0.0
+		if LightMix > 0.001 {
+			cReach := clamp(min(sz.x, sz.y)*1.75, 52.0, 120.0)
+			cDist := length(localDip-LightPos) / cReach
+			cursorSpot = exp(-cDist*cDist*1.6) * LightMix * 0.26
+		}
+		rimScale := RimStrength
+		if IsDark > 0.5 {
+			rimScale = RimStrength * 0.78
+		}
+		rimAdd := rimLine*(studio+cursorSpot)*rimScale + fresnel*right*0.045
+		glass += vec3(1.0) * rimAdd
+		alpha = clamp(alpha+rimAdd*0.5, 0.0, 1.0)
+	}
+
+	if Caustic > 0.001 {
+		glass += vec3(1.0, 0.92, 0.86) * smoothstep(0.72, 0.98, depth) * down * Caustic
+	}
+
+	if PressAmt > 0.004 {
+		baseSpan := clamp(max(sz.x, sz.y)*0.90, 36.0, 180.0)
+		span := baseSpan * (0.48 + 0.62*clamp(PressSpread, 0.0, 1.0))
+		pd := length(localDip-PressPos) / max(span, 1.0)
+		glowHere := PressAmt * 1.55 * exp(-pd*pd*2.0)
+		glassL := max(dot(glass, vec3(0.2126, 0.7152, 0.0722)), 0.001)
+		glass *= pow(glassL, 1.0/(1.0+glowHere)) / glassL
+		whiteStrength := 0.28
+		if IsDark > 0.5 {
+			whiteStrength = 0.16
+		}
+		whiteGlow := PressAmt * whiteStrength * max(1.0-pd, 0.0)
+		glass = mix(glass, vec3(1.0), clamp(whiteGlow, 0.0, 0.55))
+	}
+
+	if BorderAlpha > 0.001 && BorderWidth > 0.0 {
+		bwU := BorderWidth / unit
+		bLine := smoothstep(-bwU-aa, -bwU+aa, dist)
+		glass = mix(glass, vec3(1.0), bLine*BorderAlpha)
+		alpha = clamp(alpha+bLine*BorderAlpha*0.45, 0.0, 1.0)
+	}
+
+	glass = clamp(glass, vec3(0.0), vec3(1.0))
+	a := clamp(alpha, 0.0, 1.0) * mask
+	return vec4(glass*a, a)
+}
+`)
+
+var (
+	uZRadius        = zeroBackdropGlassShader.Uniform("Radius")
+	uZIsDark        = zeroBackdropGlassShader.Uniform("IsDark")
+	uZBaseAlpha     = zeroBackdropGlassShader.Uniform("BaseAlpha")
+	uZRimStrength   = zeroBackdropGlassShader.Uniform("RimStrength")
+	uZInnerStrength = zeroBackdropGlassShader.Uniform("InnerStrength")
+	uZTopRefl       = zeroBackdropGlassShader.Uniform("TopRefl")
+	uZCaustic       = zeroBackdropGlassShader.Uniform("Caustic")
+	uZBorderAlpha   = zeroBackdropGlassShader.Uniform("BorderAlpha")
+	uZBorderWidth   = zeroBackdropGlassShader.Uniform("BorderWidth")
+	uZTintColor     = zeroBackdropGlassShader.Uniform("TintColor")
+	uZLightPos      = zeroBackdropGlassShader.Uniform("LightPos")
+	uZLightMix      = zeroBackdropGlassShader.Uniform("LightMix")
+	uZPressPos      = zeroBackdropGlassShader.Uniform("PressPos")
+	uZPressAmt      = zeroBackdropGlassShader.Uniform("PressAmt")
+	uZPressSpread   = zeroBackdropGlassShader.Uniform("PressSpread")
+
+	zeroBackdropValuesPool = sync.Pool{
+		New: func() any { return zeroBackdropGlassShader.NewValues() },
+	}
+)
+
 var (
 	uRadius        = liquidGlassShader.Uniform("Radius")
 	uMode          = liquidGlassShader.Uniform("Mode")
@@ -311,7 +499,8 @@ type Preset uint8
 const (
 	PresetLens   Preset = iota // Clear curved optical lens (floating toolbars, capsules, pills)
 	PresetCard                 // Frosted radial-bend content panel (history drawer, shortcut sheet)
-	PresetTinted               // Vivid tinted liquid glass (primary Apple Blue buttons)
+	PresetTinted               // Vivid tinted liquid glass (primary Apple Blue buttons; zero-backdrop inline pass)
+	PresetPill                 // Nested optical glass pill (Select triggers inside frosted cards, moving badges; zero-backdrop inline pass)
 )
 
 // Surface configures the physical Liquid Glass material for a MyGo UI element.
@@ -407,12 +596,24 @@ func FromAdaptation(a Adaptation) Surface {
 }
 
 // Tinted creates a bilalgursen tinted prominent glass button with full 3D dome optics & press glow.
+// Uses zeroBackdropGlassShader so CTAs nested inside glass toolbars never force an extra GPU blur pass.
 func Tinted(c ui.Color) Surface {
 	return Surface{
 		Kind:       KindDark,
 		Preset:     PresetTinted,
 		Tint:       c,
-		Blur:       2.5,
+		Shadow:     true,
+		CursorLite: true,
+	}
+}
+
+// Pill creates a lightweight inline Liquid Glass pill (zero D3D11 backdrop-copy / blur pass)
+// for interactive controls nested inside an already-frosted glass surface (such as Select triggers
+// inside the Settings card) or high-frequency moving overlay badges.
+func Pill(kind Kind) Surface {
+	return Surface{
+		Kind:       kind,
+		Preset:     PresetPill,
 		Shadow:     true,
 		CursorLite: true,
 	}
@@ -533,6 +734,105 @@ func paintOptical(p *ui.Painter, box ui.Rect, radii [4]float32, is interactiveSu
 	s := is.Surface
 	rad := max(max(radii[0], radii[1]), max(radii[2], radii[3]))
 	rad = min(rad, min(box.W, box.H)*0.5)
+
+	// Fast path: PresetTinted and PresetPill use zeroBackdropGlassShader (inline D3D11 draw,
+	// ZERO render-target switch, ZERO backbuffer copy, ZERO Gaussian blur pass!).
+	if s.Preset == PresetTinted || s.Preset == PresetPill {
+		var (
+			zTint       ui.Color
+			zIsDark     float32
+			zAlpha      float32
+			zRim        float32
+			zInner      float32
+			zTopRefl    float32
+			zCaustic    float32
+			zBorderA    float32
+			zBorderW    float32
+		)
+		if s.Preset == PresetTinted {
+			zTint = s.Tint
+			if zTint.A == 0 {
+				zTint = ui.Hex("#007AFF")
+			}
+			zIsDark = 1.0
+			zAlpha = 0.94
+			zRim = 0.55
+			zInner = 0.10
+			zTopRefl = 0.28
+			zCaustic = 0.08
+		} else {
+			if s.Kind == KindDark {
+				zIsDark = 1.0
+				zTint = ui.Hex("#20232C")
+				zAlpha = 0.78
+				zRim = 0.42
+				zInner = 0.09
+				zTopRefl = 0.16
+				zCaustic = 0.05
+				zBorderA = 0.16
+				zBorderW = 1.0
+			} else {
+				zIsDark = 0.0
+				zTint = ui.Hex("#F8FAFC")
+				zAlpha = 0.78
+				zRim = 0.48
+				zInner = 0.08
+				zTopRefl = 0.18
+				zCaustic = 0.05
+				zBorderA = 0.45
+				zBorderW = 1.0
+			}
+		}
+
+		if p.Preferences().ReduceTransparency {
+			if s.Shadow {
+				p.Shadow(box, rad, 0, 4, 14, 0, ui.RGBA(0, 0, 0, 0.14))
+			}
+			p.Fill(box, zTint.Alpha(0.96), rad)
+			p.Stroke(box, ui.RGBA(0, 0, 0, 0.14), rad, 1)
+			return
+		}
+
+		if s.Shadow {
+			if s.Preset == PresetTinted {
+				p.Shadow(box, rad, 0, 6, 18, 0, zTint.Alpha(0.32))
+				p.Shadow(box, rad, 0, 2, 6, 0, ui.RGBA(0, 0, 0, 0.14))
+			} else if s.Kind == KindDark {
+				p.Shadow(box, rad, 0, 3, 10, 0, ui.RGBA(0, 0, 0, 0.26))
+			} else {
+				p.Shadow(box, rad, 0, 3, 10, 0, ui.RGBA(15, 23, 42, 0.09))
+			}
+		}
+
+		lightLocalX := is.lightX - box.W*0.5
+		lightLocalY := is.lightY - box.H*0.5
+		pressLocalX := is.pressX - box.W*0.5
+		pressLocalY := is.pressY - box.H*0.5
+
+		zv := zeroBackdropValuesPool.Get().(*shader.Values)
+		defer zeroBackdropValuesPool.Put(zv)
+		zv.Float(uZRadius, rad)
+		zv.Float(uZIsDark, zIsDark)
+		zv.Float(uZBaseAlpha, zAlpha)
+		zv.Float(uZRimStrength, zRim)
+		zv.Float(uZInnerStrength, zInner)
+		zv.Float(uZTopRefl, zTopRefl)
+		zv.Float(uZCaustic, zCaustic)
+		zv.Float(uZBorderAlpha, zBorderA)
+		zv.Float(uZBorderWidth, zBorderW)
+		zv.Color(uZTintColor, zTint)
+		zv.Vec2(uZLightPos, lightLocalX, lightLocalY)
+		zv.Float(uZLightMix, is.lightMix)
+		zv.Vec2(uZPressPos, pressLocalX, pressLocalY)
+		zv.Float(uZPressAmt, is.pressAmt)
+		zv.Float(uZPressSpread, is.pressSpread)
+
+		zeroBackdropGlassShader.Draw(p, box, shader.Options{
+			Radius: rad,
+			Values: zv,
+		})
+		return
+	}
 
 	var (
 		mode        float32

@@ -86,6 +86,10 @@ type overlayPane struct {
 	measuredSubW  float32
 	loupeKind     glasswork.Kind
 	hasLoupeKnd   bool
+	loupeSurf     glasswork.Surface
+	loupeInks     glasswork.InkColors
+	lastLoupeAdX  float32
+	lastLoupeAdY  float32
 
 	lastMeasure    winapi.MeasureResult
 	lastMeasurePxX int
@@ -789,8 +793,8 @@ func (p *overlayPane) ensureRasterCache(viewW, viewH float32) {
 		return
 	}
 	// Avoid thrashing full-selection CropRGBA + blur/pixelate allocations on every
-	// pointer-move frame while dragging or resizing the selection rectangle.
-	if p.dragMode != dragNone {
+	// pointer-move frame while dragging/resizing the selection or moving a raster annotation.
+	if p.dragMode != dragNone || p.movingAnn {
 		return
 	}
 	r := p.selectionPxRect(viewW, viewH)
@@ -1653,7 +1657,7 @@ func (p *overlayPane) view(c *ui.Context) {
 					badgeY = by0 + 10
 				}
 				badgeR := ui.Rect{X: badgeX, Y: badgeY, W: badgeW, H: badgeH}
-				glasswork.Paint(pt, badgeR, badgeH/2, glasswork.Dark())
+				glasswork.Paint(pt, badgeR, badgeH/2, glasswork.Pill(glasswork.KindDark))
 				pt.RichText(badgeR.X+11, badgeR.Y+5, 0, span)
 			} else {
 				pt.Fill(r, veil, 0)
@@ -2041,8 +2045,13 @@ func (p *overlayPane) drawGlassworkLoupe(pt *ui.Painter, r ui.Rect) {
 	ly = clamp32(ly, 12, r.H-cardH-12)
 
 	card := ui.Rect{X: lx, Y: ly, W: cardW, H: cardH}
-	surf, inks := p.adaptGlassForRect(card, r.W, r.H, &p.loupeKind, &p.hasLoupeKnd)
-	glasswork.Paint(pt, card, 18, surf)
+	if !p.hasLoupeKnd || math.Abs(float64(lx-p.lastLoupeAdX)) >= 20 || math.Abs(float64(ly-p.lastLoupeAdY)) >= 20 {
+		p.loupeSurf, p.loupeInks = p.adaptGlassForRect(card, r.W, r.H, &p.loupeKind, &p.hasLoupeKnd)
+		p.loupeSurf = glasswork.Pill(p.loupeKind)
+		p.lastLoupeAdX, p.lastLoupeAdY = lx, ly
+	}
+	glasswork.Paint(pt, card, 18, p.loupeSurf)
+	inks := p.loupeInks
 
 	px, py := p.dipToPx(p.mouseX, p.mouseY, r.W, r.H)
 	iw, ih := p.capture.Image.Bounds().Dx(), p.capture.Image.Bounds().Dy()

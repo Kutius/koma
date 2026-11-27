@@ -710,7 +710,9 @@ func (e *EditorState) View(c *ui.Context) {
 						})
 				})
 		})
-		c.After(220 * time.Millisecond)
+		if rem := time.Until(e.toastUntil); rem > 0 {
+			c.After(rem + 20*time.Millisecond)
+		}
 	}
 }
 
@@ -1026,10 +1028,16 @@ func (e *EditorState) renderAppleHomeStage(c *ui.Context, tk appleTokens) {
 				for i := 0; i < limit; i++ {
 					it := recent[i]
 					tip := fmt.Sprintf("%s · %d×%d", it.Title, it.Width, it.Height)
+					cardBg := ui.RGBA(255, 255, 255, 0.58)
+					cardBorder := ui.RGBA(255, 255, 255, 0.65)
+					if tk.dark {
+						cardBg = ui.RGBA(30, 34, 43, 0.72)
+						cardBorder = ui.RGBA(255, 255, 255, 0.14)
+					}
 					card := ui.Column(c.Key(it.ID)).
 						Width(148).Padding(6).Radius(16).
 						Role(ui.RoleButton).Label(tip).Tooltip(tip).
-						Material(tk.glass).Cursor(ui.CursorPointer).
+						Background(cardBg).Border(1, cardBorder).Cursor(ui.CursorPointer).
 						Transition(glasswork.StaggeredEnterTransition(i))
 					glasswork.ApplyLiquidButton(card, glasswork.CardHoverOpts())
 					card.Children(func() {
@@ -1735,9 +1743,7 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 				dx, dy := ix-e.moveLastImgX, iy-e.moveLastImgY
 				e.annotations[e.selectedIdx].Translate(dx, dy)
 				e.moveLastImgX, e.moveLastImgY = ix, iy
-				if k := e.annotations[e.selectedIdx].Kind; k == canvas.ToolPixelate || k == canvas.ToolBlur || k == canvas.ToolSpotlight {
-					e.rasterDirty = true
-				}
+				// Defer expensive CPU blur/pixelate re-bake until pointer-up so dragging stays 60-144fps!
 				return true
 			}
 
@@ -1791,6 +1797,11 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			}
 			if e.movingAnn {
 				e.movingAnn = false
+				if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+					if k := e.annotations[e.selectedIdx].Kind; k == canvas.ToolPixelate || k == canvas.ToolBlur || k == canvas.ToolSpotlight {
+						e.rasterDirty = true
+					}
+				}
 				return true
 			}
 			if e.cropDrag {

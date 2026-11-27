@@ -368,18 +368,9 @@ func Select[T comparable](c *ui.Context, props SelectProps[T]) bool {
 			}
 		}
 
-		// Trigger optical Liquid Glass lens material (Button's clear curved lens)
-		trigSurf := Light()
-		if props.Kind == KindDark {
-			trigSurf = Dark()
-			trigSurf.Density = 0.50
-			trigSurf.Floor = 0.34
-		} else {
-			trigSurf.Density = 0.56
-			trigSurf.Floor = 0.42
-		}
-		trigSurf.Blur = 3.0
-		trigSurf.Shadow = true
+		// Trigger optical Liquid Glass pill (inline zero-backdrop shader so nested Select
+		// triggers inside frosted cards never force redundant D3D11 blur render-target passes).
+		trigSurf := Pill(props.Kind)
 
 		trig := sel.Trigger
 		trig.Width(w).Height(h).Padding(0, 9, 0, 12).Gap(6).
