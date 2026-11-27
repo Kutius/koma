@@ -90,7 +90,9 @@ func TestScrollBarWindowHoverTooltipNoFlicker(t *testing.T) {
 				}
 			}
 
-			tt := ui.NewTester(s.barView, int(barWinR.W), int(barWinR.H))
+			tt := ui.NewTesterWith(s.barView, int(barWinR.W), int(barWinR.H), ui.TesterOptions{
+				Preferences: ui.Preferences{ReduceTransparency: reproDir == ""},
+			})
 			barMidY := (s.barCardR.Y - s.barWinOffY) + s.barCardR.H*0.5
 
 			// Hover "重置" past tooltip delay, then sweep across "编辑", "贴图", "完成".

@@ -105,7 +105,9 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !ttHome.HasText("长截图") {
 		t.Fatalf("expected 长截图 pill on Home stage, got texts: %q", ttHome.Texts())
 	}
-	savePreview(t, dumpDir, "v3_01_home_glasswork.png", ttHome.Image())
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_01_home_glasswork.png", ttHome.Image())
+	}
 
 	// 2. QQ-style In-Place Overlay: verify EVERY toolbar button click actually triggers!
 	sample := app.GenerateSampleCanvas()
@@ -128,7 +130,9 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !ov.HasSelection() || ov.ActiveTool() != canvas.ToolArrow {
 		t.Fatalf("after clicking 箭头: hasSelection=%v tool=%v, want true / ToolArrow", ov.HasSelection(), ov.ActiveTool())
 	}
-	savePreview(t, dumpDir, "v3_02_qq_overlay_glasswork.png", ttOv.Image())
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_02_qq_overlay_glasswork.png", ttOv.Image())
+	}
 
 	if err := ttOv.Click("琥珀"); err != nil {
 		t.Fatalf("overlay click color 琥珀 failed: %v", err)
@@ -153,7 +157,9 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !ov.HasSelection() || ov.ActiveTool() != canvas.ToolRect {
 		t.Fatalf("after fullscreen clicking 矩形: hasSelection=%v tool=%v", ov.HasSelection(), ov.ActiveTool())
 	}
-	savePreview(t, dumpDir, "v3_04_qq_fullscreen_overlay.png", ttFull.Image())
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_04_qq_fullscreen_overlay.png", ttFull.Image())
+	}
 
 	// Clicking active tool again toggles back to ToolSelect (classic QQ截图 behavior)
 	if err := ttFull.Click("矩形"); err != nil {
@@ -182,7 +188,9 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if ed.ActiveTool() != canvas.ToolMeasure {
 		t.Fatalf("studio tool after clicking 测距 = %v, want ToolMeasure", ed.ActiveTool())
 	}
-	savePreview(t, dumpDir, "v3_03_studio_glasswork_beautify.png", ttStudio.Image())
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_03_studio_glasswork_beautify.png", ttStudio.Image())
+	}
 
 	// 4. Dark-mode Studio & Light-background QQ Overlay previews for contrast verification
 	if dumpDir != "" {
@@ -262,11 +270,11 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if got := a.Hotkey(app.HotkeyFull); got != "" {
 		t.Fatalf("after canceling 全屏截图 hotkey, got %q, want empty", got)
 	}
-	// Capture preview while the confirmation Toast is floating above Settings
-	ttSettings.Advance(450 * time.Millisecond)
-	savePreview(t, dumpDir, "v3_07_settings_light.png", ttSettings.Image())
-
 	if dumpDir != "" {
+		// Capture preview while the confirmation Toast is floating above Settings
+		ttSettings.Advance(450 * time.Millisecond)
+		savePreview(t, dumpDir, "v3_07_settings_light.png", ttSettings.Image())
+
 		// Dump Settings with Liquid Glass Select open (both mid-stretch neck & settled open) in Light & Dark modes
 		_ = ttSettings.Click("选择外观")
 		ttSettings.Advance(45 * time.Millisecond)
@@ -346,7 +354,9 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !ttOCR.HasText("文字识别") || !ttOCR.HasText("复制并关闭") {
 		t.Fatalf("expected OCR result view controls, got texts: %q", ttOCR.Texts())
 	}
-	savePreview(t, dumpDir, "v3_10_ocr_result.png", ttOCR.Image())
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_10_ocr_result.png", ttOCR.Image())
+	}
 
 	if os.Getenv("KOMA_GEN_ICON") == "1" {
 		if err := os.WriteFile(filepath.Join("resources", "icon.png"), icons.AppIconPNG(512), 0o644); err != nil {

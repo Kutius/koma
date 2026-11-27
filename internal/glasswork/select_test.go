@@ -39,7 +39,7 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 		})
 	}
 
-	tt := ui.NewTester(view, 400, 320)
+	tt := ui.NewTester(view, 280, 240)
 	if !tt.HasText("Standard") || tt.HasText("Express") {
 		t.Fatalf("closed select should show only selected label; texts=%q", tt.Texts())
 	}
@@ -57,7 +57,7 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 	_ = tt.Image()
 
 	// Advance to settled open state
-	tt.Advance(500 * time.Millisecond)
+	tt.Advance(380 * time.Millisecond)
 	_ = tt.Image()
 
 	// Click an option
@@ -72,7 +72,7 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 	}
 
 	// Advance through reverse-close animation until fully unmounted
-	tt.Advance(600 * time.Millisecond)
+	tt.Advance(320 * time.Millisecond)
 	if tt.HasText("Same day") {
 		t.Fatalf("expected popup unmounted after close animation; texts=%q", tt.Texts())
 	}
@@ -87,7 +87,7 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 	if selected != "sameday" || pickedCount != 2 {
 		t.Fatalf("after keyboard nav skipping disabled item: selected=%q picked=%d", selected, pickedCount)
 	}
-	tt.Advance(600 * time.Millisecond)
+	tt.Advance(320 * time.Millisecond)
 
 	// Open again and dismiss with Escape without changing selection
 	if err := tt.Click("Delivery"); err != nil {
@@ -103,8 +103,46 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 	if selected != "sameday" {
 		t.Fatalf("Escape should keep selected=%q", selected)
 	}
-	tt.Advance(600 * time.Millisecond)
+	tt.Advance(320 * time.Millisecond)
 	if tt.HasText("Express") {
 		t.Fatalf("expected popup gone after Escape close animation; texts=%q", tt.Texts())
+	}
+}
+
+func TestGlassSelectReduceMotionInstantOpenClose(t *testing.T) {
+	selected := "a"
+	open := false
+	opts := []SelectOption[string]{
+		{Value: "a", Label: "Alpha"},
+		{Value: "b", Label: "Beta"},
+	}
+	view := func(c *ui.Context) {
+		ui.Box(c).Fill().Center().Children(func() {
+			Select(c, SelectProps[string]{
+				Key:      "rm-select",
+				Label:    "Pick",
+				Selected: &selected,
+				Open:     &open,
+				Width:    140,
+				Height:   28,
+				Kind:     KindDark,
+				Options:  opts,
+			})
+		})
+	}
+	tt := ui.NewTesterWith(view, 240, 200, ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true},
+	})
+	if err := tt.Click("Pick"); err != nil {
+		t.Fatalf("click trigger: %v", err)
+	}
+	if !open || !tt.HasText("Beta") {
+		t.Fatalf("expected instant open under ReduceMotion; open=%v texts=%q", open, tt.Texts())
+	}
+	if err := tt.Click("Beta"); err != nil {
+		t.Fatalf("click Beta: %v", err)
+	}
+	if selected != "b" || open || tt.HasText("Alpha") {
+		t.Fatalf("expected instant close under ReduceMotion; selected=%q open=%v texts=%q", selected, open, tt.Texts())
 	}
 }

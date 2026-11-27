@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -159,7 +158,9 @@ func TestUpdaterStateAndSettingsControlsHeadless(t *testing.T) {
 
 	ed := NewEditorState(a)
 	ed.OpenSettings()
-	tt := ui.NewTester(ed.View, 1220, 780)
+	tt := ui.NewTesterWith(ed.View, 1220, 780, ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true},
+	})
 
 	if !tt.HasText("v" + a.AppVersion()) {
 		t.Fatalf("expected current version v%s in settings sheet, got %q", a.AppVersion(), tt.Texts())
@@ -204,7 +205,9 @@ func TestSettingsSelectControlsHeadless(t *testing.T) {
 
 	ed := NewEditorState(a)
 	ed.OpenSettings()
-	tt := ui.NewTester(ed.View, 1220, 780)
+	tt := ui.NewTesterWith(ed.View, 1220, 780, ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true},
+	})
 
 	// 1. Appearance Select: defaults to 跟随系统, open and switch 跟随系统 -> 深色 -> 跟随系统
 	if got := a.ThemeMode(); got != ThemeModeSystem {
@@ -222,7 +225,6 @@ func TestSettingsSelectControlsHeadless(t *testing.T) {
 	if a.ThemeMode() != ThemeModeDark || !a.IsDarkMode() {
 		t.Fatalf("expected ThemeModeDark / dark=true after selecting 深色, got mode=%q dark=%v", a.ThemeMode(), a.IsDarkMode())
 	}
-	tt.Advance(500 * time.Millisecond)
 
 	// Switch back to 跟随系统 and verify OS theme changes propagate live
 	if err := tt.Click("选择外观"); err != nil {
@@ -242,7 +244,6 @@ func TestSettingsSelectControlsHeadless(t *testing.T) {
 	if a.IsDarkMode() {
 		t.Fatalf("expected IsDarkMode() == false when system switches light in ThemeModeSystem")
 	}
-	tt.Advance(500 * time.Millisecond)
 
 	// 2. Escape closes ONLY an open Select popup, keeping the Settings sheet open
 	if err := tt.Click("选择外观"); err != nil {
@@ -258,7 +259,6 @@ func TestSettingsSelectControlsHeadless(t *testing.T) {
 	if !ed.SettingsOpen() {
 		t.Fatalf("expected Settings sheet to stay open after Escape dismissed Select popup")
 	}
-	tt.Advance(500 * time.Millisecond)
 
 	// 3. Default Format Select: switch PNG -> JPEG
 	if err := tt.Click("选择默认格式"); err != nil {
@@ -270,7 +270,6 @@ func TestSettingsSelectControlsHeadless(t *testing.T) {
 	if got := a.SaveFormat(); got != SaveFormatJPEG {
 		t.Fatalf("SaveFormat() = %q, want %q", got, SaveFormatJPEG)
 	}
-	tt.Advance(500 * time.Millisecond)
 
 	// 4. OCR Engine Select: opens and lists 系统原生 + PP-OCRv6 (with 需下载 badge when uninstalled)
 	if err := tt.Click("选择识别引擎"); err != nil {
@@ -280,7 +279,6 @@ func TestSettingsSelectControlsHeadless(t *testing.T) {
 		t.Fatalf("expected 需下载 badge for uninstalled PP-OCRv6 option, got %q", tt.Texts())
 	}
 	tt.Key(0, ui.KeyEscape)
-	tt.Advance(500 * time.Millisecond)
 
 	// Second Escape (no select open) closes the Settings sheet
 	tt.Key(0, ui.KeyEscape)
