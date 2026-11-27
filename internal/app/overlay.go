@@ -2439,8 +2439,13 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 		Material(barSurf).
 		AlignItems(ui.Center).
 		Transition(glasswork.ToolbarAppearTransition(6))
-	if mb := mainBar.Bounds(); mb.W > 100 && math.Abs(float64(mb.W-p.measuredMainW)) > 1 {
-		p.measuredMainW = mb.W
+	if mb := mainBar.Bounds(); mb.W > 100 {
+		if math.Abs(float64(mb.W-p.measuredMainW)) > 1 {
+			p.measuredMainW = mb.W
+			c.Invalidate()
+		}
+	} else if p.measuredMainW == 0 {
+		c.Invalidate()
 	}
 	// Absorb clicks on gaps inside the bar so clicks never leak through to `surface`!
 	mainBar.Clicked()
@@ -2536,8 +2541,13 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 			AlignItems(ui.Center).
 			ClipX().
 			Transition(glasswork.MorphBarTransition(subEnterY))
-		if sb := subBar.Bounds(); sb.W > 60 && math.Abs(float64(sb.W-p.measuredSubW)) > 1 {
-			p.measuredSubW = sb.W
+		if sb := subBar.Bounds(); sb.W > 60 {
+			if math.Abs(float64(sb.W-p.measuredSubW)) > 1 {
+				p.measuredSubW = sb.W
+				c.Invalidate()
+			}
+		} else if p.measuredSubW == 0 {
+			c.Invalidate()
 		}
 		subBar.Clicked()
 

@@ -76,6 +76,52 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 	if tt.HasText("Same day") {
 		t.Fatalf("expected popup unmounted after close animation; texts=%q", tt.Texts())
 	}
+}
+
+func TestGlassSelectKeyboardNavigationAndEscape(t *testing.T) {
+	selected := "standard"
+	open := false
+	pickedCount := 0
+	var lastPicked string
+
+	opts := []SelectOption[string]{
+		{Value: "standard", Label: "Standard"},
+		{Value: "express", Label: "Express"},
+		{Value: "pickup", Label: "Pickup", Disabled: true},
+		{Value: "sameday", Label: "Same day"},
+	}
+
+	view := func(c *ui.Context) {
+		ui.Box(c).Fill().Background(ui.Hex("#E3E9F3")).Center().Children(func() {
+			Select(c, SelectProps[string]{
+				Key:      "delivery-select-kbd",
+				Label:    "Delivery",
+				Selected: &selected,
+				Open:     &open,
+				Width:    180,
+				Height:   32,
+				Kind:     KindLight,
+				Options:  opts,
+				OnSelect: func(v string) {
+					pickedCount++
+					lastPicked = v
+				},
+			})
+		})
+	}
+
+	tt := ui.NewTesterWith(view, 280, 240, ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true},
+	})
+
+	// Focus trigger first via click + close, then open with ArrowDown
+	if err := tt.Click("Delivery"); err != nil {
+		t.Fatalf("focus click trigger: %v", err)
+	}
+	tt.Key(0, ui.KeyEscape)
+	if open {
+		t.Fatalf("expected Escape to close select")
+	}
 
 	// Keyboard: open with ArrowDown, move past disabled Pickup to Same day, confirm with Enter
 	tt.Key(0, ui.KeyDown)
@@ -83,11 +129,11 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 		t.Fatalf("expected KeyDown on focused trigger to open select")
 	}
 	tt.Key(0, ui.KeyDown) // Express -> skips disabled Pickup -> Same day
+	tt.Key(0, ui.KeyDown) // Standard -> Express -> skips Pickup -> Same day
 	tt.Key(0, ui.KeyEnter)
-	if selected != "sameday" || pickedCount != 2 {
-		t.Fatalf("after keyboard nav skipping disabled item: selected=%q picked=%d", selected, pickedCount)
+	if selected != "sameday" || pickedCount != 1 || lastPicked != "sameday" {
+		t.Fatalf("after keyboard nav skipping disabled item: selected=%q picked=%d last=%q", selected, pickedCount, lastPicked)
 	}
-	tt.Advance(320 * time.Millisecond)
 
 	// Open again and dismiss with Escape without changing selection
 	if err := tt.Click("Delivery"); err != nil {
@@ -103,9 +149,8 @@ func TestGlassSelectClickKeyboardAndEscape(t *testing.T) {
 	if selected != "sameday" {
 		t.Fatalf("Escape should keep selected=%q", selected)
 	}
-	tt.Advance(320 * time.Millisecond)
 	if tt.HasText("Express") {
-		t.Fatalf("expected popup gone after Escape close animation; texts=%q", tt.Texts())
+		t.Fatalf("expected popup gone after Escape close; texts=%q", tt.Texts())
 	}
 }
 

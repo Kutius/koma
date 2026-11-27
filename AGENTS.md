@@ -118,7 +118,7 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 
 ### 4.2 Fullscreen Overlay Toolbar Containment (`overlay.go`)
 - `ComputeToolbarLayout` positions the QQ toolbar in priority order: (1) below selection, (2) above selection, (3) docked inside the bottom of the selection (for near-fullscreen / 100% fullscreen selections).
-- Always pass **measured widths** (`p.measuredMainW`, `p.measuredSubW` from `Bounds().W`, with conservative frame-0 fallbacks `636` / `420`) and clamp both `barX`/`subX` and `barY`/`subY` independently inside `16px` viewport margins. Never hardcode a smaller estimated width than the real toolbar width or the rightmost `完成` button will clip off-screen.
+- Always pass **measured widths** (`p.measuredMainW`, `p.measuredSubW` from `Bounds().W`, with conservative frame-0 fallbacks) and clamp both `barX`/`subX` and `barY`/`subY` independently inside `16px` viewport margins. Call `c.Invalidate()` when `measuredMainW`/`measuredSubW` is `0` on frame 0 or updates, so the toolbar settles to its exact position before the first click even under `ReduceMotion`. Never hardcode a smaller estimated width than the real toolbar width or the rightmost `完成` button will clip off-screen.
 
 ### 4.3 Liquid Glass Shader & D3D11 Motion Rules (`internal/glasswork/`)
 - **No chalky white border rings**: `PresetLens` (toolbars/capsules) and `PresetTinted` (primary CTAs) MUST keep `borderAlpha = 0`, `borderW = 0`, and **no** outer `p.Stroke`. Only `PresetCard` (drawers/sheets, which sets `rimStrength = 0`) uses a subtle `1px` inset hairline.
@@ -151,6 +151,11 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 - Keep `CGO_ENABLED=0` — all Win32 calls live in `internal/winapi/*_windows.go` via `syscall.NewLazyDLL`.
 - For negative Win32 index constants like `GWL_EXSTYLE = -20`, convert through `int32` before casting to `uintptr` to avoid constant overflow.
 - `mygo.Clipboard.WriteText` returns nothing; `mygo.Clipboard.WriteImage` returns `error`.
+
+### 4.8 Headless UI Testing (`main_test.go`, `*_test.go`)
+- **Avoid 20-frame CPU shader stalls**: MyGo's `ui.Tester` runs `settle()` (up to 20 frames at `dt = 0`) on every `NewTester`, `Click`, `Key`, and `Type` while any spring animation is active, software-rasterizing Liquid Glass Kage shaders on CPU-only CI runners.
+- **Interaction & layout regression tests** (`main_test.go`, `internal/app/v030_test.go`, `settings_test.go`, `scroll_test.go`) should default to `ui.NewTesterWith(..., ui.TesterOptions{Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true}})` and guard preview-only `tt.Advance(...)` calls under `if dumpDir != ""`. When `KOMA_PREVIEW_DIR` is set for visual QA, `main_test.go` switches back to full motion + Liquid Glass shaders automatically.
+- **Keep real shader & motion smoke coverage**: Preserve `TestLiquidGlassShadersRenderSmoke` (`ReduceTransparency: false, ReduceMotion: true` in `main_test.go`) and the real liquid open/stretch/retract assertions in `TestGlassSelectClickKeyboardAndEscape` (`internal/glasswork/select_test.go`) so Kage shader compilation, uniforms, and spring transitions stay verified on every CI run.
 
 ---
 

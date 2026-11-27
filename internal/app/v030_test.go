@@ -26,11 +26,17 @@ func TestFormatPickedColorFormats(t *testing.T) {
 	}
 }
 
+func newFastUITester(view func(*ui.Context), w, h int) *ui.Tester {
+	return ui.NewTesterWith(view, w, h, ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true},
+	})
+}
+
 func TestOverlayInlineTextSelectionMoveAndNudge(t *testing.T) {
 	a := New()
 	img := GenerateSampleCanvas()
 	ov := NewTestOverlayView(a, img, canvas.ToolText)
-	tt := ui.NewTester(ov.View, 860, 520)
+	tt := newFastUITester(ov.View, 860, 520)
 
 	initCount := len(ov.Annotations())
 
@@ -152,7 +158,7 @@ func TestStudioTextAnnotationDragMove(t *testing.T) {
 	a := New()
 	ed := NewEditorState(a)
 	ed.LoadImage(GenerateSampleCanvas(), "文本移动测试")
-	tt := ui.NewTester(ed.View, 1220, 780)
+	tt := newFastUITester(ed.View, 1220, 780)
 
 	if err := tt.Click("文字"); err != nil {
 		t.Fatalf("studio click 文字 failed: %v", err)
@@ -335,7 +341,7 @@ func TestOCRResultWindowHeadless(t *testing.T) {
 	a := New()
 	a.SetOCRDataDir(t.TempDir())
 	view := NewTestOCRView(a, "Koma 截图工具\n一帧清光，恰如其分。", 2)
-	tt := ui.NewTester(view, 480, 380)
+	tt := newFastUITester(view, 480, 380)
 	if !tt.HasText("文字识别") || !tt.HasText("复制并关闭") {
 		t.Fatalf("expected OCR card header and CTA, got texts: %q", tt.Texts())
 	}
@@ -365,7 +371,7 @@ func TestSettingsOCRControlsHeadless(t *testing.T) {
 	a.SetSettingsPath(filepath.Join(t.TempDir(), "settings.json"))
 	a.SetOCRDataDir(t.TempDir())
 	a.editor.OpenSettings()
-	tt := ui.NewTester(a.editor.View, 1180, 760)
+	tt := newFastUITester(a.editor.View, 1180, 760)
 	for _, want := range []string{"文字识别", "识别引擎", "系统原生", "PP-OCRv6", "下载模型"} {
 		if !tt.HasText(want) {
 			t.Fatalf("expected Settings sheet to display %q, got texts: %q", want, tt.Texts())
@@ -392,7 +398,7 @@ func TestPinWindowRightClickAndDragIsolation(t *testing.T) {
 		opacity:       1.0,
 		onContextMenu: func() { menuPopups++ },
 	}
-	tt := ui.NewTester(pw.view, 240, 160)
+	tt := newFastUITester(pw.view, 240, 160)
 
 	// Right-click opens context menu via HandleInput (without setting flagClickable on DragWindow)
 	tt.RightClickAt(120, 80)

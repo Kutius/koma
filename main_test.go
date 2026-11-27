@@ -92,6 +92,46 @@ func TestScrollOverlayPlacementAlwaysVisible(t *testing.T) {
 	}
 }
 
+func newUITester(view func(*ui.Context), w, h int, dumpDir string) *ui.Tester {
+	if dumpDir != "" {
+		return ui.NewTester(view, w, h)
+	}
+	return ui.NewTesterWith(view, w, h, ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: true},
+	})
+}
+
+// TestLiquidGlassShadersRenderSmoke verifies that full Liquid Glass Kage shaders
+// (PresetLens, PresetCard, PresetTinted, InlineGlass) compile and render across
+// Home, Overlay, and Studio views without panicking, while ReduceMotion keeps
+// headless frame counts fast on CPU-only CI runners.
+func TestLiquidGlassShadersRenderSmoke(t *testing.T) {
+	opts := ui.TesterOptions{
+		Preferences: ui.Preferences{ReduceMotion: true, ReduceTransparency: false},
+	}
+
+	a := app.New()
+	ed := app.NewEditorState(a)
+	ttHome := ui.NewTesterWith(ed.View, 640, 420, opts)
+	if img := ttHome.Image(); img == nil || img.Bounds().Empty() {
+		t.Fatalf("expected non-empty Liquid Glass Home render")
+	}
+
+	sample := app.GenerateSampleCanvas()
+	ov := app.NewTestOverlayView(a, sample, canvas.ToolArrow)
+	ttOv := ui.NewTesterWith(ov.View, 640, 420, opts)
+	if img := ttOv.Image(); img == nil || img.Bounds().Empty() {
+		t.Fatalf("expected non-empty Liquid Glass Overlay render")
+	}
+
+	ed.LoadImage(sample, "着色器冒烟")
+	ed.AddDemoAnnotations()
+	ttStudio := ui.NewTesterWith(ed.View, 640, 420, opts)
+	if img := ttStudio.Image(); img == nil || img.Bounds().Empty() {
+		t.Fatalf("expected non-empty Liquid Glass Studio render")
+	}
+}
+
 func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	dumpDir := os.Getenv("KOMA_PREVIEW_DIR")
 
@@ -99,7 +139,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	ed := app.NewEditorState(a)
 
 	// 1. Minimalist High-Contrast Liquid Glass Home Stage
-	ttHome := ui.NewTester(ed.View, 1220, 780)
+	ttHome := newUITester(ed.View, 1220, 780, dumpDir)
 	if !ttHome.HasText("区域截图") {
 		t.Fatalf("expected primary Chinese capture CTA, got texts: %q", ttHome.Texts())
 	}
@@ -113,7 +153,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	// 2. QQ-style In-Place Overlay: verify EVERY toolbar button click actually triggers!
 	sample := app.GenerateSampleCanvas()
 	ov := app.NewTestOverlayView(a, sample, canvas.ToolSelect)
-	ttOv := ui.NewTester(ov.View, 860, 520)
+	ttOv := newUITester(ov.View, 860, 520, dumpDir)
 
 	if _, ok := ttOv.Find("长截图"); !ok {
 		t.Fatalf("expected 长截图 button on QQ overlay toolbar")
@@ -179,8 +219,8 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	}); n != 3 {
 		t.Fatalf("expected 3 smart redactions applied on overlay, got %d", n)
 	}
-	ttOv.Advance(450 * time.Millisecond)
 	if dumpDir != "" {
+		ttOv.Advance(450 * time.Millisecond)
 		savePreview(t, dumpDir, "v3_02b_qq_overlay_mosaic_smart.png", ttOv.Image())
 	}
 	// Clicking directly on an existing mosaic block in ToolPixelate mode removes it cleanly,
@@ -197,7 +237,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 
 	// Verify 100% fullscreen selection keeps the ENTIRE toolbar (including rightmost 完成) strictly inside viewport!
 	ov.SetSelectionBounds(0, 0, 860, 520)
-	ttFull := ui.NewTester(ov.View, 860, 520)
+	ttFull := newUITester(ov.View, 860, 520, dumpDir)
 	if err := ttFull.Click("矩形"); err != nil {
 		t.Fatalf("fullscreen overlay click 矩形 failed: %v", err)
 	}
@@ -221,7 +261,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	ed.LoadImage(sample, "示例画布")
 	ed.AddDemoAnnotations()
 
-	ttStudio := ui.NewTester(ed.View, 1220, 780)
+	ttStudio := newUITester(ed.View, 1220, 780, dumpDir)
 	if err := ttStudio.Click("马赛克"); err != nil {
 		t.Fatalf("studio dock click 马赛克 failed: %v", err)
 	}
@@ -240,8 +280,8 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if err := ttStudio.Click("晶格"); err != nil {
 		t.Fatalf("studio click 晶格 failed: %v", err)
 	}
-	ttStudio.Advance(450 * time.Millisecond)
 	if dumpDir != "" {
+		ttStudio.Advance(450 * time.Millisecond)
 		savePreview(t, dumpDir, "v3_03b_studio_mosaic_bar.png", ttStudio.Image())
 		savePreview(t, dumpDir, "v3_11_modern_mosaic_showcase.png", renderModernMosaicShowcase())
 	}
@@ -286,7 +326,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	ed.CloseSettings()
 
 	ed.ClearDocument()
-	ttSettings := ui.NewTester(ed.View, 1220, 780)
+	ttSettings := newUITester(ed.View, 1220, 780, dumpDir)
 	if err := ttSettings.Click("设置"); err != nil {
 		t.Fatalf("home click 设置 button failed: %v", err)
 	}
@@ -384,7 +424,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if sc.StitchedHeight() <= 460 {
 		t.Fatalf("expected stitched height > 460 after feeding scrolled frames, got %d", sc.StitchedHeight())
 	}
-	ttScroll := ui.NewTester(sc.View, 1120, 680)
+	ttScroll := newUITester(sc.View, 1120, 680, dumpDir)
 	if !ttScroll.HasText("自动滚动") || !ttScroll.HasText("完成") {
 		t.Fatalf("expected 自动滚动 & 完成 on scroll control bar, got texts: %q", ttScroll.Texts())
 	}
@@ -414,7 +454,7 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 
 	// 7. Native OCR Result Card Preview
 	ocrView := app.NewTestOCRView(a, "Koma — 一帧清光，恰如其分。\nFrame the moment, effortlessly.", 2)
-	ttOCR := ui.NewTester(ocrView, 480, 380)
+	ttOCR := newUITester(ocrView, 480, 380, dumpDir)
 	if !ttOCR.HasText("文字识别") || !ttOCR.HasText("复制并关闭") {
 		t.Fatalf("expected OCR result view controls, got texts: %q", ttOCR.Texts())
 	}
