@@ -102,17 +102,18 @@ type overlayPane struct {
 	surfaceHandle ui.Handle
 
 	// In-place QQ-style annotation state (monitor physical pixels)
-	activeTool  canvas.Tool
-	mosaicStyle canvas.MosaicStyle
-	colorIdx    int
-	strokeWidth float32
-	filled      bool
-	rounded     bool
-	fontSize    float32
-	textDraft   string
-	blockSize   float64
-	nextAnnID   int
-	nextCounter int
+	activeTool      canvas.Tool
+	mosaicStyle     canvas.MosaicStyle
+	colorIdx        int
+	strokeWidth     float32
+	filled          bool
+	rounded         bool
+	fontSize        float64
+	counterSize     float32
+	blockSize       float64
+	sliderUndoAnnID int
+	nextAnnID       int
+	nextCounter     int
 
 	// Offline smart redaction & point-to-redact OCR word cache (scoped to current selection)
 	redactMu      sync.Mutex
@@ -133,18 +134,26 @@ type overlayPane struct {
 	draftAnn canvas.Annotation
 
 	// In-place annotation selection & drag-move state
-	selectedAnnIdx    int
-	movingAnn         bool
-	moveAnnLastPx     canvas.PointF
-	moveAnnUndoPushed bool
+	selectedAnnIdx      int
+	movingAnn           bool
+	moveAnnStartPx      canvas.PointF
+	moveAnnLastPx       canvas.PointF
+	moveAnnMoved        bool
+	moveAnnUndoPushed   bool
+	moveAnnFromTextTool bool
+	moveAnnWasSelected  bool
 
 	// Inline canvas text editor state (sibling of surface so typing never fights selection input)
-	textEditing       bool
-	textEditIdx       int // -1 for a new text annotation, >= 0 when editing annotations[textEditIdx]
-	textEditPx        canvas.PointF
-	textEditVal       string
-	textEditHandle    ui.Handle
-	textEditNeedFocus bool
+	textEditing        bool
+	textEditIdx        int // -1 for a new text annotation, >= 0 when editing annotations[textEditIdx]
+	textEditPx         canvas.PointF
+	textEditVal        string
+	textEditHandle     ui.Handle
+	textEditNeedFocus  bool
+	textEditDragging   bool
+	textEditDragStartX float32
+	textEditDragStartY float32
+	textEditDragOrigPx canvas.PointF
 }
 
 type localWinRect struct {
@@ -609,10 +618,10 @@ func newOverlayPane(session *overlaySession, d mygo.Display, cap winapi.MonitorC
 		lastMeasurePxY: -1,
 		activeTool:     canvas.ToolSelect,
 		colorIdx:       0,
-		strokeWidth:    4,
+		strokeWidth:    3,
 		rounded:        true,
-		fontSize:       20,
-		textDraft:      "标注",
+		fontSize:       22,
+		counterSize:    14,
 		blockSize:      14,
 		nextCounter:    1,
 		selectedAnnIdx: -1,
@@ -629,14 +638,146 @@ func (p *overlayPane) findPaletteIndex(col ui.Color) int {
 	return p.colorIdx
 }
 
+func (p *overlayPane) syncPropsFromAnnotation(ann canvas.Annotation) {
+	p.colorIdx = p.findPaletteIndex(ann.Color)
+	switch ann.Kind {
+	case canvas.ToolText:
+		p.fontSize = float64(canvas.ClampFontSize(ann.FontSize))
+		p.filled = ann.Filled
+	case canvas.ToolCounter:
+		p.counterSize = canvas.CounterRadius(ann)
+	case canvas.ToolPixelate, canvas.ToolBlur:
+		p.mosaicStyle = ann.MosaicStyle
+		if ann.Kind == canvas.ToolBlur {
+			p.mosaicStyle = canvas.MosaicBlur
+		}
+		if ann.BlockSize >= 6 {
+			p.blockSize = float64(ann.BlockSize)
+		}
+	case canvas.ToolRect, canvas.ToolEllipse:
+		if ann.StrokeWidth > 0 {
+			p.strokeWidth = ann.StrokeWidth
+		}
+		p.filled = ann.Filled
+		p.rounded = ann.Rounded
+	case canvas.ToolArrow, canvas.ToolLine, canvas.ToolPen, canvas.ToolHighlighter:
+		if ann.StrokeWidth > 0 {
+			p.strokeWidth = ann.StrokeWidth
+		}
+	}
+}
+
+func (p *overlayPane) setSelectedAnnotation(idx int) {
+	if p.selectedAnnIdx != idx {
+		p.sliderUndoAnnID = 0
+	}
+	p.selectedAnnIdx = idx
+	if idx >= 0 && idx < len(p.annotations) {
+		p.syncPropsFromAnnotation(p.annotations[idx])
+	}
+}
+
+func (p *overlayPane) applyFontSize(fs float32, fromSlider bool) {
+	fs = canvas.ClampFontSize(float32(math.Round(float64(fs))))
+	p.fontSize = float64(fs)
+	if !p.textEditing && p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) && p.annotations[p.selectedAnnIdx].Kind == canvas.ToolText {
+		ann := &p.annotations[p.selectedAnnIdx]
+		if ann.FontSize != fs {
+			if !fromSlider || p.sliderUndoAnnID != ann.ID {
+				p.pushUndo()
+				if fromSlider {
+					p.sliderUndoAnnID = ann.ID
+				} else {
+					p.sliderUndoAnnID = 0
+				}
+			}
+			ann.FontSize = fs
+		}
+	}
+}
+
+func (p *overlayPane) applyBlockSize(bs int, fromSlider bool) {
+	bs = winapi.ClampInt(bs, 6, 32)
+	p.blockSize = float64(bs)
+	if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
+		ann := &p.annotations[p.selectedAnnIdx]
+		if (ann.Kind == canvas.ToolPixelate || ann.Kind == canvas.ToolBlur) && ann.BlockSize != bs {
+			if !fromSlider || p.sliderUndoAnnID != ann.ID {
+				p.pushUndo()
+				if fromSlider {
+					p.sliderUndoAnnID = ann.ID
+				} else {
+					p.sliderUndoAnnID = 0
+				}
+			}
+			ann.BlockSize = bs
+			p.effectDirty = true
+		}
+	}
+}
+
+func (p *overlayPane) applyStrokeWidth(sw float32) {
+	p.strokeWidth = sw
+	p.sliderUndoAnnID = 0
+	if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
+		ann := &p.annotations[p.selectedAnnIdx]
+		switch ann.Kind {
+		case canvas.ToolRect, canvas.ToolEllipse, canvas.ToolArrow, canvas.ToolLine, canvas.ToolPen, canvas.ToolHighlighter:
+			if ann.StrokeWidth != sw {
+				p.pushUndo()
+				ann.StrokeWidth = sw
+			}
+		}
+	}
+}
+
+func (p *overlayPane) applyCounterSize(r float32) {
+	p.counterSize = r
+	p.sliderUndoAnnID = 0
+	if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) && p.annotations[p.selectedAnnIdx].Kind == canvas.ToolCounter {
+		ann := &p.annotations[p.selectedAnnIdx]
+		if canvas.CounterRadius(*ann) != r {
+			p.pushUndo()
+			ann.FontSize = r
+		}
+	}
+}
+
+func (p *overlayPane) stepActiveSize(delta int) {
+	targetTool := p.activeTool
+	if targetTool == canvas.ToolSelect && p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
+		targetTool = p.annotations[p.selectedAnnIdx].Kind
+	}
+	switch targetTool {
+	case canvas.ToolText:
+		p.applyFontSize(canvas.StepFontSize(float32(p.fontSize), delta), false)
+	case canvas.ToolCounter:
+		steps := canvas.CounterSizeSteps
+		curIdx := 1
+		for i, st := range steps {
+			if math.Abs(float64(p.counterSize-st.Radius)) < 1.5 {
+				curIdx = i
+				break
+			}
+		}
+		nextIdx := winapi.ClampInt(curIdx+delta, 0, len(steps)-1)
+		p.applyCounterSize(steps[nextIdx].Radius)
+	case canvas.ToolPixelate, canvas.ToolBlur:
+		p.applyBlockSize(int(math.Round(p.blockSize))+delta*2, false)
+	case canvas.ToolRect, canvas.ToolEllipse, canvas.ToolArrow, canvas.ToolLine, canvas.ToolPen, canvas.ToolHighlighter:
+		p.applyStrokeWidth(canvas.StepStrokeWidth(p.strokeWidth, delta))
+	}
+}
+
 func (p *overlayPane) beginInlineTextNew(px, py float32) {
 	p.commitTextEdit()
-	p.selectedAnnIdx = -1
+	p.setSelectedAnnotation(-1)
 	p.textEditing = true
 	p.textEditIdx = -1
 	p.textEditPx = canvas.PointF{X: px, Y: py}
 	p.textEditVal = ""
 	p.textEditNeedFocus = true
+	p.textEditDragging = false
 }
 
 func (p *overlayPane) beginInlineTextEdit(idx int) {
@@ -646,17 +787,14 @@ func (p *overlayPane) beginInlineTextEdit(idx int) {
 	p.commitTextEdit()
 	ann := p.annotations[idx]
 	p.activeTool = canvas.ToolText
-	p.selectedAnnIdx = -1
+	p.setSelectedAnnotation(-1)
 	p.textEditing = true
 	p.textEditIdx = idx
 	p.textEditPx = ann.Start
 	p.textEditVal = ann.Text
-	if ann.FontSize > 0 {
-		p.fontSize = ann.FontSize
-	}
-	p.filled = ann.Filled
-	p.colorIdx = p.findPaletteIndex(ann.Color)
+	p.syncPropsFromAnnotation(ann)
 	p.textEditNeedFocus = true
+	p.textEditDragging = false
 }
 
 func (p *overlayPane) commitTextEdit() {
@@ -666,29 +804,32 @@ func (p *overlayPane) commitTextEdit() {
 	val := strings.TrimRight(p.textEditVal, "\r\n")
 	idx := p.textEditIdx
 	pos := p.textEditPx
+	fs := canvas.ClampFontSize(float32(math.Round(p.fontSize)))
 
 	p.textEditing = false
 	p.textEditIdx = -1
 	p.textEditVal = ""
 	p.textEditNeedFocus = false
+	p.textEditDragging = false
 
 	if strings.TrimSpace(val) == "" {
 		// Clearing an existing text annotation removes it cleanly.
 		if idx >= 0 && idx < len(p.annotations) {
 			p.pushUndo()
 			p.annotations = append(p.annotations[:idx], p.annotations[idx+1:]...)
-			p.selectedAnnIdx = -1
+			p.setSelectedAnnotation(-1)
 		}
 		return
 	}
 
 	p.pushUndo()
 	if idx >= 0 && idx < len(p.annotations) {
+		p.annotations[idx].Start = pos
 		p.annotations[idx].Text = val
-		p.annotations[idx].FontSize = p.fontSize
+		p.annotations[idx].FontSize = fs
 		p.annotations[idx].Filled = p.filled
 		p.annotations[idx].Color = p.activeColor()
-		p.selectedAnnIdx = idx
+		p.setSelectedAnnotation(idx)
 		return
 	}
 
@@ -698,11 +839,11 @@ func (p *overlayPane) commitTextEdit() {
 		Kind:     canvas.ToolText,
 		Start:    pos,
 		Color:    p.activeColor(),
-		FontSize: p.fontSize,
+		FontSize: fs,
 		Filled:   p.filled,
 		Text:     val,
 	})
-	p.selectedAnnIdx = len(p.annotations) - 1
+	p.setSelectedAnnotation(len(p.annotations) - 1)
 }
 
 func (p *overlayPane) cancelTextEdit() {
@@ -713,6 +854,7 @@ func (p *overlayPane) cancelTextEdit() {
 	p.textEditIdx = -1
 	p.textEditVal = ""
 	p.textEditNeedFocus = false
+	p.textEditDragging = false
 }
 
 func (p *overlayPane) nudgeSelection(dxPx, dyPx int, resizeEnd, resizeStart bool, viewW, viewH float32) {
@@ -1025,6 +1167,10 @@ func (p *overlayPane) resetSelection() {
 	p.dragMode = dragNone
 	p.drawing = false
 	p.movingAnn = false
+	p.moveAnnMoved = false
+	p.moveAnnUndoPushed = false
+	p.moveAnnFromTextTool = false
+	p.moveAnnWasSelected = false
 	p.selectedAnnIdx = -1
 	p.activeTool = canvas.ToolSelect
 	p.annotations = nil
@@ -1368,6 +1514,13 @@ func (p *overlayPane) view(c *ui.Context) {
 				}
 			}
 
+			if c.Shortcut(0, ui.KeyBracketLeft) {
+				p.stepActiveSize(-1)
+			}
+			if c.Shortcut(0, ui.KeyBracketRight) {
+				p.stepActiveSize(1)
+			}
+
 			if c.Shortcut(0, ui.KeyB) {
 				p.commitTextEdit()
 				if p.activeTool == canvas.ToolPixelate && p.mosaicStyle == canvas.MosaicBlur {
@@ -1418,8 +1571,28 @@ func (p *overlayPane) view(c *ui.Context) {
 
 	cur := ui.CursorCrosshair
 	if p.hasSelection && p.dragMode == dragNone {
-		if p.activeTool == canvas.ToolText {
+		if p.movingAnn {
+			cur = ui.CursorMove
+		} else if p.activeTool == canvas.ToolText {
 			cur = ui.CursorText
+			if !p.textEditing && p.mouseInside && len(p.annotations) > 0 {
+				mpx, mpy := p.dipToPxF(p.mouseX, p.mouseY, viewW, viewH)
+				iw := float32(max(1, p.capture.Image.Bounds().Dx()))
+				tol := 10 * iw / max(1, viewW)
+				if canvas.HitTestAnnotationKind(p.annotations, canvas.ToolText, mpx, mpy, tol) >= 0 {
+					cur = ui.CursorMove
+				}
+			}
+		} else if p.activeTool == canvas.ToolCounter {
+			cur = ui.CursorCrosshair
+			if p.mouseInside && len(p.annotations) > 0 {
+				mpx, mpy := p.dipToPxF(p.mouseX, p.mouseY, viewW, viewH)
+				iw := float32(max(1, p.capture.Image.Bounds().Dx()))
+				tol := 10 * iw / max(1, viewW)
+				if canvas.HitTestAnnotationKind(p.annotations, canvas.ToolCounter, mpx, mpy, tol) >= 0 {
+					cur = ui.CursorMove
+				}
+			}
 		} else if (p.activeTool == canvas.ToolPixelate || p.activeTool == canvas.ToolBlur) && !p.drawing && p.mouseInside {
 			mpx, mpy := p.dipToPxF(p.mouseX, p.mouseY, viewW, viewH)
 			if hit := hitRedactionAnnotation(p.annotations, mpx, mpy); hit >= 0 {
@@ -1491,6 +1664,14 @@ func (p *overlayPane) view(c *ui.Context) {
 
 				if p.movingAnn && p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
 					px, py := p.dipToPxF(ev.X, ev.Y, viewW, viewH)
+					if !p.moveAnnMoved {
+						iw := float32(max(1, p.capture.Image.Bounds().Dx()))
+						thresh := 3 * iw / max(1, viewW)
+						if float32(math.Hypot(float64(px-p.moveAnnStartPx.X), float64(py-p.moveAnnStartPx.Y))) < thresh {
+							return true
+						}
+						p.moveAnnMoved = true
+					}
 					dx := px - p.moveAnnLastPx.X
 					dy := py - p.moveAnnLastPx.Y
 					if math.Abs(float64(dx)) >= 0.5 || math.Abs(float64(dy)) >= 0.5 {
@@ -1633,6 +1814,22 @@ func (p *overlayPane) view(c *ui.Context) {
 					if p.activeTool != canvas.ToolText {
 						return true
 					}
+					// If the user clicked empty canvas, stop after committing instead of
+					// immediately spawning a second empty text box; if they clicked directly
+					// on a text annotation (e.g. to drag it), fall through to handle it.
+					if !p.hasSelection {
+						return true
+					}
+					x0, y0, x1, y1 := p.normSel()
+					if ev.X < x0 || ev.X > x1 || ev.Y < y0 || ev.Y > y1 {
+						return true
+					}
+					px, py := p.dipToPxF(ev.X, ev.Y, viewW, viewH)
+					iw := float32(max(1, p.capture.Image.Bounds().Dx()))
+					tol := 10 * iw / max(1, viewW)
+					if canvas.HitTestAnnotationKind(p.annotations, canvas.ToolText, px, py, tol) < 0 {
+						return true
+					}
 				}
 
 				if p.hasSelection {
@@ -1643,6 +1840,19 @@ func (p *overlayPane) view(c *ui.Context) {
 						px, py := p.dipToPxF(ev.X, ev.Y, viewW, viewH)
 						switch p.activeTool {
 						case canvas.ToolCounter:
+							iw := float32(max(1, p.capture.Image.Bounds().Dx()))
+							tol := 10 * iw / max(1, viewW)
+							if hit := canvas.HitTestAnnotationKind(p.annotations, canvas.ToolCounter, px, py, tol); hit >= 0 {
+								p.setSelectedAnnotation(hit)
+								p.movingAnn = true
+								p.moveAnnStartPx = canvas.PointF{X: px, Y: py}
+								p.moveAnnLastPx = canvas.PointF{X: px, Y: py}
+								p.moveAnnMoved = false
+								p.moveAnnUndoPushed = false
+								p.moveAnnFromTextTool = false
+								p.moveAnnWasSelected = false
+								return true
+							}
 							p.pushUndo()
 							p.nextAnnID++
 							p.annotations = append(p.annotations, canvas.Annotation{
@@ -1650,17 +1860,36 @@ func (p *overlayPane) view(c *ui.Context) {
 								Kind:       canvas.ToolCounter,
 								Start:      canvas.PointF{X: px, Y: py},
 								Color:      p.activeColor(),
+								FontSize:   p.counterSize,
 								CounterNum: p.nextCounter,
 							})
 							p.nextCounter++
-							p.selectedAnnIdx = len(p.annotations) - 1
+							p.setSelectedAnnotation(len(p.annotations) - 1)
+							p.movingAnn = true
+							p.moveAnnStartPx = canvas.PointF{X: px, Y: py}
+							p.moveAnnLastPx = canvas.PointF{X: px, Y: py}
+							p.moveAnnMoved = false
+							p.moveAnnUndoPushed = true
+							p.moveAnnFromTextTool = false
+							p.moveAnnWasSelected = false
 							return true
 
 						case canvas.ToolText:
 							iw := float32(max(1, p.capture.Image.Bounds().Dx()))
 							tol := 10 * iw / max(1, viewW)
-							if hit := canvas.HitTestAnnotation(p.annotations, px, py, tol); hit >= 0 && p.annotations[hit].Kind == canvas.ToolText {
-								p.beginInlineTextEdit(hit)
+							if hit := canvas.HitTestAnnotationKind(p.annotations, canvas.ToolText, px, py, tol); hit >= 0 {
+								if ev.Clicks >= 2 {
+									p.beginInlineTextEdit(hit)
+									return true
+								}
+								p.moveAnnWasSelected = p.selectedAnnIdx == hit
+								p.setSelectedAnnotation(hit)
+								p.movingAnn = true
+								p.moveAnnStartPx = canvas.PointF{X: px, Y: py}
+								p.moveAnnLastPx = canvas.PointF{X: px, Y: py}
+								p.moveAnnMoved = false
+								p.moveAnnUndoPushed = false
+								p.moveAnnFromTextTool = true
 							} else {
 								p.beginInlineTextNew(px, py)
 							}
@@ -1722,10 +1951,14 @@ func (p *overlayPane) view(c *ui.Context) {
 								p.beginInlineTextEdit(hit)
 								return true
 							}
-							p.selectedAnnIdx = hit
+							p.setSelectedAnnotation(hit)
 							p.movingAnn = true
+							p.moveAnnStartPx = canvas.PointF{X: px, Y: py}
 							p.moveAnnLastPx = canvas.PointF{X: px, Y: py}
+							p.moveAnnMoved = false
 							p.moveAnnUndoPushed = false
+							p.moveAnnFromTextTool = false
+							p.moveAnnWasSelected = false
 							return true
 						}
 						p.selectedAnnIdx = -1
@@ -1757,8 +1990,18 @@ func (p *overlayPane) view(c *ui.Context) {
 					return false
 				}
 				if p.movingAnn {
+					moved := p.moveAnnMoved
+					fromText := p.moveAnnFromTextTool
+					wasSel := p.moveAnnWasSelected
+					idx := p.selectedAnnIdx
 					p.movingAnn = false
+					p.moveAnnMoved = false
 					p.moveAnnUndoPushed = false
+					p.moveAnnFromTextTool = false
+					p.moveAnnWasSelected = false
+					if !ev.Canceled && !moved && fromText && wasSel && idx >= 0 && idx < len(p.annotations) && p.annotations[idx].Kind == canvas.ToolText {
+						p.beginInlineTextEdit(idx)
+					}
 					return true
 				}
 				if p.drawing {
@@ -2042,50 +2285,109 @@ func (p *overlayPane) renderInlineTextEditor(c *ui.Context, viewW, viewH float32
 
 	dipX := p.textEditPx.X * pxToDipX
 	dipY := p.textEditPx.Y * pxToDipY
-	fs := p.fontSize * scale
+	fs := canvas.ClampFontSize(float32(p.fontSize)) * scale
 	if fs < 12 {
 		fs = 12
 	}
 
-	const boxW float32 = 220
-	const minH float32 = 34
+	boxW := clamp32(fs*10.5, 210, 420)
+	const gripW float32 = 16
+	minH := max(float32(34), fs*1.55)
 	x0, y0, x1, y1 := p.normSel()
-	maxLeft := max(x0, min(viewW-boxW-12, x1-96))
+	if avail := x1 - x0 - gripW - 24; avail > 140 && boxW > avail {
+		boxW = avail
+	}
+	maxLeft := max(x0, min(viewW-(boxW+gripW+12)-12, x1-96))
 	maxTop := max(y0, min(viewH-minH-12, y1-minH))
-	left := clamp32(dipX-6, 8, max(8, maxLeft))
+	left := clamp32(dipX-gripW-6, 8, max(8, maxLeft))
 	top := clamp32(dipY-6, 8, max(8, maxTop))
 
 	accentCol := p.activeColor()
 	txtCol := accentCol
-	bgCol := ui.RGBA(15, 23, 42, 0.56)
+	bgCol := canvas.InlineEditorBackdrop(accentCol)
 	if p.filled {
-		bgCol = accentCol.Alpha(0.92)
-		lum := 0.2126*float64(accentCol.R) + 0.7152*float64(accentCol.G) + 0.0722*float64(accentCol.B)
-		if lum > 175 {
-			txtCol = ui.Hex("#0F172A")
-		} else {
-			txtCol = ui.Hex("#FFFFFF")
-		}
+		bgCol = accentCol.Alpha(0.95)
+		txtCol = canvas.ContrastInk(accentCol)
 	}
 
-	wrap := ui.Box(c.Key("qq-inline-text-wrap")).
-		Absolute().Left(left).Top(top).MinWidth(148).MaxWidth(max(220, x1-left-4)).
-		Radius(8).Background(bgCol).Border(1.5, ui.Hex("#0A84FF"))
-	wrap.Clicked()
+	wrap := ui.Row(c.Key("qq-inline-text-wrap")).
+		Absolute().Left(left).Top(top).MinWidth(164).MaxWidth(max(240, x1-left-4)).
+		Padding(4, 6, 4, 4).Gap(2).
+		Radius(8).Background(bgCol).Border(1.5, ui.Hex("#0A84FF")).
+		AlignItems(ui.Center).
+		Cursor(ui.CursorMove)
+
+	wrap.HandleInput(func(ev ui.InputEvent) bool {
+		switch ev.Kind {
+		case ui.InputPointerDown:
+			if ev.Button != 0 {
+				return false
+			}
+			p.textEditDragging = true
+			p.textEditDragStartX = left + ev.X
+			p.textEditDragStartY = top + ev.Y
+			p.textEditDragOrigPx = p.textEditPx
+			return true
+		case ui.InputPointerMove:
+			if !p.textEditDragging {
+				return false
+			}
+			curX := left + ev.X
+			curY := top + ev.Y
+			dxPx, dyPx := p.dipToPxF(curX-p.textEditDragStartX, curY-p.textEditDragStartY, viewW, viewH)
+			selPx := p.selectionPxRect(viewW, viewH)
+			minPxX, minPxY := float32(selPx.Min.X), float32(selPx.Min.Y)
+			maxPxX := max(minPxX, float32(selPx.Max.X)-24)
+			maxPxY := max(minPxY, float32(selPx.Max.Y)-24)
+			p.textEditPx = canvas.PointF{
+				X: clamp32(p.textEditDragOrigPx.X+dxPx, minPxX, maxPxX),
+				Y: clamp32(p.textEditDragOrigPx.Y+dyPx, minPxY, maxPxY),
+			}
+			return true
+		case ui.InputPointerUp:
+			if p.textEditDragging {
+				p.textEditDragging = false
+				p.textEditNeedFocus = true
+				return true
+			}
+		}
+		return false
+	})
 
 	wrap.Children(func() {
+		// Subtle 2×3 dot drag handle so users can reposition text even while typing.
+		dotCol := txtCol.Alpha(0.55)
+		ui.Box(c.Key("qq-inline-text-grip")).Size(gripW, 24).Shrink(0).PassThrough().Draw(func(pt *ui.Painter, r ui.Rect) {
+			cx := r.X + r.W*0.5
+			cy := r.Y + r.H*0.5
+			for _, dy := range []float32{-5, 0, 5} {
+				for _, dx := range []float32{-2.5, 2.5} {
+					pt.Fill(ui.Rect{X: cx + dx - 1.2, Y: cy + dy - 1.2, W: 2.4, H: 2.4}, dotCol, 1.2)
+				}
+			}
+		})
+
 		ta := ui.TextArea(c.Key("qq-inline-text"), &p.textEditVal).
 			Bind(&p.textEditHandle).
 			Width(boxW).MinHeight(minH).
-			Padding(4, 8, 4, 8).
+			Padding(2, 6, 2, 4).
 			FontSize(fs).FontWeight(700).TextColor(txtCol).
 			Background(ui.Transparent).Border(0, ui.Transparent).
+			Cursor(ui.CursorText).
 			Placeholder("输入文字… (Enter 确认，Shift+Enter 换行)").
 			PlaceholderColor(txtCol.Alpha(0.55))
 
 		ta.OnTextKey(func(k ui.TextKey) bool {
 			if k.Key == ui.KeyEscape {
 				p.cancelTextEdit()
+				return true
+			}
+			if k.Mods&ui.Ctrl != 0 && (k.Key == ui.KeyMinus || k.Key == ui.KeyBracketLeft) {
+				p.applyFontSize(canvas.StepFontSize(float32(p.fontSize), -1), false)
+				return true
+			}
+			if k.Mods&ui.Ctrl != 0 && (k.Key == ui.KeyEqual || k.Key == ui.KeyBracketRight) {
+				p.applyFontSize(canvas.StepFontSize(float32(p.fontSize), 1), false)
 				return true
 			}
 			if k.Key == ui.KeyEnter && k.Mods&ui.Shift == 0 {
@@ -2097,7 +2399,7 @@ func (p *overlayPane) renderInlineTextEditor(c *ui.Context, viewW, viewH float32
 		})
 	})
 
-	if p.textEditNeedFocus {
+	if p.textEditNeedFocus && !p.textEditDragging {
 		p.textEditHandle.Focus(c)
 		p.textEditNeedFocus = false
 	}
@@ -2114,7 +2416,7 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 	}
 	subW := p.measuredSubW
 	if subW < 180 {
-		subW = 470
+		subW = 540
 	}
 
 	showSub := p.activeTool != canvas.ToolSelect
@@ -2269,7 +2571,11 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 					if p.mosaicStyle == canvas.MosaicBlur {
 						tip = "模糊强度"
 					}
+					prevBS := int(math.Round(p.blockSize))
 					ui.Slider(c, &p.blockSize, 6, 32).Width(92).Label(tip).Tooltip(tip)
+					if curBS := int(math.Round(p.blockSize)); curBS != prevBS {
+						p.applyBlockSize(curBS, true)
+					}
 					ui.Textf(c, "%d px", int(math.Round(p.blockSize))).
 						FontSize(11.5).FontWeight(600).TextColor(inks.Primary).SingleLine().Shrink(0).
 						ContentTransition(glasswork.ContentNumeric)
@@ -2306,18 +2612,51 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 				}
 
 			case canvas.ToolText:
-				for _, sz := range []float32{16, 22, 30} {
-					if glassChipScoped(c, inks, fmt.Sprintf("%d", int(sz)), p.fontSize == sz, "qq-font") {
-						p.fontSize = sz
+				if glassStepBtn(c, inks, "−", "减小字号", "减小字号 ([)") {
+					p.applyFontSize(canvas.StepFontSize(float32(p.fontSize), -1), false)
+					if p.textEditing {
+						p.textEditNeedFocus = true
 					}
 				}
+				prevFS := int(math.Round(p.fontSize))
+				ui.Slider(c, &p.fontSize, float64(canvas.MinFontSize), float64(canvas.MaxFontSize)).
+					Width(84).Label("字号").Tooltip("调整字号 (12–72 px，快捷键 [ / ])")
+				if curFS := int(math.Round(p.fontSize)); curFS != prevFS {
+					p.applyFontSize(float32(curFS), true)
+				}
+				if glassStepBtn(c, inks, "+", "增大字号", "增大字号 (])") {
+					p.applyFontSize(canvas.StepFontSize(float32(p.fontSize), 1), false)
+					if p.textEditing {
+						p.textEditNeedFocus = true
+					}
+				}
+				ui.Textf(c, "%d px", int(math.Round(p.fontSize))).
+					FontSize(11.5).FontWeight(600).TextColor(inks.Primary).SingleLine().Shrink(0).
+					ContentTransition(glasswork.ContentNumeric)
+				glassSep(c, inks)
 				if glassChip(c, inks, "底色", p.filled) {
 					p.filled = !p.filled
+					if !p.textEditing && p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) && p.annotations[p.selectedAnnIdx].Kind == canvas.ToolText {
+						p.pushUndo()
+						p.annotations[p.selectedAnnIdx].Filled = p.filled
+					}
+					if p.textEditing {
+						p.textEditNeedFocus = true
+					}
 				}
 				glassSep(c, inks)
 				p.renderOverlayColorDots(c, inks)
 
 			case canvas.ToolCounter:
+				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+					for _, st := range canvas.CounterSizeSteps {
+						active := math.Abs(float64(p.counterSize-st.Radius)) < 1.5
+						if glassChipScoped(c, inks, st.Label, active, "qq-counter-size") {
+							p.applyCounterSize(st.Radius)
+						}
+					}
+				})
+				glassSep(c, inks)
 				ui.Textf(c, "#%d", p.nextCounter).
 					FontSize(12).FontWeight(700).TextColor(inks.Primary).SingleLine().Shrink(0).
 					ContentTransition(glasswork.ContentNumeric)
@@ -2331,17 +2670,12 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 				p.renderOverlayColorDots(c, inks)
 
 			default:
-				sizes := []struct {
-					dot float32
-					sw  float32
-					tip string
-				}{{5, 2, "细"}, {8, 4, "中"}, {11, 7, "粗"}}
-				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-					for _, s := range sizes {
-						active := p.strokeWidth == s.sw
+				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+					for _, s := range canvas.StrokeWidthSteps {
+						active := math.Abs(float64(p.strokeWidth-s.Width)) < 0.3
 						btn := ui.Box(c).Size(24, 24).Radius(12).Center().
-							Role(ui.RoleButton).Label(s.tip).
-							Cursor(ui.CursorPointer).Tooltip(s.tip)
+							Role(ui.RoleButton).Label(s.Label).
+							Cursor(ui.CursorPointer).Tooltip(fmt.Sprintf("%s (%.0fpx · [ / ])", s.Label, s.Width))
 						if !active && btn.Hovered() {
 							btn.Background(inks.Hover)
 						}
@@ -2355,10 +2689,10 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 							if active {
 								dotCol = inks.Accent
 							}
-							ui.Box(c).Size(s.dot, s.dot).Radius(s.dot / 2).Background(dotCol)
+							ui.Box(c).Size(s.Dot, s.Dot).Radius(s.Dot / 2).Background(dotCol)
 						})
 						if btn.Clicked() {
-							p.strokeWidth = s.sw
+							p.applyStrokeWidth(s.Width)
 						}
 					}
 				})
@@ -2368,10 +2702,20 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 					glassSep(c, inks)
 					if glassChip(c, inks, "填充", p.filled) {
 						p.filled = !p.filled
+						if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
+							if k := p.annotations[p.selectedAnnIdx].Kind; k == canvas.ToolRect || k == canvas.ToolEllipse {
+								p.pushUndo()
+								p.annotations[p.selectedAnnIdx].Filled = p.filled
+							}
+						}
 					}
 					if p.activeTool == canvas.ToolRect {
 						if glassChip(c, inks, "圆角", p.rounded) {
 							p.rounded = !p.rounded
+							if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) && p.annotations[p.selectedAnnIdx].Kind == canvas.ToolRect {
+								p.pushUndo()
+								p.annotations[p.selectedAnnIdx].Rounded = p.rounded
+							}
 						}
 					}
 				}
@@ -2381,7 +2725,7 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 }
 
 func (p *overlayPane) renderOverlayColorDots(c *ui.Context, inks glasswork.InkColors) {
-	ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
 		for i, sw := range canvas.DefaultPalette {
 			active := p.colorIdx == i
 			ring := ui.Box(c).Size(22, 22).Radius(11).Center().
@@ -2392,13 +2736,36 @@ func (p *overlayPane) renderOverlayColorDots(c *ui.Context, inks glasswork.InkCo
 				if active {
 					glasswork.SlidingRingLens(c, "qq-color", 11, inks.Accent)
 				}
-				ui.Box(c).Size(14, 14).Radius(7).Background(sw.Color).Border(1, inks.Hairline)
+				ui.Box(c).Size(14, 14).Radius(7).Background(sw.Color).Border(1, canvas.PillBorderColor(sw.Color))
 			})
 			if ring.Clicked() {
 				p.colorIdx = i
+				if p.textEditing {
+					p.textEditNeedFocus = true
+				} else if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
+					p.pushUndo()
+					p.annotations[p.selectedAnnIdx].Color = sw.Color
+				}
 			}
 		}
 	})
+}
+
+func glassStepBtn(c *ui.Context, inks glasswork.InkColors, glyph, label, tip string) bool {
+	btn := ui.Box(c).Size(22, 22).Radius(11).Center().Shrink(0).
+		Role(ui.RoleButton).Label(label).
+		Cursor(ui.CursorPointer).Tooltip(tip)
+	fg := inks.Primary
+	if btn.Hovered() {
+		btn.Background(inks.Hover)
+		fg = inks.Accent
+	}
+	btn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+	glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
+	btn.Children(func() {
+		ui.Text(c, glyph).FontSize(13).FontWeight(700).TextColor(fg).SingleLine()
+	})
+	return btn.Clicked()
 }
 
 func (p *overlayPane) drawGlassworkLoupe(pt *ui.Painter, r ui.Rect) {

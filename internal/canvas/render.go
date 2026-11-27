@@ -1019,6 +1019,10 @@ func hexColor(c ui.Color) string {
 	return fmt.Sprintf("#%02x%02x%02x", c.R, c.G, c.B)
 }
 
+func rgbaCSS(c ui.Color) string {
+	return fmt.Sprintf("rgba(%d,%d,%d,%.2f)", c.R, c.G, c.B, float64(c.A)/255.0)
+}
+
 func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 	hasVector := false
 	for _, a := range anns {
@@ -1048,6 +1052,10 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 				minX, minY, maxX-minX, maxY-minY)
 
 		case ToolLine:
+			if halo, ok := strokeContrastHalo(a.Color); ok {
+				fmt.Fprintf(&sb, `<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="%.1f" stroke-linecap="round"/>`,
+					a.Start.X, a.Start.Y, a.End.X, a.End.Y, rgbaCSS(halo), sw+2)
+			}
 			fmt.Fprintf(&sb, `<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-width="%.1f" stroke-linecap="round"/>`,
 				a.Start.X, a.Start.Y, a.End.X, a.End.Y, col, sw)
 
@@ -1055,7 +1063,11 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 			if d := taperedArrowSVGPath(a.Start.X, a.Start.Y, a.End.X, a.End.Y, sw); d != "" {
 				// Crisp subtle shadow under arrow
 				fmt.Fprintf(&sb, `<path d="%s" transform="translate(0,1.5)" fill="rgba(0,0,0,0.28)"/>`, d)
-				fmt.Fprintf(&sb, `<path d="%s" fill="%s"/>`, d, col)
+				if halo, ok := strokeContrastHalo(a.Color); ok {
+					fmt.Fprintf(&sb, `<path d="%s" fill="%s" stroke="%s" stroke-width="1.8" stroke-linejoin="round" paint-order="stroke fill"/>`, d, col, rgbaCSS(halo))
+				} else {
+					fmt.Fprintf(&sb, `<path d="%s" fill="%s"/>`, d, col)
+				}
 			}
 
 		case ToolRect:
@@ -1068,6 +1080,10 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 			if a.Filled {
 				fill = fmt.Sprintf("rgba(%d,%d,%d,0.20)", a.Color.R, a.Color.G, a.Color.B)
 			}
+			if halo, ok := strokeContrastHalo(a.Color); ok {
+				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="%.1f" fill="none" stroke="%s" stroke-width="%.1f"/>`,
+					minX, minY, maxX-minX, maxY-minY, rx, rgbaCSS(halo), sw+2)
+			}
 			fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="%.1f" fill="%s" stroke="%s" stroke-width="%.1f"/>`,
 				minX, minY, maxX-minX, maxY-minY, rx, fill, col, sw)
 
@@ -1079,13 +1095,22 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 			if a.Filled {
 				fill = fmt.Sprintf("rgba(%d,%d,%d,0.20)", a.Color.R, a.Color.G, a.Color.B)
 			}
+			if halo, ok := strokeContrastHalo(a.Color); ok {
+				fmt.Fprintf(&sb, `<ellipse cx="%.1f" cy="%.1f" rx="%.1f" ry="%.1f" fill="none" stroke="%s" stroke-width="%.1f"/>`,
+					cx, cy, rx, ry, rgbaCSS(halo), sw+2)
+			}
 			fmt.Fprintf(&sb, `<ellipse cx="%.1f" cy="%.1f" rx="%.1f" ry="%.1f" fill="%s" stroke="%s" stroke-width="%.1f"/>`,
 				cx, cy, rx, ry, fill, col, sw)
 
 		case ToolPen:
 			if len(a.Points) >= 2 {
+				d := smoothPathSVG(a.Points)
+				if halo, ok := strokeContrastHalo(a.Color); ok {
+					fmt.Fprintf(&sb, `<path d="%s" fill="none" stroke="%s" stroke-width="%.1f" stroke-linecap="round" stroke-linejoin="round"/>`,
+						d, rgbaCSS(halo), sw+2)
+				}
 				fmt.Fprintf(&sb, `<path d="%s" fill="none" stroke="%s" stroke-width="%.1f" stroke-linecap="round" stroke-linejoin="round"/>`,
-					smoothPathSVG(a.Points), col, sw)
+					d, col, sw)
 			}
 
 		case ToolHighlighter:
@@ -1096,28 +1121,26 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 			}
 
 		case ToolCounter:
-			r := float32(14)
+			r := CounterRadius(a)
 			cx, cy := a.Start.X, a.Start.Y
-			fmt.Fprintf(&sb, `<circle cx="%.1f" cy="%.1f" r="%.1f" fill="rgba(0,0,0,0.32)"/>`, cx, cy+2, r+0.5)
-			fmt.Fprintf(&sb, `<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" stroke="#ffffff" stroke-width="2"/>`, cx, cy, r, col)
-			txtCol := "#ffffff"
-			if isLightColor(a.Color) {
-				txtCol = "#0f172a"
+			fmt.Fprintf(&sb, `<circle cx="%.1f" cy="%.1f" r="%.1f" fill="rgba(0,0,0,0.30)"/>`, cx, cy+2, r+0.5)
+			ringCol := "#ffffff"
+			if RelativeLuminance(a.Color) > 0.72 {
+				ringCol = "rgba(15,23,42,0.34)"
 			}
-			fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, sans-serif" font-size="15" font-weight="700" text-anchor="middle" dominant-baseline="central">%d</text>`,
-				cx, cy, txtCol, a.CounterNum)
+			fmt.Fprintf(&sb, `<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" stroke="%s" stroke-width="2"/>`, cx, cy, r, col, ringCol)
+			txtCol := hexColor(ContrastInk(a.Color))
+			fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, sans-serif" font-size="%.1f" font-weight="700" text-anchor="middle" dominant-baseline="central">%d</text>`,
+				cx, cy, txtCol, r*1.05, a.CounterNum)
 
 		case ToolText:
 			txt := strings.TrimRight(a.Text, "\r\n")
 			if strings.TrimSpace(txt) == "" {
 				continue
 			}
-			fs := a.FontSize
-			if fs <= 0 {
-				fs = 20
-			}
+			fs := ClampFontSize(a.FontSize)
 			lines := strings.Split(strings.ReplaceAll(txt, "\r\n", "\n"), "\n")
-			lineH := fs * 1.38
+			lineH := fs * 1.36
 			if a.Filled {
 				var maxLineW float32
 				for _, line := range lines {
@@ -1125,32 +1148,34 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 						maxLineW = lw
 					}
 				}
-				estW := maxLineW + 20
-				estH := float32(len(lines))*lineH + 8
-				txtCol := "#ffffff"
-				if isLightColor(a.Color) {
-					txtCol = "#0f172a"
-				}
-				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="7" fill="rgba(0,0,0,0.28)"/>`, a.Start.X-6, a.Start.Y-4, estW, estH)
-				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="7" fill="%s"/>`, a.Start.X-6, a.Start.Y-6, estW, estH, col)
+				padX := max(float32(8), fs*0.42)
+				padY := max(float32(5), fs*0.24)
+				rad := min(float32(10), max(float32(6), fs*0.30))
+				estW := maxLineW + padX*2.1
+				estH := float32(len(lines))*lineH + padY*1.8
+				txtCol := hexColor(ContrastInk(a.Color))
+				borderCSS := rgbaCSS(PillBorderColor(a.Color))
+				px, py := a.Start.X-padX*0.65, a.Start.Y-padY
+				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="%.1f" fill="rgba(0,0,0,0.22)"/>`, px, py+2, estW, estH, rad)
+				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="%.1f" fill="%s" stroke="%s" stroke-width="1.1"/>`, px, py, estW, estH, rad, col, borderCSS)
 				for i, line := range lines {
 					if line == "" {
 						continue
 					}
 					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="600" dominant-baseline="hanging">%s</text>`,
-						a.Start.X+4, a.Start.Y+1+float32(i)*lineH, txtCol, fs, html.EscapeString(line))
+						a.Start.X+padX*0.4, a.Start.Y+1+float32(i)*lineH, txtCol, fs, html.EscapeString(line))
 				}
 			} else {
+				haloCSS := rgbaCSS(TextHaloColor(a.Color))
+				haloW := min(float32(5.2), max(float32(2.4), fs*0.14))
 				for i, line := range lines {
 					if line == "" {
 						continue
 					}
 					esc := html.EscapeString(line)
 					ly := a.Start.Y + float32(i)*lineH
-					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="rgba(0,0,0,0.55)" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
-						a.Start.X+1.5, ly+1.5, fs, esc)
-					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
-						a.Start.X, ly, col, fs, esc)
+					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" stroke="%s" stroke-width="%.1f" stroke-linejoin="round" paint-order="stroke fill" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
+						a.Start.X, ly, col, haloCSS, haloW, fs, esc)
 				}
 			}
 
@@ -1158,6 +1183,10 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 			mw := a.MeasRight - a.MeasLeft + 1
 			mh := a.MeasBottom - a.MeasTop + 1
 			ox, oy := a.Start.X, a.Start.Y
+			if halo, ok := strokeContrastHalo(a.Color); ok {
+				fmt.Fprintf(&sb, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="3.0"/>`, a.MeasLeft, oy, a.MeasRight, oy, rgbaCSS(halo))
+				fmt.Fprintf(&sb, `<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="%s" stroke-width="3.0"/>`, ox, a.MeasTop, ox, a.MeasBottom, rgbaCSS(halo))
+			}
 			// Horizontal measurement line & endcaps
 			fmt.Fprintf(&sb, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1.5"/>`, a.MeasLeft, oy, a.MeasRight, oy, col)
 			fmt.Fprintf(&sb, `<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1.5"/>`, a.MeasLeft, oy-5, a.MeasLeft, oy+5, col)
@@ -1177,9 +1206,11 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 			if by < 4 {
 				by = oy + 8
 			}
-			fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="22" rx="6" fill="%s"/>`, bx, by, bw, col)
-			fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="#ffffff" font-family="Segoe UI, Consolas, monospace" font-size="11.5" font-weight="700" text-anchor="middle" dominant-baseline="central">%s</text>`,
-				bx+bw/2, by+11, label)
+			txtCol := hexColor(ContrastInk(a.Color))
+			borderCSS := rgbaCSS(PillBorderColor(a.Color))
+			fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="22" rx="6" fill="%s" stroke="%s" stroke-width="1"/>`, bx, by, bw, col, borderCSS)
+			fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Consolas, monospace" font-size="11.5" font-weight="700" text-anchor="middle" dominant-baseline="central">%s</text>`,
+				bx+bw/2, by+11, txtCol, label)
 		}
 	}
 
@@ -1254,11 +1285,6 @@ func smoothPathSVG(pts []PointF) string {
 	last := pts[len(pts)-1]
 	fmt.Fprintf(&sb, " L%.1f %.1f", last.X, last.Y)
 	return sb.String()
-}
-
-func isLightColor(c ui.Color) bool {
-	lum := 0.2126*float64(c.R) + 0.7152*float64(c.G) + 0.0722*float64(c.B)
-	return lum > 175
 }
 
 func clampInt(v, lo, hi int) int {

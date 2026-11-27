@@ -3,6 +3,7 @@ package canvas
 import (
 	"image"
 	"image/color"
+	"math"
 	"strings"
 
 	"github.com/egoist/mygo/ui"
@@ -175,26 +176,25 @@ func (a Annotation) Bounds() (minX, minY, maxX, maxY float32) {
 		pad := a.StrokeWidth * 0.6
 		return minX - pad, minY - pad, maxX + pad, maxY + pad
 	case ToolCounter:
-		r := float32(15)
+		r := CounterRadius(a) + 1.5
 		return a.Start.X - r, a.Start.Y - r, a.Start.X + r, a.Start.Y + r
 	case ToolText:
-		fs := a.FontSize
-		if fs <= 0 {
-			fs = 20
-		}
-		lines := strings.Split(a.Text, "\n")
+		fs := ClampFontSize(a.FontSize)
+		lines := strings.Split(strings.ReplaceAll(a.Text, "\r\n", "\n"), "\n")
 		var maxW float32
 		for _, line := range lines {
 			if lw := estimateTextWidth(line, fs); lw > maxW {
 				maxW = lw
 			}
 		}
-		if maxW < fs*2 {
-			maxW = fs * 2
+		if maxW < fs*1.6 {
+			maxW = fs * 1.6
 		}
-		lineH := fs * 1.38
-		h := float32(len(lines))*lineH + 10
-		return a.Start.X - 6, a.Start.Y - 6, a.Start.X + maxW + 20, a.Start.Y + h
+		lineH := fs * 1.36
+		padX := max(float32(8), fs*0.42)
+		padY := max(float32(5), fs*0.24)
+		h := float32(len(lines))*lineH + padY*2
+		return a.Start.X - padX*0.65, a.Start.Y - padY, a.Start.X + maxW + padX*1.45, a.Start.Y + h
 	case ToolMeasure:
 		return float32(a.MeasLeft), float32(a.MeasTop), float32(a.MeasRight), float32(a.MeasBottom)
 	default:
@@ -244,10 +244,179 @@ type PaletteSwatch struct {
 	Color ui.Color
 }
 
+// FontSizeSteps defines clean optical typographic stops for quick stepping (-/+ and [/]).
+var FontSizeSteps = []float32{12, 14, 16, 18, 20, 22, 26, 30, 36, 44, 54, 64, 72}
+
+// StrokeWidthSteps defines 5 balanced stroke widths from crisp 1.5px hairline to 12px bold callout.
+var StrokeWidthSteps = []struct {
+	Dot   float32
+	Width float32
+	Label string
+}{
+	{4, 1.5, "极细"},
+	{6, 3, "细"},
+	{8, 5, "中"},
+	{10, 8, "粗"},
+	{12, 12, "特粗"},
+}
+
+// CounterSizeSteps defines 3 optical counter badge radii (stored in Annotation.FontSize).
+var CounterSizeSteps = []struct {
+	Radius float32
+	Label  string
+}{
+	{11, "小"},
+	{14, "中"},
+	{19, "大"},
+}
+
+const (
+	MinFontSize float32 = 12
+	MaxFontSize float32 = 72
+)
+
+// ClampFontSize normalizes a text annotation font size to [MinFontSize, MaxFontSize].
+func ClampFontSize(fs float32) float32 {
+	if fs <= 0 {
+		return 22
+	}
+	if fs < MinFontSize {
+		return MinFontSize
+	}
+	if fs > MaxFontSize {
+		return MaxFontSize
+	}
+	return fs
+}
+
+// StepFontSize returns the next larger (delta > 0) or smaller (delta < 0) typographic stop.
+func StepFontSize(cur float32, delta int) float32 {
+	cur = ClampFontSize(cur)
+	if delta > 0 {
+		for _, s := range FontSizeSteps {
+			if s > cur+0.5 {
+				return s
+			}
+		}
+		return FontSizeSteps[len(FontSizeSteps)-1]
+	}
+	for i := len(FontSizeSteps) - 1; i >= 0; i-- {
+		if FontSizeSteps[i] < cur-0.5 {
+			return FontSizeSteps[i]
+		}
+	}
+	return FontSizeSteps[0]
+}
+
+// StepStrokeWidth returns the next thicker (delta > 0) or thinner (delta < 0) stroke stop.
+func StepStrokeWidth(cur float32, delta int) float32 {
+	if delta > 0 {
+		for _, s := range StrokeWidthSteps {
+			if s.Width > cur+0.25 {
+				return s.Width
+			}
+		}
+		return StrokeWidthSteps[len(StrokeWidthSteps)-1].Width
+	}
+	for i := len(StrokeWidthSteps) - 1; i >= 0; i-- {
+		if StrokeWidthSteps[i].Width < cur-0.25 {
+			return StrokeWidthSteps[i].Width
+		}
+	}
+	return StrokeWidthSteps[0].Width
+}
+
+// CounterRadius returns the normalized pixel radius of a ToolCounter badge.
+func CounterRadius(a Annotation) float32 {
+	r := a.FontSize
+	if r <= 0 {
+		return 14
+	}
+	if r < 10 {
+		return 10
+	}
+	if r > 26 {
+		return 26
+	}
+	return r
+}
+
+// RelativeLuminance returns WCAG 2.1 relative luminance in [0, 1] for an sRGB color.
+func RelativeLuminance(c ui.Color) float64 {
+	lin := func(u uint8) float64 {
+		v := float64(u) / 255.0
+		if v <= 0.03928 {
+			return v / 12.92
+		}
+		return math.Pow((v+0.055)/1.055, 2.4)
+	}
+	return 0.2126*lin(c.R) + 0.7152*lin(c.G) + 0.0722*lin(c.B)
+}
+
+// ContrastRatio computes the WCAG 2.1 contrast ratio in [1, 21] between a and b.
+func ContrastRatio(a, b ui.Color) float64 {
+	la, lb := RelativeLuminance(a), RelativeLuminance(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
+}
+
+// IsLightColor reports whether c is bright enough (WCAG relative luminance > 0.34,
+// covering Amber #FF9500, Yellow #FFCC00, Emerald #34C759, White #FFFFFF) that dark
+// ink is required for crisp legibility.
+func IsLightColor(c ui.Color) bool {
+	return RelativeLuminance(c) > 0.34
+}
+
+// ContrastInk returns the highest-legibility foreground ink (#0F172A or #FFFFFF)
+// for text and badges rendered over fill color bg.
+func ContrastInk(bg ui.Color) ui.Color {
+	if IsLightColor(bg) {
+		return ui.Hex("#0F172A")
+	}
+	return ui.Hex("#FFFFFF")
+}
+
+// TextHaloColor returns an adaptive optical outline color that keeps unfilled text
+// sharp across pure white, pure black, and busy screenshots without muddy shadows.
+func TextHaloColor(fg ui.Color) ui.Color {
+	if IsLightColor(fg) {
+		return ui.RGBA(15, 23, 42, 0.86)
+	}
+	return ui.RGBA(255, 255, 255, 0.88)
+}
+
+// PillBorderColor returns an adaptive hairline border color for filled badges/pills
+// so white pills stay defined on light screenshots and charcoal pills on dark screens.
+func PillBorderColor(bg ui.Color) ui.Color {
+	lum := RelativeLuminance(bg)
+	switch {
+	case lum > 0.72:
+		return ui.RGBA(15, 23, 42, 0.24)
+	case lum < 0.08:
+		return ui.RGBA(255, 255, 255, 0.26)
+	case lum > 0.34:
+		return ui.RGBA(15, 23, 42, 0.14)
+	default:
+		return ui.RGBA(255, 255, 255, 0.20)
+	}
+}
+
+// InlineEditorBackdrop picks a translucent backdrop behind the inline text editor
+// that guarantees crisp readability while typing for both light and dark ink colors.
+func InlineEditorBackdrop(fg ui.Color) ui.Color {
+	if IsLightColor(fg) {
+		return ui.RGBA(15, 23, 42, 0.82)
+	}
+	return ui.RGBA(255, 255, 255, 0.90)
+}
+
 // DefaultPalette provides Apple HIG system colors tuned for crisp annotation legibility.
 var DefaultPalette = []PaletteSwatch{
 	{Name: "绯红", Color: ui.Hex("#FF3B30")},
 	{Name: "琥珀", Color: ui.Hex("#FF9500")},
+	{Name: "明黄", Color: ui.Hex("#FFCC00")},
 	{Name: "翡翠", Color: ui.Hex("#34C759")},
 	{Name: "晴空", Color: ui.Hex("#007AFF")},
 	{Name: "鸢尾", Color: ui.Hex("#AF52DE")},

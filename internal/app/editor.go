@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,16 +59,17 @@ type EditorState struct {
 	rasterBmpOnBase bool
 	rasterDirty     bool
 
-	tool        canvas.Tool
-	mosaicStyle canvas.MosaicStyle
-	colorIdx    int
-	strokeWidth float32
-	filled      bool
-	rounded     bool
-	fontSize    float32
-	textDraft   string
-	blockSize   float64
-	measureSens float64
+	tool            canvas.Tool
+	mosaicStyle     canvas.MosaicStyle
+	colorIdx        int
+	strokeWidth     float32
+	filled          bool
+	rounded         bool
+	fontSize        float64
+	counterSize     float32
+	blockSize       float64
+	measureSens     float64
+	sliderUndoAnnID int
 
 	// Offline smart redaction & point-to-redact OCR cache (scoped to current document)
 	redactMu      sync.Mutex
@@ -77,15 +79,34 @@ type EditorState struct {
 	ocrLines      []winapi.OCRWord
 	pendingRedact *pendingEditorRedact
 
-	selectedIdx  int
-	drawing      bool
-	draftAnn     canvas.Annotation
-	movingAnn    bool
-	moveLastImgX float32
-	moveLastImgY float32
-	panning      bool
-	panLastX     float32
-	panLastY     float32
+	selectedIdx         int
+	drawing             bool
+	draftAnn            canvas.Annotation
+	movingAnn           bool
+	moveAnnUndoPushed   bool
+	moveAnnMoved        bool
+	moveAnnFromTextTool bool
+	moveAnnWasSelected  bool
+	moveStartImgX       float32
+	moveStartImgY       float32
+	moveLastImgX        float32
+	moveLastImgY        float32
+
+	// Inline WYSIWYG canvas text editor (sibling of viewport, mirrors overlay UX)
+	textEditing         bool
+	textEditIdx         int
+	textEditImg         canvas.PointF
+	textEditVal         string
+	textEditHandle      ui.Handle
+	textEditNeedFocus   bool
+	textEditDragging    bool
+	textEditDragStartX  float32
+	textEditDragStartY  float32
+	textEditDragOrigImg canvas.PointF
+
+	panning  bool
+	panLastX float32
+	panLastY float32
 
 	hasCrop  bool
 	cropX0   float32
@@ -141,15 +162,16 @@ func NewEditorState(a *App) *EditorState {
 		app:         a,
 		tool:        canvas.ToolArrow,
 		colorIdx:    0,
-		strokeWidth: 4,
+		strokeWidth: 3,
 		filled:      false,
 		rounded:     true,
 		fontSize:    22,
-		textDraft:   "标注文字",
+		counterSize: 14,
 		blockSize:   14,
 		measureSens: 28,
 		nextCounter: 1,
 		selectedIdx: -1,
+		textEditIdx: -1,
 		zoom:        1.0,
 		lastMeasX:   -1,
 		lastMeasY:   -1,
@@ -159,6 +181,244 @@ func NewEditorState(a *App) *EditorState {
 
 // ActiveTool exposes the selected tool for automated testing.
 func (e *EditorState) ActiveTool() canvas.Tool { return e.tool }
+
+// Annotations returns a deep copy of the active editor annotations (used by tests).
+func (e *EditorState) Annotations() []canvas.Annotation {
+	return canvas.CloneAnnotations(e.annotations)
+}
+
+// SelectedIdx returns the index of the currently selected annotation, or -1.
+func (e *EditorState) SelectedIdx() int { return e.selectedIdx }
+
+// TextEditing reports whether Studio's inline canvas text editor is open.
+func (e *EditorState) TextEditing() bool { return e.textEditing }
+
+func (e *EditorState) findPaletteIndex(col ui.Color) int {
+	for i, sw := range canvas.DefaultPalette {
+		if sw.Color == col {
+			return i
+		}
+	}
+	return e.colorIdx
+}
+
+func (e *EditorState) syncPropsFromAnnotation(ann canvas.Annotation) {
+	e.colorIdx = e.findPaletteIndex(ann.Color)
+	switch ann.Kind {
+	case canvas.ToolText:
+		e.fontSize = float64(canvas.ClampFontSize(ann.FontSize))
+		e.filled = ann.Filled
+	case canvas.ToolCounter:
+		e.counterSize = canvas.CounterRadius(ann)
+	case canvas.ToolPixelate, canvas.ToolBlur:
+		e.mosaicStyle = ann.MosaicStyle
+		if ann.Kind == canvas.ToolBlur {
+			e.mosaicStyle = canvas.MosaicBlur
+		}
+		if ann.BlockSize >= 6 {
+			e.blockSize = float64(ann.BlockSize)
+		}
+	case canvas.ToolRect, canvas.ToolEllipse:
+		if ann.StrokeWidth > 0 {
+			e.strokeWidth = ann.StrokeWidth
+		}
+		e.filled = ann.Filled
+		e.rounded = ann.Rounded
+	case canvas.ToolArrow, canvas.ToolLine, canvas.ToolPen, canvas.ToolHighlighter:
+		if ann.StrokeWidth > 0 {
+			e.strokeWidth = ann.StrokeWidth
+		}
+	}
+}
+
+func (e *EditorState) setSelectedAnnotation(idx int) {
+	if e.selectedIdx != idx {
+		e.sliderUndoAnnID = 0
+	}
+	e.selectedIdx = idx
+	if idx >= 0 && idx < len(e.annotations) {
+		e.syncPropsFromAnnotation(e.annotations[idx])
+	}
+}
+
+func (e *EditorState) applyFontSize(fs float32, fromSlider bool) {
+	fs = canvas.ClampFontSize(float32(math.Round(float64(fs))))
+	e.fontSize = float64(fs)
+	if !e.textEditing && e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) && e.annotations[e.selectedIdx].Kind == canvas.ToolText {
+		ann := &e.annotations[e.selectedIdx]
+		if ann.FontSize != fs {
+			if !fromSlider || e.sliderUndoAnnID != ann.ID {
+				e.pushUndo()
+				if fromSlider {
+					e.sliderUndoAnnID = ann.ID
+				} else {
+					e.sliderUndoAnnID = 0
+				}
+			}
+			ann.FontSize = fs
+		}
+	}
+}
+
+func (e *EditorState) applyBlockSize(bs int, fromSlider bool) {
+	bs = winapi.ClampInt(bs, 6, 36)
+	e.blockSize = float64(bs)
+	if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+		ann := &e.annotations[e.selectedIdx]
+		if (ann.Kind == canvas.ToolPixelate || ann.Kind == canvas.ToolBlur) && ann.BlockSize != bs {
+			if !fromSlider || e.sliderUndoAnnID != ann.ID {
+				e.pushUndo()
+				if fromSlider {
+					e.sliderUndoAnnID = ann.ID
+				} else {
+					e.sliderUndoAnnID = 0
+				}
+			}
+			ann.BlockSize = bs
+			e.rasterDirty = true
+		}
+	}
+}
+
+func (e *EditorState) applyStrokeWidth(sw float32) {
+	e.strokeWidth = sw
+	e.sliderUndoAnnID = 0
+	if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+		ann := &e.annotations[e.selectedIdx]
+		switch ann.Kind {
+		case canvas.ToolRect, canvas.ToolEllipse, canvas.ToolArrow, canvas.ToolLine, canvas.ToolPen, canvas.ToolHighlighter:
+			if ann.StrokeWidth != sw {
+				e.pushUndo()
+				ann.StrokeWidth = sw
+			}
+		}
+	}
+}
+
+func (e *EditorState) applyCounterSize(r float32) {
+	e.counterSize = r
+	e.sliderUndoAnnID = 0
+	if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) && e.annotations[e.selectedIdx].Kind == canvas.ToolCounter {
+		ann := &e.annotations[e.selectedIdx]
+		if canvas.CounterRadius(*ann) != r {
+			e.pushUndo()
+			ann.FontSize = r
+		}
+	}
+}
+
+func (e *EditorState) stepActiveSize(delta int) {
+	targetTool := e.tool
+	if targetTool == canvas.ToolSelect && e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+		targetTool = e.annotations[e.selectedIdx].Kind
+	}
+	switch targetTool {
+	case canvas.ToolText:
+		e.applyFontSize(canvas.StepFontSize(float32(e.fontSize), delta), false)
+	case canvas.ToolCounter:
+		steps := canvas.CounterSizeSteps
+		curIdx := 1
+		for i, st := range steps {
+			if math.Abs(float64(e.counterSize-st.Radius)) < 1.5 {
+				curIdx = i
+				break
+			}
+		}
+		nextIdx := winapi.ClampInt(curIdx+delta, 0, len(steps)-1)
+		e.applyCounterSize(steps[nextIdx].Radius)
+	case canvas.ToolPixelate, canvas.ToolBlur:
+		e.applyBlockSize(int(math.Round(e.blockSize))+delta*2, false)
+	case canvas.ToolRect, canvas.ToolEllipse, canvas.ToolArrow, canvas.ToolLine, canvas.ToolPen, canvas.ToolHighlighter:
+		e.applyStrokeWidth(canvas.StepStrokeWidth(e.strokeWidth, delta))
+	}
+}
+
+func (e *EditorState) beginInlineTextNew(ix, iy float32) {
+	e.commitTextEdit()
+	e.setSelectedAnnotation(-1)
+	e.textEditing = true
+	e.textEditIdx = -1
+	e.textEditImg = canvas.PointF{X: ix, Y: iy}
+	e.textEditVal = ""
+	e.textEditNeedFocus = true
+	e.textEditDragging = false
+}
+
+func (e *EditorState) beginInlineTextEdit(idx int) {
+	if idx < 0 || idx >= len(e.annotations) || e.annotations[idx].Kind != canvas.ToolText {
+		return
+	}
+	e.commitTextEdit()
+	ann := e.annotations[idx]
+	e.tool = canvas.ToolText
+	e.setSelectedAnnotation(-1)
+	e.textEditing = true
+	e.textEditIdx = idx
+	e.textEditImg = ann.Start
+	e.textEditVal = ann.Text
+	e.syncPropsFromAnnotation(ann)
+	e.textEditNeedFocus = true
+	e.textEditDragging = false
+}
+
+func (e *EditorState) commitTextEdit() {
+	if !e.textEditing {
+		return
+	}
+	val := strings.TrimRight(e.textEditVal, "\r\n")
+	idx := e.textEditIdx
+	pos := e.textEditImg
+	fs := canvas.ClampFontSize(float32(math.Round(e.fontSize)))
+
+	e.textEditing = false
+	e.textEditIdx = -1
+	e.textEditVal = ""
+	e.textEditNeedFocus = false
+	e.textEditDragging = false
+
+	if strings.TrimSpace(val) == "" {
+		if idx >= 0 && idx < len(e.annotations) {
+			e.pushUndo()
+			e.annotations = append(e.annotations[:idx], e.annotations[idx+1:]...)
+			e.setSelectedAnnotation(-1)
+		}
+		return
+	}
+
+	e.pushUndo()
+	if idx >= 0 && idx < len(e.annotations) {
+		e.annotations[idx].Start = pos
+		e.annotations[idx].Text = val
+		e.annotations[idx].FontSize = fs
+		e.annotations[idx].Filled = e.filled
+		e.annotations[idx].Color = e.activeColor()
+		e.setSelectedAnnotation(idx)
+		return
+	}
+
+	e.nextAnnID++
+	e.annotations = append(e.annotations, canvas.Annotation{
+		ID:       e.nextAnnID,
+		Kind:     canvas.ToolText,
+		Start:    pos,
+		Color:    e.activeColor(),
+		FontSize: fs,
+		Filled:   e.filled,
+		Text:     val,
+	})
+	e.setSelectedAnnotation(len(e.annotations) - 1)
+}
+
+func (e *EditorState) cancelTextEdit() {
+	if !e.textEditing {
+		return
+	}
+	e.textEditing = false
+	e.textEditIdx = -1
+	e.textEditVal = ""
+	e.textEditNeedFocus = false
+	e.textEditDragging = false
+}
 
 // MosaicStyle returns the active mosaic visual style.
 func (e *EditorState) MosaicStyle() canvas.MosaicStyle { return e.mosaicStyle }
@@ -424,6 +684,7 @@ func (e *EditorState) loadOwnedImage(img *image.RGBA, pngBytes []byte, title str
 	if img == nil {
 		return
 	}
+	e.cancelTextEdit()
 	e.clearRedactCache()
 	e.title = title
 	e.baseImg = img
@@ -445,6 +706,7 @@ func (e *EditorState) loadOwnedImage(img *image.RGBA, pngBytes []byte, title str
 
 // ClearDocument releases active document buffers when returning to Home stage.
 func (e *EditorState) ClearDocument() {
+	e.cancelTextEdit()
 	e.clearRedactCache()
 	e.baseImg = nil
 	e.basePNG = nil
@@ -464,6 +726,7 @@ func (e *EditorState) ClearDocument() {
 // when the Studio window is closed to the system tray, keeping only compressed PNG
 // bytes (~200-500 KB) so reopening Studio restores the document and annotations seamlessly.
 func (e *EditorState) ParkForTray() {
+	e.commitTextEdit()
 	e.clearRedactCache()
 	if e.baseImg != nil && len(e.basePNG) == 0 {
 		if encoded, err := canvas.EncodePNG(e.baseImg); err == nil {
@@ -529,6 +792,7 @@ func (e *EditorState) pushUndo() {
 }
 
 func (e *EditorState) undo() {
+	e.cancelTextEdit()
 	if len(e.undoStack) == 0 {
 		return
 	}
@@ -552,6 +816,7 @@ func (e *EditorState) undo() {
 }
 
 func (e *EditorState) redo() {
+	e.cancelTextEdit()
 	if len(e.redoStack) == 0 {
 		return
 	}
@@ -615,6 +880,7 @@ func (e *EditorState) rebuildCaches() {
 
 // ExportComposite returns the final export-ready image with raster effects and vector annotations.
 func (e *EditorState) ExportComposite() *image.RGBA {
+	e.commitTextEdit()
 	base := e.baseImg
 	if base == nil && len(e.basePNG) > 0 {
 		base = decodeImageRGBA(e.basePNG)
@@ -835,6 +1101,9 @@ func (e *EditorState) View(c *ui.Context) {
 			e.renderAppleHomeStage(c, tk)
 		} else {
 			e.renderCanvasViewport(c, tk)
+			if e.textEditing {
+				e.renderStudioInlineTextEditor(c, tk)
+			}
 		}
 
 		// Layer 2: Top drag strip (sits BELOW the top glass capsules so capsule buttons
@@ -911,6 +1180,10 @@ func (e *EditorState) handleShortcuts(c *ui.Context) {
 		return
 	}
 	if c.Shortcut(0, ui.KeyEscape) {
+		if e.textEditing {
+			e.cancelTextEdit()
+			return
+		}
 		if e.settingsOpen {
 			e.CloseSettings()
 			return
@@ -994,14 +1267,51 @@ func (e *EditorState) handleShortcuts(c *ui.Context) {
 		return
 	}
 
+	if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+		nudgeDirs := []struct {
+			key    ui.Key
+			dx, dy int
+		}{
+			{ui.KeyLeft, -1, 0},
+			{ui.KeyRight, 1, 0},
+			{ui.KeyUp, 0, -1},
+			{ui.KeyDown, 0, 1},
+		}
+		for _, d := range nudgeDirs {
+			if c.Shortcut(0, d.key) {
+				e.pushUndo()
+				e.annotations[e.selectedIdx].Translate(float32(d.dx), float32(d.dy))
+				e.rasterDirty = true
+				return
+			}
+			if c.Shortcut(ui.Shift, d.key) {
+				e.pushUndo()
+				e.annotations[e.selectedIdx].Translate(float32(d.dx*10), float32(d.dy*10))
+				e.rasterDirty = true
+				return
+			}
+		}
+	}
+
+	if c.Shortcut(0, ui.KeyBracketLeft) {
+		e.stepActiveSize(-1)
+		return
+	}
+	if c.Shortcut(0, ui.KeyBracketRight) {
+		e.stepActiveSize(1)
+		return
+	}
+
 	if c.Shortcut(ui.Shift, ui.KeyX) {
+		e.commitTextEdit()
 		e.triggerSmartRedact()
 		return
 	}
 	if c.Shortcut(0, ui.KeyB) {
+		e.commitTextEdit()
 		e.tool = canvas.ToolPixelate
 		e.mosaicStyle = canvas.MosaicBlur
-		e.selectedIdx = -1
+		e.setSelectedAnnotation(-1)
 		return
 	}
 
@@ -1025,9 +1335,10 @@ func (e *EditorState) handleShortcuts(c *ui.Context) {
 	}
 	for _, item := range toolKeys {
 		if c.Shortcut(0, item.key) {
+			e.commitTextEdit()
 			e.tool = item.tool
 			if item.tool != canvas.ToolSelect {
-				e.selectedIdx = -1
+				e.setSelectedAnnotation(-1)
 			}
 			return
 		}
@@ -1376,7 +1687,11 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 							if e.mosaicStyle == canvas.MosaicBlur {
 								tip = "模糊强度"
 							}
+							prevBS := int(math.Round(e.blockSize))
 							ui.Slider(c, &e.blockSize, 6, 36).Width(100).Label(tip).Tooltip(tip)
+							if curBS := int(math.Round(e.blockSize)); curBS != prevBS {
+								e.applyBlockSize(curBS, true)
+							}
 							ui.Textf(c, "%d px", int(math.Round(e.blockSize))).
 								FontSize(12).FontWeight(600).TextColor(tk.textPrimary).SingleLine().Shrink(0).
 								ContentTransition(glasswork.ContentNumeric)
@@ -1434,22 +1749,50 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 						}
 
 					default:
-						e.renderAppleColorDots(c, tk)
 						if e.tool == canvas.ToolText {
-							appleGlassDivider(c, tk)
-							inp := ui.TextInput(c.Key("studio-text-draft"), &e.textDraft).Placeholder("输入文字…").Width(160)
-							if inp.Changed() && e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) && e.annotations[e.selectedIdx].Kind == canvas.ToolText {
-								e.annotations[e.selectedIdx].Text = e.textDraft
-							}
-							for _, sz := range []float32{16, 22, 30} {
-								if appleSubChipScoped(c, tk, fmt.Sprintf("%d", int(sz)), e.fontSize == sz, "studio-font") {
-									e.fontSize = sz
+							if glassStepBtn(c, tk.inks, "−", "减小字号", "减小字号 ([)") {
+								e.applyFontSize(canvas.StepFontSize(float32(e.fontSize), -1), false)
+								if e.textEditing {
+									e.textEditNeedFocus = true
 								}
 							}
+							prevFS := int(math.Round(e.fontSize))
+							ui.Slider(c, &e.fontSize, float64(canvas.MinFontSize), float64(canvas.MaxFontSize)).
+								Width(88).Label("字号").Tooltip("调整字号 (12–72 px，快捷键 [ / ])")
+							if curFS := int(math.Round(e.fontSize)); curFS != prevFS {
+								e.applyFontSize(float32(curFS), true)
+							}
+							if glassStepBtn(c, tk.inks, "+", "增大字号", "增大字号 (])") {
+								e.applyFontSize(canvas.StepFontSize(float32(e.fontSize), 1), false)
+								if e.textEditing {
+									e.textEditNeedFocus = true
+								}
+							}
+							ui.Textf(c, "%d px", int(math.Round(e.fontSize))).
+								FontSize(11.5).FontWeight(600).TextColor(tk.textPrimary).SingleLine().Shrink(0).
+								ContentTransition(glasswork.ContentNumeric)
+							appleGlassDivider(c, tk)
 							if appleSubChip(c, tk, "底色", e.filled) {
 								e.filled = !e.filled
+								if !e.textEditing && e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) && e.annotations[e.selectedIdx].Kind == canvas.ToolText {
+									e.pushUndo()
+									e.annotations[e.selectedIdx].Filled = e.filled
+								}
+								if e.textEditing {
+									e.textEditNeedFocus = true
+								}
 							}
+							appleGlassDivider(c, tk)
+							e.renderAppleColorDots(c, tk)
 						} else if e.tool == canvas.ToolCounter {
+							ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+								for _, st := range canvas.CounterSizeSteps {
+									active := math.Abs(float64(e.counterSize-st.Radius)) < 1.5
+									if appleSubChipScoped(c, tk, st.Label, active, "studio-counter-size") {
+										e.applyCounterSize(st.Radius)
+									}
+								}
+							})
 							appleGlassDivider(c, tk)
 							ui.Textf(c, "#%d", e.nextCounter).
 								FontSize(12).FontWeight(700).TextColor(tk.textPrimary).SingleLine().Shrink(0).
@@ -1457,44 +1800,55 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 							if appleSubChip(c, tk, "重置", false) {
 								e.nextCounter = 1
 							}
-						} else {
 							appleGlassDivider(c, tk)
-							for _, s := range []struct {
-								dot float32
-								sw  float32
-								tip string
-							}{{5, 2, "细"}, {8, 4, "中"}, {11, 7, "粗"}} {
-								active := e.strokeWidth == s.sw
-								btn := ui.Box(c).Size(24, 24).Radius(12).Center().
-									Role(ui.RoleButton).Label(s.tip).
-									Cursor(ui.CursorPointer).Tooltip(s.tip)
-								if !active && btn.Hovered() {
-									btn.Background(tk.hoverFill)
-								}
-								btn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-								glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
-								btn.Children(func() {
-									if active {
-										glasswork.SlidingAccentLens(c, "studio-stroke", 12, tk.inks.AccentFill, tk.inks.AccentBorder)
+							e.renderAppleColorDots(c, tk)
+						} else {
+							e.renderAppleColorDots(c, tk)
+							appleGlassDivider(c, tk)
+							ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+								for _, s := range canvas.StrokeWidthSteps {
+									active := math.Abs(float64(e.strokeWidth-s.Width)) < 0.3
+									btn := ui.Box(c).Size(24, 24).Radius(12).Center().
+										Role(ui.RoleButton).Label(s.Label).
+										Cursor(ui.CursorPointer).Tooltip(fmt.Sprintf("%s (%.0fpx · [ / ])", s.Label, s.Width))
+									if !active && btn.Hovered() {
+										btn.Background(tk.hoverFill)
 									}
-									dotCol := tk.textSecondary
-									if active {
-										dotCol = tk.inks.Accent
+									btn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+									glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
+									btn.Children(func() {
+										if active {
+											glasswork.SlidingAccentLens(c, "studio-stroke", 12, tk.inks.AccentFill, tk.inks.AccentBorder)
+										}
+										dotCol := tk.textSecondary
+										if active {
+											dotCol = tk.inks.Accent
+										}
+										ui.Box(c).Size(s.Dot, s.Dot).Radius(s.Dot / 2).Background(dotCol)
+									})
+									if btn.Clicked() {
+										e.applyStrokeWidth(s.Width)
 									}
-									ui.Box(c).Size(s.dot, s.dot).Radius(s.dot / 2).Background(dotCol)
-								})
-								if btn.Clicked() {
-									e.strokeWidth = s.sw
 								}
-							}
+							})
 							if e.tool == canvas.ToolRect || e.tool == canvas.ToolEllipse {
 								appleGlassDivider(c, tk)
 								if appleSubChip(c, tk, "填充", e.filled) {
 									e.filled = !e.filled
+									if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+										if k := e.annotations[e.selectedIdx].Kind; k == canvas.ToolRect || k == canvas.ToolEllipse {
+											e.pushUndo()
+											e.annotations[e.selectedIdx].Filled = e.filled
+										}
+									}
 								}
 								if e.tool == canvas.ToolRect {
 									if appleSubChip(c, tk, "圆角", e.rounded) {
 										e.rounded = !e.rounded
+										if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) && e.annotations[e.selectedIdx].Kind == canvas.ToolRect {
+											e.pushUndo()
+											e.annotations[e.selectedIdx].Rounded = e.rounded
+										}
 									}
 								}
 							}
@@ -1542,9 +1896,10 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 					active := e.tool == item.tool
 					tip := fmt.Sprintf("%s (%s)", item.tool.Name(), item.tool.Shortcut())
 					if appleDockToolBtn(c, tk, item.ic, item.tool.Name(), tip, active) {
+						e.commitTextEdit()
 						e.tool = item.tool
 						if item.tool != canvas.ToolSelect {
-							e.selectedIdx = -1
+							e.setSelectedAnnotation(-1)
 						}
 					}
 				}
@@ -1553,7 +1908,7 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 }
 
 func (e *EditorState) renderAppleColorDots(c *ui.Context, tk appleTokens) {
-	ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
 		for i, sw := range canvas.DefaultPalette {
 			active := e.colorIdx == i
 			ring := ui.Box(c).Size(22, 22).Radius(11).Center().
@@ -1564,11 +1919,14 @@ func (e *EditorState) renderAppleColorDots(c *ui.Context, tk appleTokens) {
 				if active {
 					glasswork.SlidingRingLens(c, "studio-color", 11, tk.inks.Accent)
 				}
-				ui.Box(c).Size(14, 14).Radius(7).Background(sw.Color).Border(1, tk.hairline)
+				ui.Box(c).Size(14, 14).Radius(7).Background(sw.Color).Border(1, canvas.PillBorderColor(sw.Color))
 			})
 			if ring.Clicked() {
 				e.colorIdx = i
-				if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+				if e.textEditing {
+					e.textEditNeedFocus = true
+				} else if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+					e.pushUndo()
 					e.annotations[e.selectedIdx].Color = sw.Color
 				}
 			}
@@ -1805,10 +2163,23 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 	switch {
 	case e.panning:
 		cur = ui.CursorGrabbing
+	case e.movingAnn:
+		cur = ui.CursorMove
 	case e.tool == canvas.ToolSelect:
 		cur = ui.CursorDefault
+		if e.hoverValid && len(e.annotations) > 0 && canvas.HitTestAnnotation(e.annotations, float32(e.hoverImgX), float32(e.hoverImgY), 8/e.zoom) >= 0 {
+			cur = ui.CursorMove
+		}
 	case e.tool == canvas.ToolText:
 		cur = ui.CursorText
+		if !e.textEditing && e.hoverValid && len(e.annotations) > 0 && canvas.HitTestAnnotationKind(e.annotations, canvas.ToolText, float32(e.hoverImgX), float32(e.hoverImgY), 10/e.zoom) >= 0 {
+			cur = ui.CursorMove
+		}
+	case e.tool == canvas.ToolCounter:
+		cur = ui.CursorCrosshair
+		if e.hoverValid && len(e.annotations) > 0 && canvas.HitTestAnnotationKind(e.annotations, canvas.ToolCounter, float32(e.hoverImgX), float32(e.hoverImgY), 10/e.zoom) >= 0 {
+			cur = ui.CursorMove
+		}
 	case (e.tool == canvas.ToolPixelate || e.tool == canvas.ToolBlur) && !e.drawing && e.hoverValid:
 		if hit := hitRedactionAnnotation(e.annotations, float32(e.hoverImgX), float32(e.hoverImgY)); hit >= 0 {
 			hoverRemoveIdx = hit
@@ -1870,6 +2241,10 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			return true
 
 		case ui.InputPointerDown:
+			if ev.Button == 1 && e.textEditing {
+				e.cancelTextEdit()
+				return true
+			}
 			if ev.Button == 2 || (ev.Button == 0 && c.KeyDown(ui.KeySpace)) {
 				e.panning = true
 				e.panLastX, e.panLastY = ev.X, ev.Y
@@ -1880,50 +2255,86 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			}
 			ix, iy := viewToImg(ev.X, ev.Y)
 
+			if e.textEditing {
+				e.commitTextEdit()
+				if e.tool != canvas.ToolText {
+					return true
+				}
+				if canvas.HitTestAnnotationKind(e.annotations, canvas.ToolText, ix, iy, 10/e.zoom) < 0 {
+					return true
+				}
+			}
+
 			switch e.tool {
 			case canvas.ToolSelect:
 				hit := canvas.HitTestAnnotation(e.annotations, ix, iy, 8/e.zoom)
-				e.selectedIdx = hit
+				e.setSelectedAnnotation(hit)
 				if hit >= 0 {
-					e.pushUndo()
-					e.movingAnn = true
-					e.moveLastImgX, e.moveLastImgY = ix, iy
-					if e.annotations[hit].Kind == canvas.ToolText {
-						e.textDraft = e.annotations[hit].Text
+					if e.annotations[hit].Kind == canvas.ToolText && ev.Clicks >= 2 {
+						e.beginInlineTextEdit(hit)
+						return true
 					}
+					e.movingAnn = true
+					e.moveAnnUndoPushed = false
+					e.moveAnnMoved = false
+					e.moveAnnFromTextTool = false
+					e.moveAnnWasSelected = false
+					e.moveStartImgX, e.moveStartImgY = ix, iy
+					e.moveLastImgX, e.moveLastImgY = ix, iy
 				}
 				return true
 
 			case canvas.ToolCounter:
+				if hit := canvas.HitTestAnnotationKind(e.annotations, canvas.ToolCounter, ix, iy, 10/e.zoom); hit >= 0 {
+					e.setSelectedAnnotation(hit)
+					e.movingAnn = true
+					e.moveAnnUndoPushed = false
+					e.moveAnnMoved = false
+					e.moveAnnFromTextTool = false
+					e.moveAnnWasSelected = false
+					e.moveStartImgX, e.moveStartImgY = ix, iy
+					e.moveLastImgX, e.moveLastImgY = ix, iy
+					return true
+				}
 				e.pushUndo()
 				e.nextAnnID++
+				cx, cy := clamp32(ix, 0, bw), clamp32(iy, 0, bh)
 				e.annotations = append(e.annotations, canvas.Annotation{
 					ID:         e.nextAnnID,
 					Kind:       canvas.ToolCounter,
-					Start:      canvas.PointF{X: clamp32(ix, 0, bw), Y: clamp32(iy, 0, bh)},
+					Start:      canvas.PointF{X: cx, Y: cy},
 					Color:      e.activeColor(),
+					FontSize:   e.counterSize,
 					CounterNum: e.nextCounter,
 				})
 				e.nextCounter++
+				e.setSelectedAnnotation(len(e.annotations) - 1)
+				e.movingAnn = true
+				e.moveAnnUndoPushed = true
+				e.moveAnnMoved = false
+				e.moveAnnFromTextTool = false
+				e.moveAnnWasSelected = false
+				e.moveStartImgX, e.moveStartImgY = ix, iy
+				e.moveLastImgX, e.moveLastImgY = ix, iy
 				return true
 
 			case canvas.ToolText:
-				e.pushUndo()
-				e.nextAnnID++
-				txt := e.textDraft
-				if txt == "" {
-					txt = "标注"
+				if hit := canvas.HitTestAnnotationKind(e.annotations, canvas.ToolText, ix, iy, 10/e.zoom); hit >= 0 {
+					if ev.Clicks >= 2 {
+						e.beginInlineTextEdit(hit)
+						return true
+					}
+					e.moveAnnWasSelected = e.selectedIdx == hit
+					e.setSelectedAnnotation(hit)
+					e.movingAnn = true
+					e.moveAnnUndoPushed = false
+					e.moveAnnMoved = false
+					e.moveAnnFromTextTool = true
+					e.moveStartImgX, e.moveStartImgY = ix, iy
+					e.moveLastImgX, e.moveLastImgY = ix, iy
+					return true
 				}
-				e.annotations = append(e.annotations, canvas.Annotation{
-					ID:       e.nextAnnID,
-					Kind:     canvas.ToolText,
-					Start:    canvas.PointF{X: clamp32(ix, 0, bw), Y: clamp32(iy, 0, bh)},
-					Color:    e.activeColor(),
-					FontSize: e.fontSize,
-					Filled:   e.filled,
-					Text:     txt,
-				})
-				e.selectedIdx = len(e.annotations) - 1
+				e.beginInlineTextNew(clamp32(ix, 0, bw), clamp32(iy, 0, bh))
 				return true
 
 			case canvas.ToolMeasure:
@@ -1998,9 +2409,22 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			}
 
 			if e.movingAnn && e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+				if !e.moveAnnMoved {
+					thresh := 3 / max(float32(0.15), e.zoom)
+					if float32(math.Hypot(float64(ix-e.moveStartImgX), float64(iy-e.moveStartImgY))) < thresh {
+						return true
+					}
+					e.moveAnnMoved = true
+				}
 				dx, dy := ix-e.moveLastImgX, iy-e.moveLastImgY
-				e.annotations[e.selectedIdx].Translate(dx, dy)
-				e.moveLastImgX, e.moveLastImgY = ix, iy
+				if math.Abs(float64(dx)) >= 0.5 || math.Abs(float64(dy)) >= 0.5 {
+					if !e.moveAnnUndoPushed {
+						e.pushUndo()
+						e.moveAnnUndoPushed = true
+					}
+					e.annotations[e.selectedIdx].Translate(dx, dy)
+					e.moveLastImgX, e.moveLastImgY = ix, iy
+				}
 				// Defer expensive CPU blur/pixelate re-bake until pointer-up so dragging stays 60-144fps!
 				return true
 			}
@@ -2054,10 +2478,21 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 				return true
 			}
 			if e.movingAnn {
+				moved := e.moveAnnMoved
+				fromText := e.moveAnnFromTextTool
+				wasSel := e.moveAnnWasSelected
+				idx := e.selectedIdx
 				e.movingAnn = false
-				if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
-					if k := e.annotations[e.selectedIdx].Kind; k == canvas.ToolPixelate || k == canvas.ToolBlur || k == canvas.ToolSpotlight {
+				e.moveAnnMoved = false
+				e.moveAnnUndoPushed = false
+				e.moveAnnFromTextTool = false
+				e.moveAnnWasSelected = false
+				if idx >= 0 && idx < len(e.annotations) {
+					if k := e.annotations[idx].Kind; k == canvas.ToolPixelate || k == canvas.ToolBlur || k == canvas.ToolSpotlight {
 						e.rasterDirty = true
+					}
+					if !ev.Canceled && !moved && fromText && wasSel && e.annotations[idx].Kind == canvas.ToolText {
+						e.beginInlineTextEdit(idx)
 					}
 				}
 				return true
@@ -2160,6 +2595,9 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			oy += r.Y
 
 			for i, a := range e.annotations {
+				if e.textEditing && i == e.textEditIdx {
+					continue
+				}
 				canvas.DrawAnnotationLive(pt, a, ox, oy, e.zoom, i == e.selectedIdx, false)
 			}
 			if e.drawing {
@@ -2224,6 +2662,130 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 	})
 }
 
+func (e *EditorState) renderStudioInlineTextEditor(c *ui.Context, tk appleTokens) {
+	if e.baseImg == nil {
+		return
+	}
+	viewW, viewH := c.Size()
+	bw := float32(e.baseImg.Bounds().Dx())
+	bh := float32(e.baseImg.Bounds().Dy())
+	_, _, imgOffX, imgOffY := e.docDisplaySize()
+	ox := e.panX + float32(imgOffX)*e.zoom
+	oy := e.panY + float32(imgOffY)*e.zoom
+
+	dipX := ox + e.textEditImg.X*e.zoom
+	dipY := oy + e.textEditImg.Y*e.zoom
+	fs := canvas.ClampFontSize(float32(e.fontSize)) * e.zoom
+	if fs < 12 {
+		fs = 12
+	}
+
+	boxW := clamp32(fs*10.5, 210, 420)
+	const gripW float32 = 16
+	minH := max(float32(34), fs*1.55)
+	left := clamp32(dipX-gripW-6, 16, max(16, viewW-boxW-gripW-28))
+	top := clamp32(dipY-6, 62, max(62, viewH-minH-128))
+
+	accentCol := e.activeColor()
+	txtCol := accentCol
+	bgCol := canvas.InlineEditorBackdrop(accentCol)
+	if e.filled {
+		bgCol = accentCol.Alpha(0.95)
+		txtCol = canvas.ContrastInk(accentCol)
+	}
+
+	wrap := ui.Row(c.Key("studio-inline-text-wrap")).
+		Absolute().Left(left).Top(top).MinWidth(164).MaxWidth(max(240, viewW-left-20)).
+		Padding(4, 6, 4, 4).Gap(2).
+		Radius(8).Background(bgCol).Border(1.5, tk.accent).
+		AlignItems(ui.Center).
+		Cursor(ui.CursorMove)
+
+	wrap.HandleInput(func(ev ui.InputEvent) bool {
+		switch ev.Kind {
+		case ui.InputPointerDown:
+			if ev.Button != 0 {
+				return false
+			}
+			e.textEditDragging = true
+			e.textEditDragStartX = left + ev.X
+			e.textEditDragStartY = top + ev.Y
+			e.textEditDragOrigImg = e.textEditImg
+			return true
+		case ui.InputPointerMove:
+			if !e.textEditDragging {
+				return false
+			}
+			curX := left + ev.X
+			curY := top + ev.Y
+			invZ := 1 / max(float32(0.15), e.zoom)
+			dxImg := (curX - e.textEditDragStartX) * invZ
+			dyImg := (curY - e.textEditDragStartY) * invZ
+			e.textEditImg = canvas.PointF{
+				X: clamp32(e.textEditDragOrigImg.X+dxImg, 0, max(0, bw-24)),
+				Y: clamp32(e.textEditDragOrigImg.Y+dyImg, 0, max(0, bh-24)),
+			}
+			return true
+		case ui.InputPointerUp:
+			if e.textEditDragging {
+				e.textEditDragging = false
+				e.textEditNeedFocus = true
+				return true
+			}
+		}
+		return false
+	})
+
+	wrap.Children(func() {
+		dotCol := txtCol.Alpha(0.55)
+		ui.Box(c.Key("studio-inline-text-grip")).Size(gripW, 24).Shrink(0).PassThrough().Draw(func(pt *ui.Painter, r ui.Rect) {
+			cx := r.X + r.W*0.5
+			cy := r.Y + r.H*0.5
+			for _, dy := range []float32{-5, 0, 5} {
+				for _, dx := range []float32{-2.5, 2.5} {
+					pt.Fill(ui.Rect{X: cx + dx - 1.2, Y: cy + dy - 1.2, W: 2.4, H: 2.4}, dotCol, 1.2)
+				}
+			}
+		})
+
+		ta := ui.TextArea(c.Key("studio-inline-text"), &e.textEditVal).
+			Bind(&e.textEditHandle).
+			Width(boxW).MinHeight(minH).
+			Padding(2, 6, 2, 4).
+			FontSize(fs).FontWeight(700).TextColor(txtCol).
+			Background(ui.Transparent).Border(0, ui.Transparent).
+			Cursor(ui.CursorText).
+			Placeholder("输入文字… (Enter 确认，Shift+Enter 换行)").
+			PlaceholderColor(txtCol.Alpha(0.55))
+
+		ta.OnTextKey(func(k ui.TextKey) bool {
+			if k.Key == ui.KeyEscape {
+				e.cancelTextEdit()
+				return true
+			}
+			if k.Mods&ui.Ctrl != 0 && (k.Key == ui.KeyMinus || k.Key == ui.KeyBracketLeft) {
+				e.applyFontSize(canvas.StepFontSize(float32(e.fontSize), -1), false)
+				return true
+			}
+			if k.Mods&ui.Ctrl != 0 && (k.Key == ui.KeyEqual || k.Key == ui.KeyBracketRight) {
+				e.applyFontSize(canvas.StepFontSize(float32(e.fontSize), 1), false)
+				return true
+			}
+			if k.Key == ui.KeyEnter && k.Mods&ui.Shift == 0 {
+				e.textEditVal = k.Text()
+				e.commitTextEdit()
+				return true
+			}
+			return false
+		})
+	})
+
+	if e.textEditNeedFocus && !e.textEditDragging {
+		e.textEditHandle.Focus(c)
+		e.textEditNeedFocus = false
+	}
+}
+
 func (e *EditorState) renderHelpSheet(c *ui.Context, tk appleTokens) {
 	ui.Overlay(c, func() {
 		scrimAnim := glasswork.AnimColorFade
@@ -2267,6 +2829,7 @@ func (e *EditorState) renderHelpSheet(c *ui.Context, tk appleTokens) {
 						appleHelpRow(c, tk, "X / B / S", "马赛克 / 模糊样式 / 聚光灯")
 						appleHelpRow(c, tk, "Shift+X / Alt+单击", "智能打码 / 整行打码")
 						appleHelpRow(c, tk, "T / N / M / C", "文字 / 序号 / 测距 / 裁剪")
+						appleHelpRow(c, tk, "[ / ]", "调节字号 / 线宽 / 粒度")
 						appleHelpRow(c, tk, "Ctrl+Z / Ctrl+Y", "撤销 / 重做")
 						appleHelpRow(c, tk, "Ctrl+C / S / P", "复制 / 保存 / 贴图")
 						appleHelpRow(c, tk, "Ctrl+,", "打开设置")

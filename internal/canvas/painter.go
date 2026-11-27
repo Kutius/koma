@@ -45,6 +45,9 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 
 	case ToolLine:
 		path := (&ui.Path{}).MoveTo(tx(a.Start.X), ty(a.Start.Y)).LineTo(tx(a.End.X), ty(a.End.Y))
+		if strokeHalo, ok := strokeContrastHalo(a.Color); ok {
+			p.StrokePath(path, sw+2*zoom, strokeHalo)
+		}
 		p.StrokePath(path, sw, a.Color)
 
 	case ToolArrow:
@@ -64,6 +67,9 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 			shadow.Close()
 			arrow.Close()
 			p.FillPath(shadow, ui.RGBA(0, 0, 0, 0.28))
+			if strokeHalo, ok := strokeContrastHalo(a.Color); ok {
+				p.StrokePath(arrow, max(1.5, 1.8*zoom), strokeHalo)
+			}
 			p.FillPath(arrow, a.Color)
 		}
 
@@ -76,6 +82,9 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 		}
 		if a.Filled {
 			p.Fill(r, a.Color.Alpha(0.20), rad)
+		}
+		if strokeHalo, ok := strokeContrastHalo(a.Color); ok {
+			p.Stroke(r, strokeHalo, rad, sw+2*zoom)
 		}
 		p.Stroke(r, a.Color, rad, sw)
 
@@ -90,12 +99,18 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 			if a.Filled {
 				p.FillPath(ep, a.Color.Alpha(0.20))
 			}
+			if strokeHalo, ok := strokeContrastHalo(a.Color); ok {
+				p.StrokePath(ep, sw+2*zoom, strokeHalo)
+			}
 			p.StrokePath(ep, sw, a.Color)
 		}
 
 	case ToolPen:
 		if len(a.Points) >= 2 {
 			path := smoothUIPath(a.Points, tx, ty)
+			if strokeHalo, ok := strokeContrastHalo(a.Color); ok {
+				p.StrokePath(path, sw+2*zoom, strokeHalo)
+			}
 			p.StrokePath(path, sw, a.Color)
 		}
 
@@ -107,36 +122,33 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 		}
 
 	case ToolCounter:
-		r := 14 * zoom
+		rPx := CounterRadius(a)
+		r := rPx * zoom
 		cx, cy := tx(a.Start.X), ty(a.Start.Y)
-		p.Shadow(ui.Rect{X: cx - r, Y: cy - r, W: r * 2, H: r * 2}, r, 0, 2*zoom, 6*zoom, 0, ui.RGBA(0, 0, 0, 0.35))
-		p.Fill(ui.Rect{X: cx - r, Y: cy - r, W: r * 2, H: r * 2}, a.Color, r)
-		p.Stroke(ui.Rect{X: cx - r, Y: cy - r, W: r * 2, H: r * 2}, ui.Hex("#FFFFFF"), r, max(1.5, 2*zoom))
-		txtCol := ui.Hex("#FFFFFF")
-		if isLightColor(a.Color) {
-			txtCol = ui.Hex("#0F172A")
+		badge := ui.Rect{X: cx - r, Y: cy - r, W: r * 2, H: r * 2}
+		p.Shadow(badge, r, 0, 2*zoom, 6*zoom, 0, ui.RGBA(0, 0, 0, 0.32))
+		p.Fill(badge, a.Color, r)
+		ringCol := ui.Hex("#FFFFFF")
+		if RelativeLuminance(a.Color) > 0.72 {
+			ringCol = ui.RGBA(15, 23, 42, 0.34)
 		}
-		span := ui.Span{Text: fmt.Sprintf("%d", a.CounterNum), Size: 14 * zoom, Weight: 700, Color: txtCol}
+		p.Stroke(badge, ringCol, r, max(1.5, 2*zoom))
+		txtCol := ContrastInk(a.Color)
+		span := ui.Span{Text: fmt.Sprintf("%d", a.CounterNum), Size: rPx * zoom, Weight: 700, Color: txtCol}
 		tw, th := p.MeasureText(0, span)
 		p.RichText(cx-tw/2, cy-th/2, 0, span)
 
 	case ToolText:
-		txt := a.Text
+		txt := strings.ReplaceAll(a.Text, "\r\n", "\n")
 		if txt == "" {
 			txt = "Text"
 		}
-		fs := a.FontSize
-		if fs <= 0 {
-			fs = 20
-		}
+		fs := ClampFontSize(a.FontSize)
 		lines := strings.Split(txt, "\n")
-		lineH := fs * 1.38 * zoom
+		lineH := fs * 1.36 * zoom
 		sx, sy := tx(a.Start.X), ty(a.Start.Y)
 		if a.Filled {
-			txtCol := ui.Hex("#FFFFFF")
-			if isLightColor(a.Color) {
-				txtCol = ui.Hex("#0F172A")
-			}
+			txtCol := ContrastInk(a.Color)
 			var maxW, totalH float32
 			for i, line := range lines {
 				measureTxt := line
@@ -151,10 +163,13 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 					totalH = float32(i)*lineH + th
 				}
 			}
-			padX, padY := 10*zoom, 5*zoom
-			pill := ui.Rect{X: sx - padX*0.6, Y: sy - padY, W: maxW + padX*2, H: totalH + padY*2}
-			p.Shadow(pill, 7*zoom, 0, 2*zoom, 8*zoom, 0, ui.RGBA(0, 0, 0, 0.28))
-			p.Fill(pill, a.Color, 7*zoom)
+			padX := max(float32(8), fs*0.42) * zoom
+			padY := max(float32(5), fs*0.24) * zoom
+			rad := min(10*zoom, max(6*zoom, fs*0.30*zoom))
+			pill := ui.Rect{X: sx - padX*0.65, Y: sy - padY, W: maxW + padX*2.1, H: totalH + padY*2}
+			p.Shadow(pill, rad, 0, 2*zoom, 8*zoom, 0, ui.RGBA(0, 0, 0, 0.22))
+			p.Fill(pill, a.Color, rad)
+			p.Stroke(pill, PillBorderColor(a.Color), rad, max(1, 1.1*zoom))
 			for i, line := range lines {
 				if line == "" {
 					continue
@@ -162,13 +177,22 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 				p.RichText(sx+padX*0.4, sy+float32(i)*lineH, 0, ui.Span{Text: line, Size: fs * zoom, Weight: 600, Color: txtCol})
 			}
 		} else {
+			haloCol := TextHaloColor(a.Color)
+			hr := min(float32(2.4), max(float32(1.0), fs*zoom*0.065))
+			hd := hr * 0.72
+			haloOffsets := [8][2]float32{
+				{-hr, 0}, {hr, 0}, {0, -hr}, {0, hr},
+				{-hd, -hd}, {hd, -hd}, {-hd, hd}, {hd, hd},
+			}
 			for i, line := range lines {
 				if line == "" {
 					continue
 				}
 				ly := sy + float32(i)*lineH
-				shadowSpan := ui.Span{Text: line, Size: fs * zoom, Weight: 700, Color: ui.RGBA(0, 0, 0, 0.55)}
-				p.RichText(sx+1.5*zoom, ly+1.5*zoom, 0, shadowSpan)
+				haloSpan := ui.Span{Text: line, Size: fs * zoom, Weight: 700, Color: haloCol}
+				for _, off := range haloOffsets {
+					p.RichText(sx+off[0], ly+off[1], 0, haloSpan)
+				}
 				mainSpan := ui.Span{Text: line, Size: fs * zoom, Weight: 700, Color: a.Color}
 				p.RichText(sx, ly, 0, mainSpan)
 			}
@@ -179,6 +203,10 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 		tyTop, tyBot := ty(float32(a.MeasTop)), ty(float32(a.MeasBottom))
 		cx, cy := tx(a.Start.X), ty(a.Start.Y)
 		c := a.Color
+		if strokeHalo, ok := strokeContrastHalo(c); ok {
+			p.Line(lx, cy, rx, cy, 3.0, strokeHalo)
+			p.Line(cx, tyTop, cx, tyBot, 3.0, strokeHalo)
+		}
 		p.Line(lx, cy, rx, cy, 1.5, c)
 		p.Line(lx, cy-5, lx, cy+5, 1.5, c)
 		p.Line(rx, cy-5, rx, cy+5, 1.5, c)
@@ -189,11 +217,12 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 		mw := a.MeasRight - a.MeasLeft + 1
 		mh := a.MeasBottom - a.MeasTop + 1
 		label := fmt.Sprintf("%d × %d px", mw, mh)
-		span := ui.Span{Text: label, Size: 11.5, Weight: 700, Color: ui.Hex("#FFFFFF")}
+		span := ui.Span{Text: label, Size: 11.5, Weight: 700, Color: ContrastInk(c)}
 		tw, th := p.MeasureText(0, span)
 		pill := ui.Rect{X: cx + 8, Y: cy - th - 12, W: tw + 14, H: th + 8}
-		p.Shadow(pill, 6, 0, 2, 6, 0, ui.RGBA(0, 0, 0, 0.35))
+		p.Shadow(pill, 6, 0, 2, 6, 0, ui.RGBA(0, 0, 0, 0.28))
 		p.Fill(pill, c, 6)
+		p.Stroke(pill, PillBorderColor(c), 6, 1)
 		p.RichText(pill.X+7, pill.Y+4, 0, span)
 	}
 
@@ -219,6 +248,17 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 			p.Stroke(hRect, ui.Hex("#0EA5E9"), 4, 1.5)
 		}
 	}
+}
+
+func strokeContrastHalo(c ui.Color) (ui.Color, bool) {
+	lum := RelativeLuminance(c)
+	if lum > 0.72 {
+		return ui.RGBA(15, 23, 42, 0.38), true
+	}
+	if lum < 0.06 {
+		return ui.RGBA(255, 255, 255, 0.42), true
+	}
+	return ui.Transparent, false
 }
 
 func smoothUIPath(pts []PointF, tx, ty func(float32) float32) *ui.Path {
@@ -255,19 +295,83 @@ func ellipsePath(cx, cy, rx, ry float32) *ui.Path {
 // image pixel coordinates, or -1 if none.
 func HitTestAnnotation(anns []Annotation, ix, iy, tol float32) int {
 	for i := len(anns) - 1; i >= 0; i-- {
-		a := anns[i]
-		minX, minY, maxX, maxY := a.Bounds()
-		if ix >= minX-tol && ix <= maxX+tol && iy >= minY-tol && iy <= maxY+tol {
-			if a.Kind == ToolLine || a.Kind == ToolArrow {
-				if distToSegment(ix, iy, a.Start.X, a.Start.Y, a.End.X, a.End.Y) <= max(tol, a.StrokeWidth*2) {
-					return i
-				}
-				continue
-			}
+		if hitTestSingle(anns[i], ix, iy, tol) {
 			return i
 		}
 	}
 	return -1
+}
+
+// HitTestAnnotationKind returns the top-most annotation index of the given Tool kind
+// containing (ix, iy) in image pixel coordinates, or -1 if none.
+func HitTestAnnotationKind(anns []Annotation, kind Tool, ix, iy, tol float32) int {
+	for i := len(anns) - 1; i >= 0; i-- {
+		if anns[i].Kind == kind && hitTestSingle(anns[i], ix, iy, tol) {
+			return i
+		}
+	}
+	return -1
+}
+
+func hitTestSingle(a Annotation, ix, iy, tol float32) bool {
+	minX, minY, maxX, maxY := a.Bounds()
+	if ix < minX-tol || ix > maxX+tol || iy < minY-tol || iy > maxY+tol {
+		return false
+	}
+	switch a.Kind {
+	case ToolLine, ToolArrow:
+		return distToSegment(ix, iy, a.Start.X, a.Start.Y, a.End.X, a.End.Y) <= max(tol, a.StrokeWidth*2)
+	case ToolPen, ToolHighlighter:
+		if len(a.Points) >= 2 {
+			strokeTol := max(tol, a.StrokeWidth*1.5)
+			if a.Kind == ToolHighlighter {
+				strokeTol = max(tol, max(float32(14), a.StrokeWidth*4.5)*0.6)
+			}
+			for i := 0; i < len(a.Points)-1; i++ {
+				if distToSegment(ix, iy, a.Points[i].X, a.Points[i].Y, a.Points[i+1].X, a.Points[i+1].Y) <= strokeTol {
+					return true
+				}
+			}
+			return false
+		}
+		return true
+	case ToolRect:
+		if a.Filled {
+			return true
+		}
+		edgeTol := max(tol, a.StrokeWidth*1.5)
+		nearLeft := ix >= minX-edgeTol && ix <= minX+edgeTol
+		nearRight := ix >= maxX-edgeTol && ix <= maxX+edgeTol
+		nearTop := iy >= minY-edgeTol && iy <= minY+edgeTol
+		nearBottom := iy >= maxY-edgeTol && iy <= maxY+edgeTol
+		return nearLeft || nearRight || nearTop || nearBottom
+	case ToolEllipse:
+		if a.Filled {
+			return true
+		}
+		rx := (maxX - minX) * 0.5
+		ry := (maxY - minY) * 0.5
+		if rx <= 1 || ry <= 1 {
+			return true
+		}
+		cx := (minX + maxX) * 0.5
+		cy := (minY + maxY) * 0.5
+		dx, dy := ix-cx, iy-cy
+		edgeTol := max(tol, a.StrokeWidth*1.5)
+		orx, ory := rx+edgeTol, ry+edgeTol
+		if (dx*dx)/(orx*orx)+(dy*dy)/(ory*ory) > 1 {
+			return false
+		}
+		if rx > edgeTol && ry > edgeTol {
+			irx, iry := rx-edgeTol, ry-edgeTol
+			if (dx*dx)/(irx*irx)+(dy*dy)/(iry*iry) < 1 {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
 }
 
 func distToSegment(px, py, x1, y1, x2, y2 float32) float32 {
