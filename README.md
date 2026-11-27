@@ -46,7 +46,7 @@
 
 前往 [Releases](https://github.com/Kutius/koma/releases) 下载：
 - `Koma.exe` — 单文件便携版，双击即用
-- `koma-setup-0.3.2-amd64.exe` — Windows 安装程序（支持应用内自动更新）
+- `koma-setup-<version>-amd64.exe` — Windows 安装程序（支持应用内自动更新）
 
 ## 快捷键
 
@@ -80,7 +80,7 @@ go tool mygo build
 
 构建产物位于 `build/windows-amd64/`：
 - `Koma.exe` — 独立便携版
-- `koma-setup-0.3.2-amd64.exe` — Windows 安装程序
+- `koma-setup-<version>-amd64.exe` — Windows 安装程序
 
 ## 致谢
 
