@@ -454,31 +454,50 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 				cx, cy, txtCol, a.CounterNum)
 
 		case ToolText:
-			txt := strings.TrimSpace(a.Text)
-			if txt == "" {
+			txt := strings.TrimRight(a.Text, "\r\n")
+			if strings.TrimSpace(txt) == "" {
 				continue
 			}
 			fs := a.FontSize
 			if fs <= 0 {
 				fs = 20
 			}
-			esc := html.EscapeString(txt)
+			lines := strings.Split(strings.ReplaceAll(txt, "\r\n", "\n"), "\n")
+			lineH := fs * 1.38
 			if a.Filled {
-				estW := estimateTextWidth(txt, fs) + 20
-				estH := fs*1.42 + 8
+				var maxLineW float32
+				for _, line := range lines {
+					if lw := estimateTextWidth(line, fs); lw > maxLineW {
+						maxLineW = lw
+					}
+				}
+				estW := maxLineW + 20
+				estH := float32(len(lines))*lineH + 8
 				txtCol := "#ffffff"
 				if isLightColor(a.Color) {
 					txtCol = "#0f172a"
 				}
 				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="7" fill="rgba(0,0,0,0.28)"/>`, a.Start.X-6, a.Start.Y-4, estW, estH)
 				fmt.Fprintf(&sb, `<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="7" fill="%s"/>`, a.Start.X-6, a.Start.Y-6, estW, estH, col)
-				fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="600" dominant-baseline="hanging">%s</text>`,
-					a.Start.X+4, a.Start.Y+1, txtCol, fs, esc)
+				for i, line := range lines {
+					if line == "" {
+						continue
+					}
+					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="600" dominant-baseline="hanging">%s</text>`,
+						a.Start.X+4, a.Start.Y+1+float32(i)*lineH, txtCol, fs, html.EscapeString(line))
+				}
 			} else {
-				fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="rgba(0,0,0,0.55)" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
-					a.Start.X+1.5, a.Start.Y+1.5, fs, esc)
-				fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
-					a.Start.X, a.Start.Y, col, fs, esc)
+				for i, line := range lines {
+					if line == "" {
+						continue
+					}
+					esc := html.EscapeString(line)
+					ly := a.Start.Y + float32(i)*lineH
+					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="rgba(0,0,0,0.55)" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
+						a.Start.X+1.5, ly+1.5, fs, esc)
+					fmt.Fprintf(&sb, `<text x="%.1f" y="%.1f" fill="%s" font-family="Segoe UI, Microsoft YaHei UI, sans-serif" font-size="%.1f" font-weight="700" dominant-baseline="hanging">%s</text>`,
+						a.Start.X, ly, col, fs, esc)
+				}
 			}
 
 		case ToolMeasure:

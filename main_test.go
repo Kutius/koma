@@ -30,7 +30,7 @@ func TestFullscreenToolbarPlacementAlwaysVisible(t *testing.T) {
 		{"top_edge_selection", 100, 0, 700, 500, 860, 520, false},
 	}
 
-	const mainW, subW float32 = 672, 440
+	const mainW, subW float32 = 740, 440
 	for _, tc := range cases {
 		barX, barY, subX, subY, _ := app.ComputeToolbarLayout(tc.x0, tc.y0, tc.x1, tc.y1, tc.viewW, tc.viewH, mainW, subW, tc.showSub)
 		if barX < 16 || barX+mainW > tc.viewW-15 {
@@ -113,6 +113,12 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 
 	if _, ok := ttOv.Find("长截图"); !ok {
 		t.Fatalf("expected 长截图 button on QQ overlay toolbar")
+	}
+	if _, ok := ttOv.Find("提取文字"); !ok {
+		t.Fatalf("expected 提取文字 (OCR) button on QQ overlay toolbar")
+	}
+	if _, ok := ttOv.Find("编辑"); !ok {
+		t.Fatalf("expected 编辑 button on QQ overlay toolbar")
 	}
 
 	if err := ttOv.Click("箭头"); err != nil {
@@ -318,6 +324,14 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !sc.Closed() {
 		t.Fatalf("expected scroll session Closed() == true after clicking 取消")
 	}
+
+	// 7. Native OCR Result Card Preview
+	ocrView := app.NewTestOCRView(a, "Koma — 一帧清光，恰如其分。\nFrame the moment, effortlessly.", 2)
+	ttOCR := ui.NewTester(ocrView, 480, 380)
+	if !ttOCR.HasText("文字识别") || !ttOCR.HasText("复制并关闭") {
+		t.Fatalf("expected OCR result view controls, got texts: %q", ttOCR.Texts())
+	}
+	savePreview(t, dumpDir, "v3_10_ocr_result.png", ttOCR.Image())
 
 	if os.Getenv("KOMA_GEN_ICON") == "1" {
 		if err := os.WriteFile(filepath.Join("resources", "icon.png"), icons.AppIconPNG(512), 0o644); err != nil {

@@ -104,12 +104,13 @@ type EditorState struct {
 	settingsOpen           bool
 	openAtLoginToggle      bool
 	autoCheckUpdatesToggle bool
+	quickSaveToggle        bool
 	recordingHotkey        HotkeyAction
 	settingsErr            string
-	hotkeyRecHandles       [4]ui.Handle
-	toastMsg          string
-	toastUntil        time.Time
-	brandBmp          *ui.Bitmap
+	hotkeyRecHandles       [5]ui.Handle
+	toastMsg               string
+	toastUntil             time.Time
+	brandBmp               *ui.Bitmap
 }
 
 // NewEditorState creates an initialized Glasswork Liquid Glass Studio editor.
@@ -150,6 +151,7 @@ func (e *EditorState) OpenSettings() {
 	e.app.SyncUpdaterState()
 	e.openAtLoginToggle = e.app.OpenAtLogin()
 	e.autoCheckUpdatesToggle = e.app.AutomaticUpdateChecks()
+	e.quickSaveToggle = e.app.QuickSave()
 	e.helpOpen = false
 	e.settingsOpen = true
 	e.settingsErr = ""
@@ -435,7 +437,7 @@ func (e *EditorState) saveComposite() {
 	e.app.mu.Lock()
 	parent := e.app.editorWin
 	e.app.mu.Unlock()
-	go e.app.SaveImageWithDialog(comp, parent)
+	go e.app.SaveImagePreferred(comp, nil, parent)
 }
 
 func (e *EditorState) pinComposite() {
@@ -842,7 +844,7 @@ func (e *EditorState) renderFloatingTopChrome(c *ui.Context, tk appleTokens) {
 		if appleIconBtn(c, tk, icons.CaptureArea, "区域截图", FormatHotkeyTooltip("区域截图", e.app.Hotkey(HotkeyArea)), false) {
 			e.app.StartAreaCapture(true)
 		}
-		if appleIconBtn(c, tk, icons.LongCapture, "长截图", "滚动长截图", false) {
+		if appleIconBtn(c, tk, icons.LongCapture, "长截图", FormatHotkeyTooltip("滚动长截图", e.app.Hotkey(HotkeyLong)), false) {
 			e.app.StartLongCapture(true)
 		}
 		if appleIconBtn(c, tk, icons.CaptureScreen, "全屏截图", FormatHotkeyTooltip("全屏截图", e.app.Hotkey(HotkeyFull)), false) {
@@ -878,6 +880,11 @@ func (e *EditorState) renderFloatingTopChrome(c *ui.Context, tk appleTokens) {
 			}
 			appleGlassDivider(c, tk)
 
+			if appleIconBtn(c, tk, icons.OCR, "提取文字", "文字识别 OCR", false) {
+				if comp := e.ExportComposite(); comp != nil {
+					e.app.RecognizeTextFromImage(comp)
+				}
+			}
 			if appleIconBtn(c, tk, icons.Pin, "贴图", "贴图到桌面 (Ctrl+P)", false) {
 				e.pinComposite()
 			}
@@ -1877,13 +1884,13 @@ func (e *EditorState) renderHelpSheet(c *ui.Context, tk appleTokens) {
 					ui.Column(c).Grow(1).Gap(7).Children(func() {
 						ui.Text(c, "全局与截图遮罩").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
 						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyArea)), "区域截图（原位标注）")
+						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyLong)), "滚动长截图")
 						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyFull)), "全屏截图")
 						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyDelay)), "延时 3 秒截图")
 						appleHelpRow(c, tk, FormatHotkeyDisplay(e.app.Hotkey(HotkeyPin)), "贴图剪贴板")
 						appleHelpRow(c, tk, "双击选区 / Enter", "完成并复制")
-						appleHelpRow(c, tk, "L（选区后）", "滚动长截图")
-						appleHelpRow(c, tk, "右键单击", "重选 / 退出")
-						appleHelpRow(c, tk, "Space / C / M", "吸附 / 取色 / 测距")
+						appleHelpRow(c, tk, "E / L / 方向键", "工作台 / 长截图 / 1px 微调")
+						appleHelpRow(c, tk, "Space / Shift+C / M", "吸附 / 取色格式 / 测距")
 					})
 					ui.Column(c).Grow(1).Gap(7).Children(func() {
 						ui.Text(c, "标注与贴图").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
@@ -1915,7 +1922,7 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 		}
 		scrim.Children(func() {
 			sheet := ui.Column(c.Key("settings-sheet")).
-				Width(492).Padding(22).Gap(14).Radius(28).
+				Width(780).Padding(22).Gap(16).Radius(28).
 				Material(glasswork.Card(tk.glass.Kind)).
 				Transition(glasswork.PanelTransition(0, 12))
 			sheet.Clicked()
@@ -1931,241 +1938,314 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 					}
 				})
 
-				// Section 1: General (Launch at Startup + Theme)
-				ui.Column(c).Gap(10).Children(func() {
-					ui.Text(c, "常规").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
+				// Balanced 2-column Liquid Glass layout so all 4 sections stay visible without scrolling
+				ui.Row(c.Key("settings-columns")).Gap(20).AlignItems(ui.Start).Children(func() {
+					// Left column: General + Save Preferences
+					ui.Column(c).Width(348).Gap(14).Children(func() {
+						// Section 1: General (Launch at Startup + Theme)
+						ui.Column(c).Gap(8).Children(func() {
+							ui.Text(c, "常规").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
 
-					// Launch at Startup row (entire row is an accessible SwitchBase)
-					e.renderLiquidSwitchRow(c, tk, "settings-autostart", "开机自启", &e.openAtLoginToggle, func(on bool) {
-						if err := e.app.SetOpenAtLogin(on); err != nil {
-							e.openAtLoginToggle = e.app.OpenAtLogin()
-							e.settingsErr = err.Error()
-						} else {
-							e.settingsErr = ""
-							if on {
-								e.SetToast("已开启开机自启（后台静默驻留托盘）")
-							} else {
-								e.SetToast("已关闭开机自启")
-							}
-						}
-					})
-
-					// Appearance row
-					ui.Row(c).Height(38).Padding(0, 12, 0, 12).Radius(13).
-						Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "外观").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
-						ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
-							if appleSubChipScoped(c, tk, "浅色", !e.app.darkMode, "settings-theme") {
-								e.app.SetDarkMode(false)
-							}
-							if appleSubChipScoped(c, tk, "深色", e.app.darkMode, "settings-theme") {
-								e.app.SetDarkMode(true)
-							}
-						})
-					})
-				})
-
-				// Section 2: Global Hotkeys
-				ui.Column(c).Gap(8).Children(func() {
-					ui.Row(c).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "全局快捷键").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent).Grow(1)
-						resetBtn := ui.Row(c.Key("settings-reset-hotkeys")).
-							Height(24).Padding(0, 10, 0, 10).Radius(12).AlignItems(ui.Center).
-							Role(ui.RoleButton).Label("恢复默认").
-							Cursor(ui.CursorPointer).Tooltip("恢复全部默认快捷键")
-						rCol := tk.textSecondary
-						if resetBtn.Hovered() {
-							resetBtn.Background(tk.hoverFill)
-							rCol = tk.inks.Accent
-						}
-						resetBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-						glasswork.ApplyLiquidButton(resetBtn, glasswork.CompactButtonOpts())
-						resetBtn.Children(func() {
-							ui.Text(c, "恢复默认").FontSize(11.5).FontWeight(600).TextColor(rCol).SingleLine()
-						})
-						if resetBtn.Clicked() {
-							e.stopRecordingHotkey()
-							if err := e.app.ResetDefaultHotkeys(); err != nil {
-								e.settingsErr = err.Error()
-							} else {
-								e.settingsErr = ""
-								e.SetToast("已恢复默认快捷键")
-							}
-						}
-					})
-
-					for i, meta := range hotkeyOrder {
-						idx := i
-						m := meta
-						acc := e.app.Hotkey(m.Action)
-						recording := e.recordingHotkey == m.Action
-
-						ui.Row(c.Key("hk-row-"+string(m.Action))).
-							Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(6).
-							Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
-							ui.Text(c, m.Label).FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
-
-							recLabel := FormatHotkeyDisplay(acc)
-							recTip := "点击录制快捷键（录制时按 Backspace 可取消）"
-							if recording {
-								recLabel = "请按下快捷键…"
-								recTip = "按下组合键保存，Esc 退出，Backspace 取消快捷键"
-							}
-
-							pill := ui.Row(c.Key("hk-rec-"+string(m.Action))).
-								Height(28).MinWidth(128).Padding(0, 12, 0, 12).Radius(14).
-								AlignItems(ui.Center).Justify(ui.Center).
-								Focusable().Bind(&e.hotkeyRecHandles[idx]).
-								Role(ui.RoleButton).Label("修改" + m.Label + "快捷键").
-								Cursor(ui.CursorPointer).Tooltip(recTip)
-
-							fg := tk.textPrimary
-							if recording {
-								pill.Background(tk.inks.AccentFill).Border(1.5, tk.inks.Accent)
-								fg = tk.inks.Accent
-							} else {
-								if acc == "" {
-									fg = tk.textTertiary
-								}
-								if pill.Hovered() {
-									pill.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+							e.renderLiquidSwitchRow(c, tk, "settings-autostart", "开机自启", &e.openAtLoginToggle, func(on bool) {
+								if err := e.app.SetOpenAtLogin(on); err != nil {
+									e.openAtLoginToggle = e.app.OpenAtLogin()
+									e.settingsErr = err.Error()
 								} else {
-									pill.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									e.settingsErr = ""
+									if on {
+										e.SetToast("已开启开机自启（后台静默驻留托盘）")
+									} else {
+										e.SetToast("已关闭开机自启")
+									}
+								}
+							})
+
+							ui.Row(c).Height(38).Padding(0, 12, 0, 12).Radius(13).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, "外观").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
+								ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+									if appleSubChipScoped(c, tk, "浅色", !e.app.darkMode, "settings-theme") {
+										e.app.SetDarkMode(false)
+									}
+									if appleSubChipScoped(c, tk, "深色", e.app.darkMode, "settings-theme") {
+										e.app.SetDarkMode(true)
+									}
+								})
+							})
+						})
+
+						// Section 2: Save Preferences
+						ui.Column(c).Gap(8).Children(func() {
+							ui.Text(c, "保存偏好").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
+
+							e.renderLiquidSwitchRow(c, tk, "settings-quicksave", "静默快速保存", &e.quickSaveToggle, func(on bool) {
+								e.app.SetQuickSave(on)
+								if on {
+									e.SetToast("已开启静默快速保存（跳过保存弹窗）")
+								} else {
+									e.SetToast("已关闭静默快速保存")
+								}
+							})
+
+							curFmt := e.app.SaveFormat()
+							ui.Row(c.Key("settings-format-row")).
+								Height(38).Padding(0, 12, 0, 12).Radius(13).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, "默认格式").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
+								ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+									if appleSubChipScoped(c, tk, "PNG", curFmt == SaveFormatPNG, "settings-format") {
+										e.app.SetSaveFormat(SaveFormatPNG)
+									}
+									if appleSubChipScoped(c, tk, "JPEG", curFmt == SaveFormatJPEG, "settings-format") {
+										e.app.SetSaveFormat(SaveFormatJPEG)
+									}
+								})
+							})
+
+							customDir := e.app.SaveDir()
+							dirLabel := "系统图片目录"
+							dirTip := e.app.EffectiveSaveDir()
+							if customDir != "" {
+								dirLabel = customDir
+								if r := []rune(dirLabel); len(r) > 16 {
+									dirLabel = "…" + string(r[len(r)-15:])
 								}
 							}
-							pill.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-							glasswork.ApplyLiquidButton(pill, glasswork.CompactButtonOpts())
+							ui.Row(c.Key("settings-savedir-row")).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(6).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, "保存目录").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine().Shrink(0)
+								ui.Text(c, dirLabel).FontSize(11.5).FontWeight(500).TextColor(tk.textSecondary).SingleLine().Grow(1).Tooltip(dirTip)
+								chooseBtn := ui.Row(c.Key("settings-choose-dir")).
+									Height(26).Padding(0, 10, 0, 10).Radius(13).AlignItems(ui.Center).Shrink(0).
+									Role(ui.RoleButton).Label("更改保存目录").
+									Cursor(ui.CursorPointer).Tooltip("选择默认保存目录")
+								cFg := tk.textPrimary
+								if chooseBtn.Hovered() {
+									chooseBtn.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+									cFg = tk.inks.Accent
+								} else {
+									chooseBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+								}
+								chooseBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+								glasswork.ApplyLiquidButton(chooseBtn, glasswork.CompactButtonOpts())
+								chooseBtn.Children(func() {
+									ui.Text(c, "更改").FontSize(11.5).FontWeight(600).TextColor(cFg).SingleLine()
+								})
+								if chooseBtn.Clicked() {
+									e.app.ChooseSaveDir()
+								}
+								if customDir != "" {
+									if appleMiniBtn(c, tk, icons.Close, "恢复默认保存目录") {
+										e.app.SetSaveDir("")
+										e.SetToast("已恢复系统默认图片目录")
+									}
+								}
+							})
+						})
 
-							if recording {
-								pill.HandleInput(func(ev ui.InputEvent) bool {
-									if ev.Kind != ui.InputKeyDown {
-										return false
+						// Section 3: Software Updates
+						ui.Column(c).Gap(8).Children(func() {
+							ui.Text(c, "软件更新").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
+
+							e.renderLiquidSwitchRow(c, tk, "settings-autocheck", "自动检查更新", &e.autoCheckUpdatesToggle, func(on bool) {
+								e.app.SetAutomaticUpdateChecks(on)
+								if on {
+									e.SetToast("已开启每日自动检查更新")
+								} else {
+									e.SetToast("已关闭自动检查更新")
+								}
+							})
+
+							avail := e.app.AvailableUpdate()
+							verLabel := "v" + e.app.AppVersion()
+							ui.Row(c.Key("settings-update-row")).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(8).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								ui.Row(c).AlignItems(ui.Center).Gap(6).Grow(1).Children(func() {
+									ui.Text(c, "版本").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine()
+									ui.Box(c).Padding(2, 7, 2, 7).Radius(8).
+										Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline).Children(func() {
+										ui.Text(c, verLabel).FontSize(11.5).FontWeight(600).TextColor(tk.textSecondary).SingleLine()
+									})
+									if avail != "" {
+										ui.Box(c).Padding(2, 7, 2, 7).Radius(8).
+											Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder).Children(func() {
+											ui.Textf(c, "新版本 v%s", avail).FontSize(11).FontWeight(600).TextColor(tk.inks.Accent).SingleLine()
+										})
 									}
-									nextAcc, clear, cancel, ignored, errMsg := ParseHotkeyInput(ev)
-									if ignored {
+								})
+
+								btnLabel := "检查更新"
+								btnTip := "从 GitHub Releases 检查 Koma 新版本"
+								if avail != "" {
+									btnLabel = "立即更新"
+									btnTip = fmt.Sprintf("查看并安装 Koma v%s", avail)
+								}
+								checkBtn := ui.Row(c.Key("settings-check-update")).
+									Height(28).Padding(0, 11, 0, 9).Gap(5).Radius(14).
+									AlignItems(ui.Center).Shrink(0).
+									Role(ui.RoleButton).Label(btnLabel).
+									Cursor(ui.CursorPointer).Tooltip(btnTip)
+								btnFg := tk.textPrimary
+								if avail != "" {
+									checkBtn.Material(glasswork.Tinted(tk.accent))
+									btnFg = ui.Hex("#FFFFFF")
+								} else {
+									if checkBtn.Hovered() {
+										checkBtn.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+										btnFg = tk.inks.Accent
+									} else {
+										checkBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									}
+									checkBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+								}
+								glasswork.ApplyLiquidButton(checkBtn, glasswork.CompactButtonOpts())
+								checkBtn.Children(func() {
+									ui.Icon(c, icons.Restart.For(avail != "" || checkBtn.Pressed())).Size(14, 14).Shrink(0).TextColor(btnFg).ContentTransition(ui.ContentTransition{})
+									ui.Text(c, btnLabel).FontSize(11.5).FontWeight(600).TextColor(btnFg).SingleLine().Shrink(0)
+								})
+								if checkBtn.Clicked() {
+									e.app.CheckForUpdates()
+								}
+							})
+						})
+					})
+
+					// Right column: Global Hotkeys
+					ui.Column(c).Grow(1).Gap(8).Children(func() {
+						ui.Row(c).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, "全局快捷键").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent).Grow(1)
+							resetBtn := ui.Row(c.Key("settings-reset-hotkeys")).
+								Height(24).Padding(0, 10, 0, 10).Radius(12).AlignItems(ui.Center).
+								Role(ui.RoleButton).Label("恢复默认").
+								Cursor(ui.CursorPointer).Tooltip("恢复全部默认快捷键")
+							rCol := tk.textSecondary
+							if resetBtn.Hovered() {
+								resetBtn.Background(tk.hoverFill)
+								rCol = tk.inks.Accent
+							}
+							resetBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+							glasswork.ApplyLiquidButton(resetBtn, glasswork.CompactButtonOpts())
+							resetBtn.Children(func() {
+								ui.Text(c, "恢复默认").FontSize(11.5).FontWeight(600).TextColor(rCol).SingleLine()
+							})
+							if resetBtn.Clicked() {
+								e.stopRecordingHotkey()
+								if err := e.app.ResetDefaultHotkeys(); err != nil {
+									e.settingsErr = err.Error()
+								} else {
+									e.settingsErr = ""
+									e.SetToast("已恢复默认快捷键")
+								}
+							}
+						})
+
+						for i, meta := range hotkeyOrder {
+							idx := i
+							m := meta
+							acc := e.app.Hotkey(m.Action)
+							recording := e.recordingHotkey == m.Action
+
+							ui.Row(c.Key("hk-row-"+string(m.Action))).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(6).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, m.Label).FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
+
+								recLabel := FormatHotkeyDisplay(acc)
+								recTip := "点击录制快捷键（录制时按 Backspace 可取消）"
+								if recording {
+									recLabel = "请按下快捷键…"
+									recTip = "按下组合键保存，Esc 退出，Backspace 取消快捷键"
+								}
+
+								pill := ui.Row(c.Key("hk-rec-"+string(m.Action))).
+									Height(28).MinWidth(124).Padding(0, 11, 0, 11).Radius(14).
+									AlignItems(ui.Center).Justify(ui.Center).
+									Focusable().Bind(&e.hotkeyRecHandles[idx]).
+									Role(ui.RoleButton).Label("修改" + m.Label + "快捷键").
+									Cursor(ui.CursorPointer).Tooltip(recTip)
+
+								fg := tk.textPrimary
+								if recording {
+									pill.Background(tk.inks.AccentFill).Border(1.5, tk.inks.Accent)
+									fg = tk.inks.Accent
+								} else {
+									if acc == "" {
+										fg = tk.textTertiary
+									}
+									if pill.Hovered() {
+										pill.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+									} else {
+										pill.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									}
+								}
+								pill.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+								glasswork.ApplyLiquidButton(pill, glasswork.CompactButtonOpts())
+
+								if recording {
+									pill.HandleInput(func(ev ui.InputEvent) bool {
+										if ev.Kind != ui.InputKeyDown {
+											return false
+										}
+										nextAcc, clear, cancel, ignored, errMsg := ParseHotkeyInput(ev)
+										if ignored {
+											return true
+										}
+										if cancel {
+											e.stopRecordingHotkey()
+											e.settingsErr = ""
+											return true
+										}
+										if clear {
+											e.commitHotkey(m.Action, "")
+											return true
+										}
+										if errMsg != "" {
+											e.settingsErr = errMsg
+											return true
+										}
+										e.commitHotkey(m.Action, nextAcc)
 										return true
-									}
-									if cancel {
+									})
+								}
+
+								pill.Children(func() {
+									ui.Text(c, recLabel).FontSize(11.5).FontWeight(600).TextColor(fg).SingleLine()
+								})
+
+								if pill.Clicked() {
+									if recording {
 										e.stopRecordingHotkey()
 										e.settingsErr = ""
-										return true
+									} else {
+										e.startRecordingHotkey(c, idx, m.Action)
 									}
-									if clear {
+								}
+
+								if acc != "" && !recording {
+									clrBtn := ui.Box(c.Key("hk-clr-"+string(m.Action))).
+										Size(24, 24).Center().Radius(12).
+										Role(ui.RoleButton).Label("取消" + m.Label + "快捷键").
+										Cursor(ui.CursorPointer).Tooltip("取消快捷键")
+									cCol := tk.textTertiary
+									hov := clrBtn.Hovered()
+									if hov {
+										clrBtn.Background(tk.inks.DangerFill)
+										cCol = tk.inks.Danger
+									}
+									clrBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+									glasswork.ApplyLiquidButton(clrBtn, glasswork.CompactButtonOpts())
+									clrBtn.Children(func() {
+										ui.Icon(c, icons.Close.For(hov || clrBtn.Pressed())).Size(14, 14).TextColor(cCol).ContentTransition(ui.ContentTransition{})
+									})
+									if clrBtn.Clicked() {
 										e.commitHotkey(m.Action, "")
-										return true
 									}
-									if errMsg != "" {
-										e.settingsErr = errMsg
-										return true
-									}
-									e.commitHotkey(m.Action, nextAcc)
-									return true
-								})
-							}
-
-							pill.Children(func() {
-								ui.Text(c, recLabel).FontSize(11.5).FontWeight(600).TextColor(fg).SingleLine()
-							})
-
-							if pill.Clicked() {
-								if recording {
-									e.stopRecordingHotkey()
-									e.settingsErr = ""
 								} else {
-									e.startRecordingHotkey(c, idx, m.Action)
+									ui.Box(c).Size(24, 24)
 								}
-							}
-
-							// Dedicated one-click clear/cancel button when a shortcut is bound
-							if acc != "" && !recording {
-								clrBtn := ui.Box(c.Key("hk-clr-"+string(m.Action))).
-									Size(24, 24).Center().Radius(12).
-									Role(ui.RoleButton).Label("取消" + m.Label + "快捷键").
-									Cursor(ui.CursorPointer).Tooltip("取消快捷键")
-								cCol := tk.textTertiary
-								hov := clrBtn.Hovered()
-								if hov {
-									clrBtn.Background(tk.inks.DangerFill)
-									cCol = tk.inks.Danger
-								}
-								clrBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-								glasswork.ApplyLiquidButton(clrBtn, glasswork.CompactButtonOpts())
-								clrBtn.Children(func() {
-									ui.Icon(c, icons.Close.For(hov || clrBtn.Pressed())).Size(14, 14).TextColor(cCol).ContentTransition(ui.ContentTransition{})
-								})
-								if clrBtn.Clicked() {
-									e.commitHotkey(m.Action, "")
-								}
-							} else {
-								ui.Box(c).Size(24, 24)
-							}
-						})
-					}
-				})
-
-				// Section 3: Software Updates
-				ui.Column(c).Gap(8).Children(func() {
-					ui.Text(c, "软件更新").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
-
-					e.renderLiquidSwitchRow(c, tk, "settings-autocheck", "自动检查更新", &e.autoCheckUpdatesToggle, func(on bool) {
-						e.app.SetAutomaticUpdateChecks(on)
-						if on {
-							e.SetToast("已开启每日自动检查更新")
-						} else {
-							e.SetToast("已关闭自动检查更新")
-						}
-					})
-
-					avail := e.app.AvailableUpdate()
-					verLabel := "v" + e.app.AppVersion()
-					ui.Row(c.Key("settings-update-row")).
-						Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(8).
-						Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
-						ui.Row(c).AlignItems(ui.Center).Gap(8).Grow(1).Children(func() {
-							ui.Text(c, "当前版本").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine()
-							ui.Box(c).Padding(2, 8, 2, 8).Radius(8).
-								Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline).Children(func() {
-								ui.Text(c, verLabel).FontSize(11.5).FontWeight(600).TextColor(tk.textSecondary).SingleLine()
 							})
-							if avail != "" {
-								ui.Box(c).Padding(2, 8, 2, 8).Radius(8).
-									Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder).Children(func() {
-									ui.Textf(c, "新版本 v%s", avail).FontSize(11.5).FontWeight(600).TextColor(tk.inks.Accent).SingleLine()
-								})
-							}
-						})
-
-						btnLabel := "检查更新"
-						btnTip := "从 GitHub Releases 检查 Koma 新版本"
-						if avail != "" {
-							btnLabel = "立即更新"
-							btnTip = fmt.Sprintf("查看并安装 Koma v%s", avail)
-						}
-						checkBtn := ui.Row(c.Key("settings-check-update")).
-							Height(28).Padding(0, 12, 0, 10).Gap(5).Radius(14).
-							AlignItems(ui.Center).Shrink(0).
-							Role(ui.RoleButton).Label(btnLabel).
-							Cursor(ui.CursorPointer).Tooltip(btnTip)
-						btnFg := tk.textPrimary
-						if avail != "" {
-							checkBtn.Material(glasswork.Tinted(tk.accent))
-							btnFg = ui.Hex("#FFFFFF")
-						} else {
-							if checkBtn.Hovered() {
-								checkBtn.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
-								btnFg = tk.inks.Accent
-							} else {
-								checkBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
-							}
-							checkBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-						}
-						glasswork.ApplyLiquidButton(checkBtn, glasswork.CompactButtonOpts())
-						checkBtn.Children(func() {
-							ui.Icon(c, icons.Restart.For(avail != "" || checkBtn.Pressed())).Size(14, 14).Shrink(0).TextColor(btnFg).ContentTransition(ui.ContentTransition{})
-							ui.Text(c, btnLabel).FontSize(11.5).FontWeight(600).TextColor(btnFg).SingleLine().Shrink(0)
-						})
-						if checkBtn.Clicked() {
-							e.app.CheckForUpdates()
 						}
 					})
 				})

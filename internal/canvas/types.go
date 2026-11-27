@@ -3,6 +3,7 @@ package canvas
 import (
 	"image"
 	"image/color"
+	"strings"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -157,13 +158,19 @@ func (a Annotation) Bounds() (minX, minY, maxX, maxY float32) {
 		if fs <= 0 {
 			fs = 20
 		}
-		runes := len([]rune(a.Text))
-		if runes < 1 {
-			runes = 4
+		lines := strings.Split(a.Text, "\n")
+		var maxW float32
+		for _, line := range lines {
+			if lw := estimateTextWidth(line, fs); lw > maxW {
+				maxW = lw
+			}
 		}
-		w := float32(runes)*fs*0.62 + 20
-		h := fs*1.45 + 10
-		return a.Start.X - 6, a.Start.Y - 6, a.Start.X + w, a.Start.Y + h
+		if maxW < fs*2 {
+			maxW = fs * 2
+		}
+		lineH := fs * 1.38
+		h := float32(len(lines))*lineH + 10
+		return a.Start.X - 6, a.Start.Y - 6, a.Start.X + maxW + 20, a.Start.Y + h
 	case ToolMeasure:
 		return float32(a.MeasLeft), float32(a.MeasTop), float32(a.MeasRight), float32(a.MeasBottom)
 	default:

@@ -3,6 +3,7 @@ package canvas
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -122,24 +123,49 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 		if fs <= 0 {
 			fs = 20
 		}
+		lines := strings.Split(txt, "\n")
+		lineH := fs * 1.38 * zoom
 		sx, sy := tx(a.Start.X), ty(a.Start.Y)
 		if a.Filled {
 			txtCol := ui.Hex("#FFFFFF")
 			if isLightColor(a.Color) {
 				txtCol = ui.Hex("#0F172A")
 			}
-			span := ui.Span{Text: txt, Size: fs * zoom, Weight: 600, Color: txtCol}
-			tw, th := p.MeasureText(0, span)
+			var maxW, totalH float32
+			for i, line := range lines {
+				measureTxt := line
+				if measureTxt == "" {
+					measureTxt = " "
+				}
+				tw, th := p.MeasureText(0, ui.Span{Text: measureTxt, Size: fs * zoom, Weight: 600, Color: txtCol})
+				if tw > maxW {
+					maxW = tw
+				}
+				if i == len(lines)-1 {
+					totalH = float32(i)*lineH + th
+				}
+			}
 			padX, padY := 10*zoom, 5*zoom
-			pill := ui.Rect{X: sx - padX*0.6, Y: sy - padY, W: tw + padX*2, H: th + padY*2}
+			pill := ui.Rect{X: sx - padX*0.6, Y: sy - padY, W: maxW + padX*2, H: totalH + padY*2}
 			p.Shadow(pill, 7*zoom, 0, 2*zoom, 8*zoom, 0, ui.RGBA(0, 0, 0, 0.28))
 			p.Fill(pill, a.Color, 7*zoom)
-			p.RichText(sx+padX*0.4, sy, 0, span)
+			for i, line := range lines {
+				if line == "" {
+					continue
+				}
+				p.RichText(sx+padX*0.4, sy+float32(i)*lineH, 0, ui.Span{Text: line, Size: fs * zoom, Weight: 600, Color: txtCol})
+			}
 		} else {
-			shadowSpan := ui.Span{Text: txt, Size: fs * zoom, Weight: 700, Color: ui.RGBA(0, 0, 0, 0.55)}
-			p.RichText(sx+1.5*zoom, sy+1.5*zoom, 0, shadowSpan)
-			mainSpan := ui.Span{Text: txt, Size: fs * zoom, Weight: 700, Color: a.Color}
-			p.RichText(sx, sy, 0, mainSpan)
+			for i, line := range lines {
+				if line == "" {
+					continue
+				}
+				ly := sy + float32(i)*lineH
+				shadowSpan := ui.Span{Text: line, Size: fs * zoom, Weight: 700, Color: ui.RGBA(0, 0, 0, 0.55)}
+				p.RichText(sx+1.5*zoom, ly+1.5*zoom, 0, shadowSpan)
+				mainSpan := ui.Span{Text: line, Size: fs * zoom, Weight: 700, Color: a.Color}
+				p.RichText(sx, ly, 0, mainSpan)
+			}
 		}
 
 	case ToolMeasure:

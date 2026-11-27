@@ -31,8 +31,13 @@ type PinWindow struct {
 	scrollY        float32
 	scale          float64
 	opacity        float64
+	clickThrough   bool
+	hidden         bool
+	viewW          float32
+	viewH          float32
 	hudText        string
 	hudUntil       time.Time
+	onContextMenu  func()
 }
 
 // OpenPin spawns a frameless, always-on-top floating screenshot card at (x, y) in DIPs.
@@ -118,6 +123,7 @@ func (a *App) OpenPinWithPNG(img *image.RGBA, pngBytes []byte, x, y int, scaleFa
 	a.mu.Lock()
 	a.pins = append(a.pins, pw)
 	a.mu.Unlock()
+	a.refreshTrayMenu()
 
 	w.OnClosed(func() {
 		a.mu.Lock()
@@ -128,12 +134,298 @@ func (a *App) OpenPinWithPNG(img *image.RGBA, pngBytes []byte, x, y int, scaleFa
 			}
 		}
 		a.mu.Unlock()
+		a.refreshTrayMenu()
 		pw.pngBytes = nil
 		pw.bmp = nil
 		pw.win = nil
 		reclaimMemoryAsync()
 		a.scheduleTrayTrim()
 	})
+}
+
+func (p *PinWindow) saveImage() {
+	if len(p.pngBytes) == 0 {
+		return
+	}
+	img := decodeImageRGBA(p.pngBytes)
+	if img == nil {
+		return
+	}
+	pngCopy := append([]byte(nil), p.pngBytes...)
+	win := p.win
+	go p.app.SaveImagePreferred(img, pngCopy, win)
+}
+
+func (p *PinWindow) setClickThrough(on bool) {
+	p.clickThrough = on
+	if p.win != nil {
+		p.win.SetIgnoreMouseEvents(on)
+		if on && p.opacity > 0.92 {
+			p.opacity = 0.78
+			p.win.SetOpacity(p.opacity)
+		}
+	}
+	p.app.refreshTrayMenu()
+	if on {
+		p.app.NotifyToast("贴图已开启鼠标穿透（可在托盘菜单中恢复）")
+	} else {
+		p.flashHUD("已恢复贴图交互")
+	}
+}
+
+func (p *PinWindow) transformImage(fn func(*image.RGBA) *image.RGBA, hudLabel string) {
+	src := decodeImageRGBA(p.pngBytes)
+	if src == nil {
+		return
+	}
+	dst := fn(src)
+	if dst == nil {
+		return
+	}
+	encoded, err := canvas.EncodePNG(dst)
+	if err != nil {
+		return
+	}
+	bmp, err := ui.DecodeBitmap(encoded)
+	if err != nil || bmp == nil {
+		bmp = ui.NewBitmap(dst)
+	}
+	p.pngBytes = encoded
+	p.bmp = bmp
+	p.drawnFrames = 0
+	p.pixelsReleased = false
+
+	iw, ih := dst.Bounds().Dx(), dst.Bounds().Dy()
+	newAspect := float64(ih) / math.Max(1, float64(iw))
+	if math.Abs(newAspect-p.imgAspect) > 0.01 {
+		p.baseW, p.baseH = p.baseH, p.baseW
+		p.imgAspect = newAspect
+		if p.win != nil {
+			b := p.win.Bounds()
+			nw := max(80, int(math.Round(p.baseW*p.scale)))
+			nh := max(54, int(math.Round(p.baseH*p.scale)))
+			cx := b.X + b.Width/2
+			cy := b.Y + b.Height/2
+			p.win.SetBounds(mygo.Rectangle{
+				X:      cx - nw/2,
+				Y:      cy - nh/2,
+				Width:  nw,
+				Height: nh,
+			})
+		}
+	}
+	p.scrollY = 0
+	p.flashHUD(hudLabel)
+}
+
+func (p *PinWindow) resetTransform() {
+	p.scale = 1.0
+	p.opacity = 1.0
+	p.scrollY = 0
+	if p.win != nil {
+		p.win.SetOpacity(1.0)
+		b := p.win.Bounds()
+		p.win.SetBounds(mygo.Rectangle{X: b.X, Y: b.Y, Width: int(math.Round(p.baseW)), Height: int(math.Round(p.baseH))})
+	}
+	p.flashHUD("重置 100%")
+}
+
+func (p *PinWindow) popupContextMenu() {
+	if p.onContextMenu != nil {
+		p.onContextMenu()
+		return
+	}
+	if p.win == nil {
+		return
+	}
+	clickThroughLabel := "开启鼠标穿透"
+	if p.clickThrough {
+		clickThroughLabel = "关闭鼠标穿透"
+	}
+	menu := mygo.NewMenu([]*mygo.MenuItem{
+		{
+			Label:       "复制图片",
+			Accelerator: "Ctrl+C",
+			Click:       func(*mygo.MenuItem, *mygo.Window) { p.copyImage() },
+		},
+		{
+			Label:       "保存图片",
+			Accelerator: "Ctrl+S",
+			Click:       func(*mygo.MenuItem, *mygo.Window) { p.saveImage() },
+		},
+		{
+			Label: "提取文字 (OCR)",
+			Click: func(*mygo.MenuItem, *mygo.Window) {
+				if img := decodeImageRGBA(p.pngBytes); img != nil {
+					p.app.RecognizeTextFromImage(img)
+				}
+			},
+		},
+		{
+			Label: "在工作台编辑",
+			Click: func(*mygo.MenuItem, *mygo.Window) {
+				if img := decodeImageRGBA(p.pngBytes); img != nil {
+					p.app.OpenImageInEditor(img, "贴图编辑")
+				}
+			},
+		},
+		mygo.Separator(),
+		{
+			Label: "向右旋转 90°",
+			Click: func(*mygo.MenuItem, *mygo.Window) { p.transformImage(rotateRGBA90CW, "已旋转 90°") },
+		},
+		{
+			Label: "水平翻转",
+			Click: func(*mygo.MenuItem, *mygo.Window) { p.transformImage(flipRGBAHorizontal, "已水平翻转") },
+		},
+		{
+			Label: clickThroughLabel,
+			Click: func(*mygo.MenuItem, *mygo.Window) { p.setClickThrough(!p.clickThrough) },
+		},
+		{
+			Label:       "重置 100%",
+			Accelerator: "0",
+			Click:       func(*mygo.MenuItem, *mygo.Window) { p.resetTransform() },
+		},
+		mygo.Separator(),
+		{
+			Label: "隐藏全部贴图",
+			Click: func(*mygo.MenuItem, *mygo.Window) { p.app.SetAllPinsVisible(false) },
+		},
+		{
+			Label:       "关闭当前贴图",
+			Accelerator: "Esc",
+			Click: func(*mygo.MenuItem, *mygo.Window) {
+				if p.win != nil {
+					p.win.Close()
+				}
+			},
+		},
+		{
+			Label: "关闭全部贴图",
+			Click: func(*mygo.MenuItem, *mygo.Window) { p.app.CloseAllPins() },
+		},
+	})
+	menu.Popup(p.win)
+}
+
+// RotateRGBA90CW rotates an RGBA image 90 degrees clockwise.
+func rotateRGBA90CW(src *image.RGBA) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, sh, sw))
+	for y := 0; y < sh; y++ {
+		sRow := y * src.Stride
+		dstX := sh - 1 - y
+		for x := 0; x < sw; x++ {
+			so := sRow + x*4
+			do := x*dst.Stride + dstX*4
+			copy(dst.Pix[do:do+4], src.Pix[so:so+4])
+		}
+	}
+	return dst
+}
+
+// flipRGBAHorizontal mirrors an RGBA image horizontally.
+func flipRGBAHorizontal(src *image.RGBA) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, sw, sh))
+	for y := 0; y < sh; y++ {
+		sRow := y * src.Stride
+		dRow := y * dst.Stride
+		for x := 0; x < sw; x++ {
+			so := sRow + x*4
+			do := dRow + (sw-1-x)*4
+			copy(dst.Pix[do:do+4], src.Pix[so:so+4])
+		}
+	}
+	return dst
+}
+
+// HasPins reports whether any floating pin windows are currently open.
+func (a *App) HasPins() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.pins) > 0
+}
+
+// HasClickThroughPins reports whether any open pin is currently ignoring mouse input.
+func (a *App) HasClickThroughPins() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, p := range a.pins {
+		if p.clickThrough {
+			return true
+		}
+	}
+	return false
+}
+
+// AllPinsHidden reports whether all open pins are currently hidden.
+func (a *App) AllPinsHidden() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.pins) == 0 {
+		return false
+	}
+	for _, p := range a.pins {
+		if !p.hidden {
+			return false
+		}
+	}
+	return true
+}
+
+// SetAllPinsVisible shows or hides every open pin window without destroying it.
+func (a *App) SetAllPinsVisible(visible bool) {
+	a.mu.Lock()
+	pins := append([]*PinWindow(nil), a.pins...)
+	a.mu.Unlock()
+	for _, p := range pins {
+		p.hidden = !visible
+		if p.win != nil {
+			if visible {
+				p.win.ShowInactive()
+			} else {
+				p.win.Hide()
+			}
+		}
+	}
+	a.refreshTrayMenu()
+}
+
+// RestoreAllPinsClickThrough re-enables mouse interaction on every click-through pin.
+func (a *App) RestoreAllPinsClickThrough() {
+	a.mu.Lock()
+	pins := append([]*PinWindow(nil), a.pins...)
+	a.mu.Unlock()
+	for _, p := range pins {
+		if p.clickThrough {
+			p.clickThrough = false
+			if p.win != nil {
+				p.win.SetIgnoreMouseEvents(false)
+			}
+		}
+	}
+	a.refreshTrayMenu()
+	a.NotifyToast("已恢复全部贴图交互")
+}
+
+// CloseAllPins closes all open desktop pin windows.
+func (a *App) CloseAllPins() {
+	a.mu.Lock()
+	pins := append([]*PinWindow(nil), a.pins...)
+	a.mu.Unlock()
+	for _, p := range pins {
+		if p.win != nil {
+			p.win.Close()
+		}
+	}
 }
 
 func (p *PinWindow) flashHUD(text string) {
@@ -204,35 +496,43 @@ func (p *PinWindow) view(c *ui.Context) {
 	if c.Shortcut(ui.Ctrl, ui.KeyC) {
 		p.copyImage()
 	}
+	if c.Shortcut(ui.Ctrl, ui.KeyS) {
+		p.saveImage()
+	}
 	if c.Shortcut(0, ui.Key0) || c.Shortcut(ui.Ctrl, ui.Key0) {
-		p.scale = 1.0
-		p.opacity = 1.0
-		if p.win != nil {
-			p.win.SetOpacity(1.0)
-			b := p.win.Bounds()
-			p.win.SetBounds(mygo.Rectangle{X: b.X, Y: b.Y, Width: int(math.Round(p.baseW)), Height: int(math.Round(p.baseH))})
-		}
-		p.flashHUD("重置 100%")
+		p.resetTransform()
 	}
 
 	outer := ui.Box(c).Fill()
 	hovered := outer.Hovered()
+	p.viewW, p.viewH = c.Size()
 
 	outer.Children(func() {
-		card := ui.Box(c).Absolute().Fill().Background(ui.Hex("#1C1C1E")).DragWindow().Cursor(ui.CursorMove)
+		// IMPORTANT: Never call RightClicked() or Clicked() on this DragWindow element!
+		// In MyGo, RightClicked() sets flagClickable, which disables DragWindow's native
+		// window drag (ui/input.go requires flags&(interactive&^flagDragWindow) == 0).
+		// Right-click is handled inside HandleInput so left-drag moves the pin smoothly.
+		card := ui.Box(c.Key("pin-drag-card")).Absolute().Fill().Background(ui.Hex("#1C1C1E")).DragWindow().Cursor(ui.CursorMove)
 
 		if card.WindowDoubleClicked() {
 			p.copyImage()
 		}
-		if card.RightClicked() {
-			if p.win != nil {
-				p.win.Close()
-			}
-			return
-		}
 
 		card.HandleInput(func(ev ui.InputEvent) bool {
 			switch ev.Kind {
+			case ui.InputPointerDown:
+				if ev.Button == 1 {
+					return true
+				}
+				return false
+			case ui.InputPointerUp:
+				if ev.Button == 1 {
+					if !ev.Canceled {
+						p.popupContextMenu()
+					}
+					return true
+				}
+				return false
 			case ui.InputScroll:
 				if ev.Mods&ui.Alt != 0 {
 					if ev.DY < 0 {
@@ -241,9 +541,8 @@ func (p *PinWindow) view(c *ui.Context) {
 						p.applyOpacityDelta(-0.08)
 					}
 				} else if p.tallScroll && ev.Mods&ui.Ctrl == 0 {
-					b := card.Bounds()
-					contentH := b.W * float32(p.imgAspect)
-					maxScroll := max(float32(0), contentH-b.H)
+					contentH := p.viewW * float32(p.imgAspect)
+					maxScroll := max(float32(0), contentH-p.viewH)
 					p.scrollY = clamp32(p.scrollY+ev.DY, 0, maxScroll)
 				} else if ev.Mods&ui.Ctrl != 0 && !p.tallScroll {
 					if ev.DY < 0 {
@@ -333,12 +632,20 @@ func (p *PinWindow) view(c *ui.Context) {
 				if pinIconBtn(c, icons.Copy, "复制 (Ctrl+C)", false) {
 					p.copyImage()
 				}
+				if pinIconBtn(c, icons.Save, "保存 (Ctrl+S)", false) {
+					p.saveImage()
+				}
+				if pinIconBtn(c, icons.OCR, "提取文字 (OCR)", false) {
+					if img := decodeImageRGBA(p.pngBytes); img != nil {
+						p.app.RecognizeTextFromImage(img)
+					}
+				}
 				if pinIconBtn(c, icons.Pen, "在工作台编辑", false) {
 					if img := decodeImageRGBA(p.pngBytes); img != nil {
 						p.app.OpenImageInEditor(img, "贴图编辑")
 					}
 				}
-				if pinIconBtn(c, icons.Close, "关闭 (Esc / 右键)", true) {
+				if pinIconBtn(c, icons.Close, "关闭 (Esc / 右键菜单)", true) {
 					if p.win != nil {
 						p.win.Close()
 					}

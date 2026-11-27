@@ -373,7 +373,7 @@ func (s *scrollSession) finishSave() {
 	go func() {
 		pngBytes, _ := canvas.EncodePNG(img)
 		app.AddHistoryEntryWithPNG(img, pngBytes, "长截图")
-		app.SaveImageWithDialogPNG(img, pngBytes, nil)
+		app.SaveImagePreferred(img, pngBytes, nil)
 	}()
 }
 

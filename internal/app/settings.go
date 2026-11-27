@@ -16,6 +16,7 @@ type HotkeyAction string
 
 const (
 	HotkeyArea  HotkeyAction = "area"
+	HotkeyLong  HotkeyAction = "long"
 	HotkeyFull  HotkeyAction = "full"
 	HotkeyDelay HotkeyAction = "delay"
 	HotkeyPin   HotkeyAction = "pin"
@@ -24,9 +25,16 @@ const (
 // Default global shortcut accelerators.
 const (
 	DefaultHotkeyArea  = "Ctrl+Shift+A"
+	DefaultHotkeyLong  = "Ctrl+Shift+L"
 	DefaultHotkeyFull  = "Ctrl+Shift+S"
 	DefaultHotkeyDelay = "Ctrl+Shift+D"
 	DefaultHotkeyPin   = "Ctrl+Shift+P"
+)
+
+// Supported export image formats for quick save and default save dialog filter.
+const (
+	SaveFormatPNG  = "png"
+	SaveFormatJPEG = "jpg"
 )
 
 type hotkeyMeta struct {
@@ -37,6 +45,7 @@ type hotkeyMeta struct {
 
 var hotkeyOrder = []hotkeyMeta{
 	{HotkeyArea, "区域截图", DefaultHotkeyArea},
+	{HotkeyLong, "滚动长截图", DefaultHotkeyLong},
 	{HotkeyFull, "全屏截图", DefaultHotkeyFull},
 	{HotkeyDelay, "延时 3 秒截图", DefaultHotkeyDelay},
 	{HotkeyPin, "贴图剪贴板", DefaultHotkeyPin},
@@ -47,9 +56,13 @@ var hotkeyOrder = []hotkeyMeta{
 type persistedSettings struct {
 	DarkMode    *bool   `json:"dark_mode,omitempty"`
 	HotkeyArea  *string `json:"hotkey_area,omitempty"`
+	HotkeyLong  *string `json:"hotkey_long,omitempty"`
 	HotkeyFull  *string `json:"hotkey_full,omitempty"`
 	HotkeyDelay *string `json:"hotkey_delay,omitempty"`
 	HotkeyPin   *string `json:"hotkey_pin,omitempty"`
+	SaveDir     *string `json:"save_dir,omitempty"`
+	SaveFormat  *string `json:"save_format,omitempty"`
+	QuickSave   *bool   `json:"quick_save,omitempty"`
 }
 
 // SetSettingsPath overrides where settings.json is stored (used by tests and startup).
@@ -97,6 +110,9 @@ func (a *App) LoadSettings() error {
 	if ps.HotkeyArea != nil {
 		a.hotkeyArea = strings.TrimSpace(*ps.HotkeyArea)
 	}
+	if ps.HotkeyLong != nil {
+		a.hotkeyLong = strings.TrimSpace(*ps.HotkeyLong)
+	}
 	if ps.HotkeyFull != nil {
 		a.hotkeyFull = strings.TrimSpace(*ps.HotkeyFull)
 	}
@@ -105,6 +121,15 @@ func (a *App) LoadSettings() error {
 	}
 	if ps.HotkeyPin != nil {
 		a.hotkeyPin = strings.TrimSpace(*ps.HotkeyPin)
+	}
+	if ps.SaveDir != nil {
+		a.saveDir = strings.TrimSpace(*ps.SaveDir)
+	}
+	if ps.SaveFormat != nil {
+		a.saveFormat = normalizeSaveFormat(*ps.SaveFormat)
+	}
+	if ps.QuickSave != nil {
+		a.quickSave = *ps.QuickSave
 	}
 	a.mu.Unlock()
 	return nil
@@ -116,9 +141,13 @@ func (a *App) SaveSettings() error {
 	path := a.settingsPath
 	dark := a.darkMode
 	hkArea := a.hotkeyArea
+	hkLong := a.hotkeyLong
 	hkFull := a.hotkeyFull
 	hkDelay := a.hotkeyDelay
 	hkPin := a.hotkeyPin
+	saveDir := a.saveDir
+	saveFmt := normalizeSaveFormat(a.saveFormat)
+	quickSave := a.quickSave
 	a.mu.Unlock()
 
 	if path == "" {
@@ -130,15 +159,120 @@ func (a *App) SaveSettings() error {
 	ps := persistedSettings{
 		DarkMode:    &dark,
 		HotkeyArea:  &hkArea,
+		HotkeyLong:  &hkLong,
 		HotkeyFull:  &hkFull,
 		HotkeyDelay: &hkDelay,
 		HotkeyPin:   &hkPin,
+		SaveDir:     &saveDir,
+		SaveFormat:  &saveFmt,
+		QuickSave:   &quickSave,
 	}
 	data, err := json.MarshalIndent(ps, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+func normalizeSaveFormat(f string) string {
+	switch strings.ToLower(strings.TrimSpace(f)) {
+	case "jpg", "jpeg":
+		return SaveFormatJPEG
+	default:
+		return SaveFormatPNG
+	}
+}
+
+// SaveDir returns the user-configured save directory ("" means system Pictures folder).
+func (a *App) SaveDir() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.saveDir
+}
+
+// EffectiveSaveDir returns the directory used for quick save and Save dialog defaults.
+func (a *App) EffectiveSaveDir() string {
+	a.mu.Lock()
+	dir := a.saveDir
+	a.mu.Unlock()
+	if dir != "" {
+		return dir
+	}
+	if picDir, err := mygo.App.Path(mygo.PathPictures); err == nil && picDir != "" {
+		return picDir
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "Pictures")
+	}
+	return "."
+}
+
+// SetSaveDir updates and persists the default screenshot save directory.
+func (a *App) SetSaveDir(dir string) {
+	a.mu.Lock()
+	a.saveDir = strings.TrimSpace(dir)
+	a.mu.Unlock()
+	_ = a.SaveSettings()
+}
+
+// ChooseSaveDir opens a native folder picker to update SaveDir.
+func (a *App) ChooseSaveDir() {
+	a.mu.Lock()
+	parent := a.editorWin
+	defPath := a.saveDir
+	a.mu.Unlock()
+	if defPath == "" {
+		defPath = a.EffectiveSaveDir()
+	}
+	go func() {
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Parent:      parent,
+			Title:       "选择默认保存目录",
+			DefaultPath: defPath,
+			Directory:   true,
+		})
+		if err != nil || len(paths) == 0 || strings.TrimSpace(paths[0]) == "" {
+			return
+		}
+		a.SetSaveDir(paths[0])
+		a.NotifyToast("保存目录已更新为 " + filepath.Base(paths[0]))
+		a.mu.Lock()
+		w := a.editorWin
+		a.mu.Unlock()
+		if w != nil {
+			w.Update(func() {})
+		}
+	}()
+}
+
+// SaveFormat returns the preferred export format ("png" or "jpg").
+func (a *App) SaveFormat() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return normalizeSaveFormat(a.saveFormat)
+}
+
+// SetSaveFormat updates and persists the preferred export format.
+func (a *App) SetSaveFormat(format string) {
+	a.mu.Lock()
+	a.saveFormat = normalizeSaveFormat(format)
+	a.mu.Unlock()
+	_ = a.SaveSettings()
+}
+
+// QuickSave reports whether saving writes directly to EffectiveSaveDir without a dialog.
+func (a *App) QuickSave() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.quickSave
+}
+
+// SetQuickSave toggles silent quick-save mode and persists the preference.
+func (a *App) SetQuickSave(on bool) {
+	a.mu.Lock()
+	a.quickSave = on
+	a.mu.Unlock()
+	_ = a.SaveSettings()
 }
 
 // Hotkey returns the configured global shortcut accelerator for action ("" if disabled).
@@ -152,6 +286,8 @@ func (a *App) hotkeyLocked(action HotkeyAction) string {
 	switch action {
 	case HotkeyArea:
 		return a.hotkeyArea
+	case HotkeyLong:
+		return a.hotkeyLong
 	case HotkeyFull:
 		return a.hotkeyFull
 	case HotkeyDelay:
@@ -167,6 +303,8 @@ func (a *App) setHotkeyLocked(action HotkeyAction, acc string) {
 	switch action {
 	case HotkeyArea:
 		a.hotkeyArea = acc
+	case HotkeyLong:
+		a.hotkeyLong = acc
 	case HotkeyFull:
 		a.hotkeyFull = acc
 	case HotkeyDelay:
@@ -180,6 +318,8 @@ func (a *App) hotkeyHandler(action HotkeyAction) func() {
 	switch action {
 	case HotkeyArea:
 		return func() { a.StartAreaCapture(false) }
+	case HotkeyLong:
+		return func() { a.StartLongCapture(false) }
 	case HotkeyFull:
 		return func() { a.CaptureFullscreen(false) }
 	case HotkeyDelay:
@@ -239,6 +379,7 @@ func (a *App) reregisterAllGlobalShortcuts() []string {
 		acc    string
 	}{
 		{HotkeyArea, a.hotkeyArea},
+		{HotkeyLong, a.hotkeyLong},
 		{HotkeyFull, a.hotkeyFull},
 		{HotkeyDelay, a.hotkeyDelay},
 		{HotkeyPin, a.hotkeyPin},
@@ -318,10 +459,11 @@ func (a *App) SetHotkey(action HotkeyAction, acc string) error {
 	return nil
 }
 
-// ResetDefaultHotkeys restores all 4 global shortcuts to their default bindings.
+// ResetDefaultHotkeys restores all 5 global shortcuts to their default bindings.
 func (a *App) ResetDefaultHotkeys() error {
 	a.mu.Lock()
 	a.hotkeyArea = DefaultHotkeyArea
+	a.hotkeyLong = DefaultHotkeyLong
 	a.hotkeyFull = DefaultHotkeyFull
 	a.hotkeyDelay = DefaultHotkeyDelay
 	a.hotkeyPin = DefaultHotkeyPin

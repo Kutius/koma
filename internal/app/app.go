@@ -56,6 +56,10 @@ type App struct {
 	quitting      bool
 	activeOverlay *overlaySession
 	activeScroll  *scrollSession
+	toastHUD      *globalToastHUD
+	delayHUD      *delayCountdownHUD
+	delayCancelCh chan struct{}
+	ocrWin        *ocrResultWindow
 	pins          []*PinWindow
 	editor        *EditorState
 	trayTrimTimer *time.Timer
@@ -69,6 +73,9 @@ type App struct {
 	openAtLogin    bool
 	hotkeysPaused  bool
 	delayCountdown int
+	saveDir        string
+	saveFormat     string
+	quickSave      bool
 
 	// Auto-updater state (backed by MyGo's native updater plugin when running)
 	updaterReady     bool
@@ -79,6 +86,7 @@ type App struct {
 
 	// Global hotkey accelerators ("" means disabled)
 	hotkeyArea  string
+	hotkeyLong  string
 	hotkeyFull  string
 	hotkeyDelay string
 	hotkeyPin   string
@@ -89,13 +97,24 @@ func New() *App {
 	a := &App{
 		darkMode:         false, // Crisp Apple Light Studio default (toggleable to Space Graphite Dark)
 		autoCheckUpdates: true,
+		saveFormat:       SaveFormatPNG,
 		hotkeyArea:       DefaultHotkeyArea,
+		hotkeyLong:       DefaultHotkeyLong,
 		hotkeyFull:       DefaultHotkeyFull,
 		hotkeyDelay:      DefaultHotkeyDelay,
 		hotkeyPin:        DefaultHotkeyPin,
 	}
+	a.toastHUD = newGlobalToastHUD(a)
+	a.delayHUD = newDelayCountdownHUD(a)
 	a.editor = NewEditorState(a)
 	return a
+}
+
+// IsDarkMode reports whether Koma is currently using dark appearance.
+func (a *App) IsDarkMode() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.darkMode
 }
 
 // Run starts the Koma desktop application lifecycle.
@@ -144,15 +163,16 @@ func (a *App) Run() error {
 }
 
 func (a *App) buildTrayMenu() *mygo.Menu {
-	return mygo.NewMenu([]*mygo.MenuItem{
+	items := []*mygo.MenuItem{
 		{
 			Label:       "区域截图",
 			Accelerator: a.Hotkey(HotkeyArea),
 			Click:       func(*mygo.MenuItem, *mygo.Window) { a.StartAreaCapture(true) },
 		},
 		{
-			Label: "长截图",
-			Click: func(*mygo.MenuItem, *mygo.Window) { a.StartLongCapture(true) },
+			Label:       "长截图",
+			Accelerator: a.Hotkey(HotkeyLong),
+			Click:       func(*mygo.MenuItem, *mygo.Window) { a.StartLongCapture(true) },
 		},
 		{
 			Label:       "全屏截图",
@@ -170,24 +190,53 @@ func (a *App) buildTrayMenu() *mygo.Menu {
 			Accelerator: a.Hotkey(HotkeyPin),
 			Click:       func(*mygo.MenuItem, *mygo.Window) { a.PinFromClipboard() },
 		},
-		{
+	}
+
+	if a.HasPins() {
+		if a.HasClickThroughPins() {
+			items = append(items, &mygo.MenuItem{
+				Label: "恢复全部贴图穿透",
+				Click: func(*mygo.MenuItem, *mygo.Window) { a.RestoreAllPinsClickThrough() },
+			})
+		}
+		if a.AllPinsHidden() {
+			items = append(items, &mygo.MenuItem{
+				Label: "显示全部贴图",
+				Click: func(*mygo.MenuItem, *mygo.Window) { a.SetAllPinsVisible(true) },
+			})
+		} else {
+			items = append(items, &mygo.MenuItem{
+				Label: "隐藏全部贴图",
+				Click: func(*mygo.MenuItem, *mygo.Window) { a.SetAllPinsVisible(false) },
+			})
+		}
+		items = append(items, &mygo.MenuItem{
+			Label: "关闭全部贴图",
+			Click: func(*mygo.MenuItem, *mygo.Window) { a.CloseAllPins() },
+		})
+	}
+
+	items = append(items,
+		mygo.Separator(),
+		&mygo.MenuItem{
 			Label: "打开 Koma",
 			Click: func(*mygo.MenuItem, *mygo.Window) { a.ShowEditor() },
 		},
-		{
+		&mygo.MenuItem{
 			Label: "设置…",
 			Click: func(*mygo.MenuItem, *mygo.Window) { a.ShowSettings() },
 		},
-		{
+		&mygo.MenuItem{
 			Label: a.trayUpdateLabel(),
 			Click: func(*mygo.MenuItem, *mygo.Window) { a.CheckForUpdates() },
 		},
 		mygo.Separator(),
-		{
+		&mygo.MenuItem{
 			Label: "退出 Koma",
 			Click: func(*mygo.MenuItem, *mygo.Window) { a.Quit() },
 		},
-	})
+	)
+	return mygo.NewMenu(items)
 }
 
 func (a *App) trayTooltip() string {
@@ -294,16 +343,28 @@ func (a *App) ensureEditorWindow() *mygo.Window {
 	return a.openEditorWindow()
 }
 
-// Quit exits Koma cleanly, closing Studio, overlays, and pins.
+// Quit exits Koma cleanly, closing Studio, overlays, HUDs, OCR windows, and pins.
 func (a *App) Quit() {
+	a.CancelDelayedCapture()
+
 	a.mu.Lock()
 	a.quitting = true
 	ov := a.activeOverlay
 	sc := a.activeScroll
 	edWin := a.editorWin
+	ocrW := a.ocrWin
 	pins := append([]*PinWindow(nil), a.pins...)
 	a.mu.Unlock()
 
+	if a.toastHUD != nil {
+		a.toastHUD.Close()
+	}
+	if a.delayHUD != nil {
+		a.delayHUD.Close()
+	}
+	if ocrW != nil {
+		ocrW.Close()
+	}
 	if ov != nil {
 		ov.closeAll()
 	}
@@ -418,7 +479,7 @@ func (a *App) scheduleTrayTrim() {
 	a.trayTrimTimer = time.AfterFunc(delay, func() {
 		a.mu.Lock()
 		a.trayTrimTimer = nil
-		idleInTray := !a.quitting && a.editorWin == nil && a.activeOverlay == nil && a.activeScroll == nil && len(a.pins) == 0
+		idleInTray := !a.quitting && a.editorWin == nil && a.activeOverlay == nil && a.activeScroll == nil && a.ocrWin == nil && len(a.pins) == 0 && (a.toastHUD == nil || !a.toastHUD.Active())
 		a.mu.Unlock()
 		if !idleInTray {
 			return
@@ -482,7 +543,28 @@ func (a *App) CaptureFullscreen(hideEditorFirst bool) {
 	}()
 }
 
-// StartDelayedCapture counts down N seconds then launches the QQ-style area overlay.
+// CancelDelayedCapture aborts an in-flight delayed capture countdown cleanly.
+func (a *App) CancelDelayedCapture() {
+	a.mu.Lock()
+	ch := a.delayCancelCh
+	a.delayCancelCh = nil
+	a.delayCountdown = 0
+	w := a.editorWin
+	a.mu.Unlock()
+
+	if ch != nil {
+		close(ch)
+	}
+	if a.delayHUD != nil {
+		a.delayHUD.Close()
+	}
+	if w != nil {
+		w.Update(func() {})
+	}
+}
+
+// StartDelayedCapture counts down N seconds (showing a floating Liquid Glass
+// countdown pill even when Studio is closed in tray) then launches area capture.
 func (a *App) StartDelayedCapture(seconds int) {
 	if seconds <= 0 {
 		a.StartAreaCapture(true)
@@ -493,7 +575,9 @@ func (a *App) StartDelayedCapture(seconds int) {
 		a.mu.Unlock()
 		return
 	}
+	cancelCh := make(chan struct{})
 	a.delayCountdown = seconds
+	a.delayCancelCh = cancelCh
 	w := a.editorWin
 	a.mu.Unlock()
 
@@ -505,14 +589,29 @@ func (a *App) StartDelayedCapture(seconds int) {
 			if w != nil {
 				w.Update(func() {})
 			}
-			time.Sleep(time.Second)
+			if a.delayHUD != nil {
+				a.delayHUD.Show(s, a.CancelDelayedCapture)
+			}
+			select {
+			case <-cancelCh:
+				return
+			case <-time.After(time.Second):
+			}
 		}
 		a.mu.Lock()
+		if a.delayCancelCh == cancelCh {
+			a.delayCancelCh = nil
+		}
 		a.delayCountdown = 0
 		a.mu.Unlock()
+		if a.delayHUD != nil {
+			a.delayHUD.Close()
+		}
 		if w != nil {
 			w.Update(func() {})
 		}
+		// Give DWM a brief frame so the countdown HUD is gone before grabbing monitors.
+		sleepMs(80)
 		a.StartAreaCapture(true)
 	}()
 }
@@ -706,6 +805,68 @@ func (a *App) LoadFilePath(path string) {
 	a.OpenImageInEditor(rgba, filepath.Base(path))
 }
 
+// SaveImagePreferred saves img either silently to EffectiveSaveDir (when QuickSave
+// is enabled) or via the native Save dialog pre-seeded with the user's preferred folder & format.
+func (a *App) SaveImagePreferred(img *image.RGBA, pngBytes []byte, parent *mygo.Window) {
+	if img == nil {
+		return
+	}
+	if a.QuickSave() {
+		path, err := a.QuickSaveImage(img, pngBytes)
+		if err != nil {
+			a.NotifyToast("快速保存失败")
+			return
+		}
+		a.NotifyToast("已快速保存 " + filepath.Base(path))
+		return
+	}
+	a.SaveImageWithDialogPNG(img, pngBytes, parent)
+}
+
+// QuickSaveImage encodes and writes img directly into EffectiveSaveDir using the
+// configured SaveFormat without prompting for a dialog, returning the written path.
+func (a *App) QuickSaveImage(img *image.RGBA, pngBytes []byte) (string, error) {
+	if img == nil {
+		return "", fmt.Errorf("koma: nil image")
+	}
+	dir := a.EffectiveSaveDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	format := a.SaveFormat()
+	ext := ".png"
+	if format == SaveFormatJPEG {
+		ext = ".jpg"
+	}
+	stamp := time.Now().Format("20060102_150405")
+	savePath := filepath.Join(dir, fmt.Sprintf("Koma_%s%s", stamp, ext))
+	for i := 1; i < 100; i++ {
+		if _, err := os.Stat(savePath); os.IsNotExist(err) {
+			break
+		}
+		savePath = filepath.Join(dir, fmt.Sprintf("Koma_%s_%d%s", stamp, i, ext))
+	}
+
+	var (
+		encoded []byte
+		err     error
+	)
+	if format == SaveFormatJPEG {
+		encoded, err = canvas.EncodeJPEG(img, 93)
+	} else if len(pngBytes) > 0 {
+		encoded = pngBytes
+	} else {
+		encoded, err = canvas.EncodePNG(img)
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(savePath, encoded, 0o644); err != nil {
+		return "", err
+	}
+	return savePath, nil
+}
+
 // SaveImageWithDialog opens a native Save dialog and writes PNG or JPEG.
 func (a *App) SaveImageWithDialog(img *image.RGBA, parent *mygo.Window) {
 	a.SaveImageWithDialogPNG(img, nil, parent)
@@ -717,32 +878,44 @@ func (a *App) SaveImageWithDialogPNG(img *image.RGBA, pngBytes []byte, parent *m
 	if img == nil {
 		return
 	}
-	defaultName := fmt.Sprintf("Koma_%s.png", time.Now().Format("20060102_150405"))
-	if picDir, err := mygo.App.Path(mygo.PathPictures); err == nil && picDir != "" {
-		defaultName = filepath.Join(picDir, defaultName)
+	format := a.SaveFormat()
+	ext := ".png"
+	filters := []mygo.FileFilter{
+		{Name: "PNG 图片", Extensions: []string{"png"}},
+		{Name: "JPEG 图片", Extensions: []string{"jpg", "jpeg"}},
+	}
+	if format == SaveFormatJPEG {
+		ext = ".jpg"
+		filters = []mygo.FileFilter{
+			{Name: "JPEG 图片", Extensions: []string{"jpg", "jpeg"}},
+			{Name: "PNG 图片", Extensions: []string{"png"}},
+		}
+	}
+	defaultName := fmt.Sprintf("Koma_%s%s", time.Now().Format("20060102_150405"), ext)
+	if dir := a.EffectiveSaveDir(); dir != "" {
+		defaultName = filepath.Join(dir, defaultName)
 	}
 	savePath, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
 		Parent:      parent,
 		Title:       "保存截图",
 		DefaultPath: defaultName,
-		Filters: []mygo.FileFilter{
-			{Name: "PNG 图片", Extensions: []string{"png"}},
-			{Name: "JPEG 图片", Extensions: []string{"jpg", "jpeg"}},
-		},
+		Filters:     filters,
 	})
 	if err != nil || savePath == "" {
 		return
 	}
 
 	var encoded []byte
-	ext := strings.ToLower(filepath.Ext(savePath))
-	if ext == ".jpg" || ext == ".jpeg" {
+	chosenExt := strings.ToLower(filepath.Ext(savePath))
+	if chosenExt == ".jpg" || chosenExt == ".jpeg" {
 		encoded, err = canvas.EncodeJPEG(img, 93)
 	} else {
-		if ext == "" {
-			savePath += ".png"
+		if chosenExt == "" {
+			savePath += ext
 		}
-		if len(pngBytes) > 0 {
+		if strings.HasSuffix(strings.ToLower(savePath), ".jpg") {
+			encoded, err = canvas.EncodeJPEG(img, 93)
+		} else if len(pngBytes) > 0 {
 			encoded = pngBytes
 		} else {
 			encoded, err = canvas.EncodePNG(img)
@@ -759,15 +932,21 @@ func (a *App) SaveImageWithDialogPNG(img *image.RGBA, pngBytes []byte, parent *m
 	a.NotifyToast("已保存 " + filepath.Base(savePath))
 }
 
-// NotifyToast shows a calm floating Liquid Glass toast inside Studio.
+// NotifyToast shows a calm floating Liquid Glass toast inside Studio, or falls
+// back to a transient global Liquid Glass HUD pill when Studio is closed in tray.
 func (a *App) NotifyToast(msg string) {
 	a.mu.Lock()
 	w := a.editorWin
+	hidden := a.editorHidden
 	a.mu.Unlock()
-	if w != nil {
+	if w != nil && !hidden {
 		w.Update(func() {
 			a.editor.SetToast(msg)
 		})
+		return
+	}
+	if a.toastHUD != nil {
+		a.toastHUD.Show(msg)
 	}
 }
 

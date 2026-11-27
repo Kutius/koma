@@ -58,7 +58,7 @@ go tool mygo build
 
 Build outputs:
 - `build/windows-amd64/Koma.exe` (standalone native executable)
-- `build/windows-amd64/koma-setup-0.2.1-amd64.exe` (Windows installer)
+- `build/windows-amd64/koma-setup-0.3.0-amd64.exe` (Windows installer)
 
 ---
 
@@ -114,6 +114,7 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 - **Overlay surface & floating toolbars MUST be siblings**, never parent/child, inside a root `ui.Box(c).Fill()`. If a toolbar is placed inside `surface.Children(...)`, `surface.HandleInput` consumes `InputPointerDown` and resets/unmounts the toolbar before button `.Clicked()` can fire.
 - Call `bar.Clicked()` on every floating glass bar (`qq-main-bar`, `qq-sub-bar`, `leftCap`, `rightCap`, `dock`, `studio-sub-pill`, `pin-action-bar`) to absorb stray clicks on padding/gaps so they never leak to the canvas or drag strip underneath.
 - In `editor.go`, the top `DragWindow()` strip must sit **before** (underneath) the top floating glass capsules so empty center space drags the window while capsule buttons capture clicks cleanly.
+- **Never call `.RightClicked()` or `.Clicked()` on a `.DragWindow()` element** (`pin.go`, `ocr.go`, `editor.go`): MyGo's `RightClicked()` sets `flagClickable`, which blocks `DragWindow()`'s native `startDrag()` check (`flags&(interactive&^flagDragWindow) == 0`). Handle right-click inside `.HandleInput` (`ev.Button == 1`) while returning `false` on left-button presses so native window dragging stays intact.
 
 ### 4.2 Fullscreen Overlay Toolbar Containment (`overlay.go`)
 - `ComputeToolbarLayout` positions the QQ toolbar in priority order: (1) below selection, (2) above selection, (3) docked inside the bottom of the selection (for near-fullscreen / 100% fullscreen selections).
@@ -157,4 +158,4 @@ Read these rules carefully before modifying UI, shaders, overlays, or lifecycle 
 
 1. Run `go test -v -count=1 ./...` and ensure all packages (`koma`, `app`, `canvas`, `stitch`, `glasswork`, `winapi`) pass.
 2. When modifying UI, shaders, icons, or layout, dump previews via `KOMA_PREVIEW_DIR` and visually inspect the rendered PNGs (`Home`, `QQ overlay`, `100% fullscreen overlay`, `Studio`, `Scroll overlay`) to check contrast, alignment, icon z-order, and absence of border/clip artifacts.
-3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.2.1-amd64.exe` compile cleanly.
+3. Stop any background `Koma` tray process and run `go tool mygo build` to confirm both `Koma.exe` and `koma-setup-0.3.0-amd64.exe` compile cleanly.
