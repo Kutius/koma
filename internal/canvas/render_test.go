@@ -35,3 +35,123 @@ func TestRenderComposite(t *testing.T) {
 		t.Fatalf("EncodePNG failed: err=%v len=%d", err, len(pngBytes))
 	}
 }
+
+func TestOptimizedBlurAccuracyAndEdges(t *testing.T) {
+	// Uniform mid-tone and pure white at max radius (40) must not drift or wrap uint8.
+	for _, tc := range []struct {
+		name   string
+		col    color.RGBA
+		radius int
+	}{
+		{"midtone", color.RGBA{120, 180, 60, 255}, 16},
+		{"white_max_radius", color.RGBA{255, 255, 255, 255}, 40},
+		{"black_max_radius", color.RGBA{0, 0, 0, 255}, 40},
+	} {
+		img := image.NewRGBA(image.Rect(0, 0, 128, 96))
+		for i := 0; i < len(img.Pix); i += 4 {
+			img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = tc.col.R, tc.col.G, tc.col.B, 255
+		}
+		applyBlur(img, image.Rect(10, 10, 118, 86), tc.radius)
+		px := img.RGBAAt(64, 48)
+		if absDiffU8(px.R, tc.col.R) > 1 || absDiffU8(px.G, tc.col.G) > 1 || absDiffU8(px.B, tc.col.B) > 1 {
+			t.Fatalf("%s: blur drifted to %+v, want ~%+v", tc.name, px, tc.col)
+		}
+	}
+
+	// Narrow 2x2 region with radius larger than width/height must not panic.
+	tiny := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	applyBlur(tiny, image.Rect(4, 4, 6, 6), 40)
+}
+
+func TestMakeThumbnailExtremeAspectAndSubImage(t *testing.T) {
+	// Extreme narrow/tall strip where dw clamps to 1 (sw*scale < 0.5) must not
+	// underflow fixed-point weight (256 - fx).
+	for _, dims := range [][2]int{{50, 16000}, {16000, 50}} {
+		src := image.NewRGBA(image.Rect(0, 0, dims[0], dims[1]))
+		for i := 0; i < len(src.Pix); i += 4 {
+			src.Pix[i], src.Pix[i+1], src.Pix[i+2], src.Pix[i+3] = 40, 140, 220, 255
+		}
+		th := MakeThumbnail(src, 240, 150)
+		if th == nil {
+			t.Fatalf("MakeThumbnail(%dx%d) returned nil", dims[0], dims[1])
+		}
+		px := th.RGBAAt(0, 0)
+		if px.R != 40 || px.G != 140 || px.B != 220 || px.A != 255 {
+			t.Fatalf("MakeThumbnail(%dx%d) corrupted uniform pixel: got %+v, want (40,140,220,255)", dims[0], dims[1], px)
+		}
+	}
+
+	// SubImage with non-zero Rect.Min must work cleanly in CloneRGBA and MakeThumbnail.
+	parent := image.NewRGBA(image.Rect(0, 0, 200, 200))
+	for y := 0; y < 200; y++ {
+		for x := 0; x < 200; x++ {
+			c := color.RGBA{10, 20, 30, 255}
+			if x >= 60 && x < 180 && y >= 50 && y < 170 {
+				c = color.RGBA{200, 100, 50, 255}
+			}
+			parent.SetRGBA(x, y, c)
+		}
+	}
+	sub := parent.SubImage(image.Rect(60, 50, 180, 170)).(*image.RGBA)
+	cloned := CloneRGBA(sub)
+	if cloned.Bounds().Dx() != 120 || cloned.Bounds().Dy() != 120 {
+		t.Fatalf("CloneRGBA(sub) bounds = %v", cloned.Bounds())
+	}
+	if px := cloned.RGBAAt(0, 0); px != (color.RGBA{200, 100, 50, 255}) {
+		t.Fatalf("CloneRGBA(sub) pixel (0,0) = %+v, want (200,100,50,255)", px)
+	}
+	th := MakeThumbnail(sub, 40, 40)
+	if px := th.RGBAAt(20, 20); px != (color.RGBA{200, 100, 50, 255}) {
+		t.Fatalf("MakeThumbnail(sub) pixel = %+v, want (200,100,50,255)", px)
+	}
+}
+
+func TestApplySpotlightsOver16Intervals(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 420, 40))
+	for i := 0; i < len(img.Pix); i += 4 {
+		img.Pix[i], img.Pix[i+1], img.Pix[i+2], img.Pix[i+3] = 200, 200, 200, 255
+	}
+	// Place 20 distinct spotlights across the same scanline (exceeds 16-slot stack fast path).
+	var rects []image.Rectangle
+	for i := 0; i < 20; i++ {
+		x0 := 5 + i*20
+		rects = append(rects, image.Rect(x0, 5, x0+10, 35))
+	}
+	applySpotlights(img, rects)
+
+	// Spotlight #19 (index 18, x=365..375) must remain undimmed!
+	if px := img.RGBAAt(370, 20); px.R != 200 {
+		t.Fatalf("spotlight #19 was unexpectedly dimmed: got %+v, want R=200", px)
+	}
+	// Outside region must be dimmed (~75).
+	if px := img.RGBAAt(0, 20); px.R < 70 || px.R > 82 {
+		t.Fatalf("exterior dim unexpected: got %+v, want R~75", px)
+	}
+}
+
+func TestBlendOverExactDiv255(t *testing.T) {
+	dst := image.NewRGBA(image.Rect(0, 0, 256, 1))
+	src := image.NewRGBA(image.Rect(0, 0, 256, 1))
+	for a := 0; a < 256; a++ {
+		dst.SetRGBA(a, 0, color.RGBA{180, 120, 60, 255})
+		src.SetRGBA(a, 0, color.RGBA{uint8(a / 2), uint8(a / 3), uint8(a / 4), uint8(a)})
+	}
+	blendOver(dst, src)
+	for a := 1; a < 255; a++ {
+		inv := uint32(255 - a)
+		wantR := min(255, uint32(a/2)+(180*inv)/255)
+		wantG := min(255, uint32(a/3)+(120*inv)/255)
+		wantB := min(255, uint32(a/4)+(60*inv)/255)
+		got := dst.RGBAAt(a, 0)
+		if uint32(got.R) != wantR || uint32(got.G) != wantG || uint32(got.B) != wantB {
+			t.Fatalf("alpha=%d: got %+v, want (%d,%d,%d)", a, got, wantR, wantG, wantB)
+		}
+	}
+}
+
+func absDiffU8(a, b uint8) uint8 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
+}

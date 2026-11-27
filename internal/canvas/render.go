@@ -10,9 +10,78 @@ import (
 	"image/png"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/egoist/mygo/ui"
 )
+
+// pngBufPool reuses png.EncoderBuffer instances across EncodePNG calls to cut
+// per-screenshot zlib compression scratch allocations.
+type pngBufPool struct {
+	pool sync.Pool
+}
+
+func (p *pngBufPool) Get() *png.EncoderBuffer {
+	if v := p.pool.Get(); v != nil {
+		return v.(*png.EncoderBuffer)
+	}
+	return nil
+}
+
+func (p *pngBufPool) Put(b *png.EncoderBuffer) {
+	if b != nil {
+		p.pool.Put(b)
+	}
+}
+
+var sharedPNGBufPool = &pngBufPool{}
+
+// blurScratch holds reusable buffers for applyBlur so repeated blurs avoid
+// multi-MB heap churn.
+type blurScratch struct {
+	bufA   []uint8
+	bufB   []uint8
+	colSum []int32
+}
+
+var blurScratchPool = sync.Pool{
+	New: func() any { return &blurScratch{} },
+}
+
+func getBlurScratch(pixels, width int) *blurScratch {
+	sc := blurScratchPool.Get().(*blurScratch)
+	need := pixels * 3
+	if cap(sc.bufA) < need {
+		sc.bufA = make([]uint8, need)
+	} else {
+		sc.bufA = sc.bufA[:need]
+	}
+	if cap(sc.bufB) < need {
+		sc.bufB = make([]uint8, need)
+	} else {
+		sc.bufB = sc.bufB[:need]
+	}
+	colNeed := width * 3
+	if cap(sc.colSum) < colNeed {
+		sc.colSum = make([]int32, colNeed)
+	} else {
+		sc.colSum = sc.colSum[:colNeed]
+	}
+	return sc
+}
+
+func putBlurScratch(sc *blurScratch) {
+	// Cap per-buffer retention (6 MiB each -> <= 12 MiB total) so extreme 4K+
+	// scratch buffers are released immediately instead of lingering in the pool.
+	const maxPooledBytes = 6 << 20
+	if cap(sc.bufA) > maxPooledBytes || cap(sc.bufB) > maxPooledBytes {
+		sc.bufA = nil
+		sc.bufB = nil
+		sc.colSum = nil
+		return
+	}
+	blurScratchPool.Put(sc)
+}
 
 // CloneRGBA returns an independent copy of src.
 func CloneRGBA(src *image.RGBA) *image.RGBA {
@@ -20,11 +89,22 @@ func CloneRGBA(src *image.RGBA) *image.RGBA {
 		return nil
 	}
 	b := src.Bounds()
-	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	for y := 0; y < b.Dy(); y++ {
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	if w <= 0 || h <= 0 {
+		return dst
+	}
+	// Note: in Go's image.RGBA, SubImage already advances src.Pix to Rect.Min,
+	// so pixel (b.Min.X, b.Min.Y) is always at src.Pix[0].
+	if src.Stride == dst.Stride {
+		copy(dst.Pix, src.Pix[:h*dst.Stride])
+		return dst
+	}
+	rowBytes := w * 4
+	for y := 0; y < h; y++ {
 		sOff := y * src.Stride
 		dOff := y * dst.Stride
-		copy(dst.Pix[dOff:dOff+b.Dx()*4], src.Pix[sOff:sOff+b.Dx()*4])
+		copy(dst.Pix[dOff:dOff+rowBytes], src.Pix[sOff:sOff+rowBytes])
 	}
 	return dst
 }
@@ -103,10 +183,18 @@ func RenderComposite(base *image.RGBA, anns []Annotation) *image.RGBA {
 	return out
 }
 
-// EncodePNG encodes img to PNG bytes.
+// EncodePNG encodes img to PNG bytes using a pooled encoder buffer.
 func EncodePNG(img image.Image) ([]byte, error) {
 	var buf bytes.Buffer
-	enc := png.Encoder{CompressionLevel: png.DefaultCompression}
+	if b := img.Bounds(); b.Dx() > 0 && b.Dy() > 0 {
+		// Pre-size modestly (~12% of pixel count, capped at 256 KiB) so returned
+		// PNG slices retained in history never pin oversized backing arrays.
+		buf.Grow(min(b.Dx()*b.Dy()/8, 256<<10))
+	}
+	enc := png.Encoder{
+		CompressionLevel: png.DefaultCompression,
+		BufferPool:       sharedPNGBufPool,
+	}
 	if err := enc.Encode(&buf, img); err != nil {
 		return nil, err
 	}
@@ -125,7 +213,8 @@ func EncodeJPEG(img image.Image, quality int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// MakeThumbnail creates a crisp bilinear-downsampled thumbnail fitting inside maxW x maxH.
+// MakeThumbnail creates a crisp bilinear-downsampled thumbnail fitting inside maxW x maxH
+// using precomputed fixed-point horizontal lookup tables (zero per-pixel float math).
 func MakeThumbnail(src *image.RGBA, maxW, maxH int) *image.RGBA {
 	if src == nil || maxW <= 0 || maxH <= 0 {
 		return nil
@@ -141,46 +230,89 @@ func MakeThumbnail(src *image.RGBA, maxW, maxH int) *image.RGBA {
 	dw := max(1, int(math.Round(float64(sw)*scale)))
 	dh := max(1, int(math.Round(float64(sh)*scale)))
 	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
-	for y := 0; y < dh; y++ {
-		sy := (float64(y) + 0.5) / scale
-		y0 := clampInt(int(math.Floor(sy)), 0, sh-1)
-		y1 := clampInt(y0+1, 0, sh-1)
-		fy := sy - float64(y0)
-		for x := 0; x < dw; x++ {
-			sx := (float64(x) + 0.5) / scale
-			x0 := clampInt(int(math.Floor(sx)), 0, sw-1)
-			x1 := clampInt(x0+1, 0, sw-1)
-			fx := sx - float64(x0)
 
-			o00 := y0*src.Stride + x0*4
-			o10 := y0*src.Stride + x1*4
-			o01 := y1*src.Stride + x0*4
-			o11 := y1*src.Stride + x1*4
-			do := y*dst.Stride + x*4
-			for c := 0; c < 3; c++ {
-				top := float64(src.Pix[o00+c])*(1-fx) + float64(src.Pix[o10+c])*fx
-				bot := float64(src.Pix[o01+c])*(1-fx) + float64(src.Pix[o11+c])*fx
-				dst.Pix[do+c] = uint8(math.Round(top*(1-fy) + bot*fy))
-			}
-			dst.Pix[do+3] = 255
+	// Precompute X lookup tables once per call. Clamp sx/sy to [0, dim-1] so
+	// extreme aspect ratios (where dw or dh clamps to 1) never underflow 256-fx.
+	// Note: src.Pix[0] is always (b.Min.X, b.Min.Y), even for SubImages.
+	x0Tab := make([]int, dw)
+	x1Tab := make([]int, dw)
+	fxTab := make([]uint32, dw)
+	invScale := 1.0 / scale
+	maxSX := float64(sw - 1)
+	maxSY := float64(sh - 1)
+	for x := 0; x < dw; x++ {
+		sx := (float64(x) + 0.5) * invScale
+		if sx < 0 {
+			sx = 0
+		} else if sx > maxSX {
+			sx = maxSX
+		}
+		ix := int(sx)
+		ix1 := min(ix+1, sw-1)
+		x0Tab[x] = ix * 4
+		x1Tab[x] = ix1 * 4
+		fxTab[x] = uint32(math.Round((sx - float64(ix)) * 256))
+	}
+
+	sPix := src.Pix
+	dPix := dst.Pix
+	sStride := src.Stride
+	dStride := dst.Stride
+
+	for y := 0; y < dh; y++ {
+		sy := (float64(y) + 0.5) * invScale
+		if sy < 0 {
+			sy = 0
+		} else if sy > maxSY {
+			sy = maxSY
+		}
+		iy := int(sy)
+		iy1 := min(iy+1, sh-1)
+		fy := uint32(math.Round((sy - float64(iy)) * 256))
+		ify := 256 - fy
+
+		sRow0 := iy * sStride
+		sRow1 := iy1 * sStride
+		dRow := y * dStride
+
+		for x := 0; x < dw; x++ {
+			fx := fxTab[x]
+			ifx := 256 - fx
+			w00 := ifx * ify
+			w10 := fx * ify
+			w01 := ifx * fy
+			w11 := fx * fy
+
+			o00 := sRow0 + x0Tab[x]
+			o10 := sRow0 + x1Tab[x]
+			o01 := sRow1 + x0Tab[x]
+			o11 := sRow1 + x1Tab[x]
+			do := dRow + x*4
+
+			dPix[do+0] = uint8((uint32(sPix[o00+0])*w00 + uint32(sPix[o10+0])*w10 + uint32(sPix[o01+0])*w01 + uint32(sPix[o11+0])*w11 + 32768) >> 16)
+			dPix[do+1] = uint8((uint32(sPix[o00+1])*w00 + uint32(sPix[o10+1])*w10 + uint32(sPix[o01+1])*w01 + uint32(sPix[o11+1])*w11 + 32768) >> 16)
+			dPix[do+2] = uint8((uint32(sPix[o00+2])*w00 + uint32(sPix[o10+2])*w10 + uint32(sPix[o01+2])*w01 + uint32(sPix[o11+2])*w11 + 32768) >> 16)
+			dPix[do+3] = 255
 		}
 	}
 	return dst
 }
 
 func applyPixelate(img *image.RGBA, r image.Rectangle, blockSize int) {
+	pix := img.Pix
+	stride := img.Stride
 	for by := r.Min.Y; by < r.Max.Y; by += blockSize {
 		yEnd := min(by+blockSize, r.Max.Y)
 		for bx := r.Min.X; bx < r.Max.X; bx += blockSize {
 			xEnd := min(bx+blockSize, r.Max.X)
 			var sr, sg, sb, cnt int
 			for y := by; y < yEnd; y++ {
-				row := y * img.Stride
+				row := y * stride
 				for x := bx; x < xEnd; x++ {
 					off := row + x*4
-					sr += int(img.Pix[off])
-					sg += int(img.Pix[off+1])
-					sb += int(img.Pix[off+2])
+					sr += int(pix[off])
+					sg += int(pix[off+1])
+					sb += int(pix[off+2])
 					cnt++
 				}
 			}
@@ -189,20 +321,22 @@ func applyPixelate(img *image.RGBA, r image.Rectangle, blockSize int) {
 			}
 			ar, ag, ab := uint8(sr/cnt), uint8(sg/cnt), uint8(sb/cnt)
 			for y := by; y < yEnd; y++ {
-				row := y * img.Stride
+				row := y * stride
 				for x := bx; x < xEnd; x++ {
 					off := row + x*4
-					img.Pix[off] = ar
-					img.Pix[off+1] = ag
-					img.Pix[off+2] = ab
-					img.Pix[off+3] = 255
+					pix[off] = ar
+					pix[off+1] = ag
+					pix[off+2] = ab
+					pix[off+3] = 255
 				}
 			}
 		}
 	}
 }
 
-// applyBlur runs a fast 3-pass separable box blur inside r (Gaussian approximation).
+// applyBlur runs a cache-friendly, pooled 3-pass separable box blur inside r
+// (Gaussian approximation) with fixed-point reciprocal scaling and row-major
+// vertical accumulation.
 func applyBlur(img *image.RGBA, r image.Rectangle, radius int) {
 	w, h := r.Dx(), r.Dy()
 	if w <= 1 || h <= 1 || radius <= 0 {
@@ -211,140 +345,243 @@ func applyBlur(img *image.RGBA, r image.Rectangle, radius int) {
 	if radius > 40 {
 		radius = 40
 	}
-	// Work in a tight temporary buffer for cache locality.
-	bufA := make([]uint8, w*h*3)
-	bufB := make([]uint8, w*h*3)
+
+	sc := getBlurScratch(w*h, w)
+	defer putBlurScratch(sc)
+	bufA := sc.bufA
+	bufB := sc.bufB
+	colSum := sc.colSum
+
+	rowW3 := w * 3
+	pix := img.Pix
+	stride := img.Stride
+
+	// Pack RGB region into tight contiguous buffer.
 	for y := 0; y < h; y++ {
-		sRow := (r.Min.Y + y) * img.Stride
-		dRow := y * w * 3
+		sRow := (r.Min.Y+y)*stride + r.Min.X*4
+		dRow := y * rowW3
 		for x := 0; x < w; x++ {
-			so := sRow + (r.Min.X+x)*4
+			so := sRow + x*4
 			do := dRow + x*3
-			bufA[do] = img.Pix[so]
-			bufA[do+1] = img.Pix[so+1]
-			bufA[do+2] = img.Pix[so+2]
+			bufA[do] = pix[so]
+			bufA[do+1] = pix[so+1]
+			bufA[do+2] = pix[so+2]
 		}
 	}
 
 	rad := max(1, radius/2)
-	for pass := 0; pass < 3; pass++ {
-		// Horizontal pass: bufA -> bufB
-		for y := 0; y < h; y++ {
-			row := y * w * 3
-			var sr, sg, sb int
-			win := rad*2 + 1
-			for k := -rad; k <= rad; k++ {
-				cx := clampInt(k, 0, w-1)
-				o := row + cx*3
-				sr += int(bufA[o])
-				sg += int(bufA[o+1])
-				sb += int(bufA[o+2])
-			}
-			for x := 0; x < w; x++ {
-				do := row + x*3
-				bufB[do] = uint8(sr / win)
-				bufB[do+1] = uint8(sg / win)
-				bufB[do+2] = uint8(sb / win)
+	win := rad*2 + 1
+	// Fixed-point reciprocal: (sum * invWin + 32768) >> 16 == round(sum / win)
+	// Verified overflow-free for all 0 <= sum <= 255*win with radius <= 40 (win <= 41).
+	invWin := int32((1<<16 + win/2) / win)
 
-				oldX := clampInt(x-rad, 0, w-1)
-				newX := clampInt(x+rad+1, 0, w-1)
-				oo := row + oldX*3
-				no := row + newX*3
-				sr += int(bufA[no]) - int(bufA[oo])
-				sg += int(bufA[no+1]) - int(bufA[oo+1])
-				sb += int(bufA[no+2]) - int(bufA[oo+2])
+	for pass := 0; pass < 3; pass++ {
+		// Horizontal pass: bufA -> bufB (sequential memory access, branchless interior).
+		for y := 0; y < h; y++ {
+			row := y * rowW3
+			srcRow := bufA[row : row+rowW3]
+			dstRow := bufB[row : row+rowW3]
+
+			sr := int32(srcRow[0]) * int32(rad+1)
+			sg := int32(srcRow[1]) * int32(rad+1)
+			sb := int32(srcRow[2]) * int32(rad+1)
+			for k := 1; k <= rad; k++ {
+				cx := k
+				if cx >= w {
+					cx = w - 1
+				}
+				o := cx * 3
+				sr += int32(srcRow[o])
+				sg += int32(srcRow[o+1])
+				sb += int32(srcRow[o+2])
+			}
+
+			// Left border (x < rad)
+			leftEnd := min(rad, w)
+			for x := 0; x < leftEnd; x++ {
+				do := x * 3
+				dstRow[do] = uint8((sr*invWin + 32768) >> 16)
+				dstRow[do+1] = uint8((sg*invWin + 32768) >> 16)
+				dstRow[do+2] = uint8((sb*invWin + 32768) >> 16)
+				nx := x + rad + 1
+				if nx >= w {
+					nx = w - 1
+				}
+				no := nx * 3
+				sr += int32(srcRow[no]) - int32(srcRow[0])
+				sg += int32(srcRow[no+1]) - int32(srcRow[1])
+				sb += int32(srcRow[no+2]) - int32(srcRow[2])
+			}
+
+			// Branchless interior (rad <= x < w-rad-1)
+			midEnd := w - rad - 1
+			for x := leftEnd; x < midEnd; x++ {
+				do := x * 3
+				dstRow[do] = uint8((sr*invWin + 32768) >> 16)
+				dstRow[do+1] = uint8((sg*invWin + 32768) >> 16)
+				dstRow[do+2] = uint8((sb*invWin + 32768) >> 16)
+				oo := (x - rad) * 3
+				no := (x + rad + 1) * 3
+				sr += int32(srcRow[no]) - int32(srcRow[oo])
+				sg += int32(srcRow[no+1]) - int32(srcRow[oo+1])
+				sb += int32(srcRow[no+2]) - int32(srcRow[oo+2])
+			}
+
+			// Right border
+			rightStart := max(leftEnd, midEnd)
+			lastO := (w - 1) * 3
+			for x := rightStart; x < w; x++ {
+				do := x * 3
+				dstRow[do] = uint8((sr*invWin + 32768) >> 16)
+				dstRow[do+1] = uint8((sg*invWin + 32768) >> 16)
+				dstRow[do+2] = uint8((sb*invWin + 32768) >> 16)
+				ox := x - rad
+				if ox < 0 {
+					ox = 0
+				}
+				oo := ox * 3
+				nx := x + rad + 1
+				no := lastO
+				if nx < w {
+					no = nx * 3
+				}
+				sr += int32(srcRow[no]) - int32(srcRow[oo])
+				sg += int32(srcRow[no+1]) - int32(srcRow[oo+1])
+				sb += int32(srcRow[no+2]) - int32(srcRow[oo+2])
 			}
 		}
-		// Vertical pass: bufB -> bufA
-		for x := 0; x < w; x++ {
-			var sr, sg, sb int
-			win := rad*2 + 1
-			for k := -rad; k <= rad; k++ {
-				cy := clampInt(k, 0, h-1)
-				o := (cy*w + x) * 3
-				sr += int(bufB[o])
-				sg += int(bufB[o+1])
-				sb += int(bufB[o+2])
-			}
-			for y := 0; y < h; y++ {
-				do := (y*w + x) * 3
-				bufA[do] = uint8(sr / win)
-				bufA[do+1] = uint8(sg / win)
-				bufA[do+2] = uint8(sb / win)
 
-				oldY := clampInt(y-rad, 0, h-1)
-				newY := clampInt(y+rad+1, 0, h-1)
-				oo := (oldY*w + x) * 3
-				no := (newY*w + x) * 3
-				sr += int(bufB[no]) - int(bufB[oo])
-				sg += int(bufB[no+1]) - int(bufB[oo+1])
-				sb += int(bufB[no+2]) - int(bufB[oo+2])
+		// Vertical pass: bufB -> bufA in row-major order via colSum[] so every
+		// read and write streams sequentially across cache lines.
+		firstRow := bufB[:rowW3]
+		radPlus1 := int32(rad + 1)
+		for i := 0; i < rowW3; i++ {
+			colSum[i] = int32(firstRow[i]) * radPlus1
+		}
+		for k := 1; k <= rad; k++ {
+			cy := k
+			if cy >= h {
+				cy = h - 1
+			}
+			rSlice := bufB[cy*rowW3 : (cy+1)*rowW3]
+			for i := 0; i < rowW3; i++ {
+				colSum[i] += int32(rSlice[i])
+			}
+		}
+
+		for y := 0; y < h; y++ {
+			dSlice := bufA[y*rowW3 : (y+1)*rowW3]
+			oldY := y - rad
+			if oldY < 0 {
+				oldY = 0
+			}
+			newY := y + rad + 1
+			if newY >= h {
+				newY = h - 1
+			}
+			oldRow := bufB[oldY*rowW3 : (oldY+1)*rowW3]
+			newRow := bufB[newY*rowW3 : (newY+1)*rowW3]
+			for i := 0; i < rowW3; i++ {
+				v := colSum[i]
+				dSlice[i] = uint8((v*invWin + 32768) >> 16)
+				colSum[i] = v + int32(newRow[i]) - int32(oldRow[i])
 			}
 		}
 	}
 
+	// Unpack back to RGBA image.
 	for y := 0; y < h; y++ {
-		dRow := (r.Min.Y + y) * img.Stride
-		sRow := y * w * 3
+		dRow := (r.Min.Y+y)*stride + r.Min.X*4
+		sRow := y * rowW3
 		for x := 0; x < w; x++ {
 			so := sRow + x*3
-			do := dRow + (r.Min.X+x)*4
-			img.Pix[do] = bufA[so]
-			img.Pix[do+1] = bufA[so+1]
-			img.Pix[do+2] = bufA[so+2]
+			do := dRow + x*4
+			pix[do] = bufA[so]
+			pix[do+1] = bufA[so+1]
+			pix[do+2] = bufA[so+2]
 		}
 	}
 }
 
 func applySpotlights(img *image.RGBA, rects []image.Rectangle) {
 	w, h := img.Bounds().Dx(), img.Bounds().Dy()
-	const dimFactor = 0.38
+	pix := img.Pix
+	stride := img.Stride
+	// Fixed-point 97/256 ≈ 0.3789 (matches 0.38 dimFactor with zero float conversion).
+	const dimNum uint32 = 97
+
+	// Stack buffer for active spotlight X intervals on the current row; spills to heap only if >16.
+	var activeBuf [16][2]int
+	var active [][2]int
 	for y := 0; y < h; y++ {
-		row := y * img.Stride
+		row := y * stride
+		active = activeBuf[:0]
+		for _, r := range rects {
+			if y >= r.Min.Y && y < r.Max.Y {
+				active = append(active, [2]int{r.Min.X, r.Max.X})
+			}
+		}
+		if len(active) == 0 {
+			for x := 0; x < w; x++ {
+				off := row + x*4
+				pix[off] = uint8((uint32(pix[off]) * dimNum) >> 8)
+				pix[off+1] = uint8((uint32(pix[off+1]) * dimNum) >> 8)
+				pix[off+2] = uint8((uint32(pix[off+2]) * dimNum) >> 8)
+			}
+			continue
+		}
 		for x := 0; x < w; x++ {
 			inSpot := false
-			for _, r := range rects {
-				if x >= r.Min.X && x < r.Max.X && y >= r.Min.Y && y < r.Max.Y {
+			for i := range active {
+				if x >= active[i][0] && x < active[i][1] {
 					inSpot = true
 					break
 				}
 			}
 			if !inSpot {
 				off := row + x*4
-				img.Pix[off] = uint8(float64(img.Pix[off]) * dimFactor)
-				img.Pix[off+1] = uint8(float64(img.Pix[off+1]) * dimFactor)
-				img.Pix[off+2] = uint8(float64(img.Pix[off+2]) * dimFactor)
+				pix[off] = uint8((uint32(pix[off]) * dimNum) >> 8)
+				pix[off+1] = uint8((uint32(pix[off+1]) * dimNum) >> 8)
+				pix[off+2] = uint8((uint32(pix[off+2]) * dimNum) >> 8)
 			}
 		}
 	}
 }
 
-// blendOver alpha-composites premultiplied src (from ui.SVG.Image) over opaque dst.
+// blendOver alpha-composites premultiplied src (from ui.SVG.Image) over opaque dst
+// using exact division-free /255 arithmetic.
 func blendOver(dst, src *image.RGBA) {
 	w := min(dst.Bounds().Dx(), src.Bounds().Dx())
 	h := min(dst.Bounds().Dy(), src.Bounds().Dy())
+	dPix := dst.Pix
+	sPix := src.Pix
+	dStride := dst.Stride
+	sStride := src.Stride
 	for y := 0; y < h; y++ {
-		dRow := y * dst.Stride
-		sRow := y * src.Stride
+		dRow := y * dStride
+		sRow := y * sStride
 		for x := 0; x < w; x++ {
 			so := sRow + x*4
-			sa := uint32(src.Pix[so+3])
+			sa := uint32(sPix[so+3])
 			if sa == 0 {
 				continue
 			}
 			do := dRow + x*4
 			if sa == 255 {
-				dst.Pix[do] = src.Pix[so]
-				dst.Pix[do+1] = src.Pix[so+1]
-				dst.Pix[do+2] = src.Pix[so+2]
-				dst.Pix[do+3] = 255
+				dPix[do] = sPix[so]
+				dPix[do+1] = sPix[so+1]
+				dPix[do+2] = sPix[so+2]
+				dPix[do+3] = 255
 				continue
 			}
 			inv := 255 - sa
-			// src from SVG.Image is premultiplied RGBA
-			r := uint32(src.Pix[so]) + (uint32(dst.Pix[do])*inv)/255
-			g := uint32(src.Pix[so+1]) + (uint32(dst.Pix[do+1])*inv)/255
-			b := uint32(src.Pix[so+2]) + (uint32(dst.Pix[do+2])*inv)/255
+			// Exact /255 for all t in [0, 65025]: (t + 1 + (t >> 8)) >> 8
+			tr := uint32(dPix[do]) * inv
+			tg := uint32(dPix[do+1]) * inv
+			tb := uint32(dPix[do+2]) * inv
+			r := uint32(sPix[so]) + ((tr + 1 + (tr >> 8)) >> 8)
+			g := uint32(sPix[so+1]) + ((tg + 1 + (tg >> 8)) >> 8)
+			b := uint32(sPix[so+2]) + ((tb + 1 + (tb >> 8)) >> 8)
 			if r > 255 {
 				r = 255
 			}
@@ -354,10 +591,10 @@ func blendOver(dst, src *image.RGBA) {
 			if b > 255 {
 				b = 255
 			}
-			dst.Pix[do] = uint8(r)
-			dst.Pix[do+1] = uint8(g)
-			dst.Pix[do+2] = uint8(b)
-			dst.Pix[do+3] = 255
+			dPix[do] = uint8(r)
+			dPix[do+1] = uint8(g)
+			dPix[do+2] = uint8(b)
+			dPix[do+3] = 255
 		}
 	}
 }
@@ -379,6 +616,7 @@ func buildAnnotationsSVG(w, h int, anns []Annotation) []byte {
 	}
 
 	var sb strings.Builder
+	sb.Grow(len(anns)*160 + 128)
 	fmt.Fprintf(&sb, `<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">`, w, h, w, h)
 
 	for _, a := range anns {
@@ -572,6 +810,7 @@ func taperedArrowSVGPath(x0, y0, x1, y1, sw float32) string {
 		return ""
 	}
 	var sb strings.Builder
+	sb.Grow(128)
 	fmt.Fprintf(&sb, "M%.1f %.1f", pts[0][0], pts[0][1])
 	for _, pt := range pts[1:] {
 		fmt.Fprintf(&sb, " L%.1f %.1f", pt[0], pt[1])
@@ -585,6 +824,7 @@ func smoothPathSVG(pts []PointF) string {
 		return ""
 	}
 	var sb strings.Builder
+	sb.Grow(len(pts) * 24)
 	fmt.Fprintf(&sb, "M%.1f %.1f", pts[0].X, pts[0].Y)
 	if len(pts) == 2 {
 		fmt.Fprintf(&sb, " L%.1f %.1f", pts[1].X, pts[1].Y)

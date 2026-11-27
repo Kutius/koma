@@ -38,7 +38,8 @@ type rowSig struct {
 }
 
 // Stitcher incrementally stitches vertical scrolling screenshots with automatic
-// sticky header/footer/scrollbar resilience and zero-copy buffer growth.
+// sticky header/footer/scrollbar resilience, dark-mode low-texture adaptation,
+// momentum-guided search, and zero-copy buffer growth.
 type Stitcher struct {
 	width     int
 	frameH    int
@@ -58,6 +59,7 @@ type Stitcher struct {
 	prevFrame *image.RGBA
 	prevSigs  []rowSig
 	currSigs  []rowSig
+	xs        [sigCols]int
 
 	// x0..x1 is the horizontal inner band used for matching (excludes thin edges
 	// and rightmost scrollbar).
@@ -65,6 +67,7 @@ type Stitcher struct {
 
 	framesAccepted int
 	totalShift     int
+	lastShiftY     int
 }
 
 // New creates a new Stitcher initialized with firstFrame.
@@ -102,6 +105,11 @@ func (s *Stitcher) Reset(firstFrame *image.RGBA) {
 	s.x0 = min(2, w/8)
 	s.x1 = max(s.x0+12, w-scrollMargin)
 
+	span := max(1, s.x1-s.x0)
+	for i := 0; i < sigCols; i++ {
+		s.xs[i] = s.x0 + (i*span)/sigCols
+	}
+
 	initCapH := min(s.maxHeight, max(h*4, h+1024))
 	s.body = make([]byte, h*s.stride, initCapH*s.stride)
 	copyRectBytes(s.body, s.stride, firstFrame, 0, h)
@@ -119,6 +127,7 @@ func (s *Stitcher) Reset(firstFrame *image.RGBA) {
 
 	s.framesAccepted = 1
 	s.totalShift = 0
+	s.lastShiftY = 0
 }
 
 // Release frees all retained pixel buffers so GC can reclaim memory immediately.
@@ -131,6 +140,7 @@ func (s *Stitcher) Release() {
 	s.prevSigs = nil
 	s.currSigs = nil
 	s.framesAccepted = 0
+	s.lastShiftY = 0
 }
 
 // Width returns the stitched image width in pixels.
@@ -170,8 +180,13 @@ func (s *Stitcher) Feed(currFrame *image.RGBA) FeedResult {
 		return FeedResult{Status: StatusUnchanged, TotalHeight: s.TotalHeight()}
 	}
 
+	// Compute outlier-resistant texture-energy floor so low-contrast dark-mode UIs
+	// (e.g., muted gray code on #1E1E1E, even with a bright titlebar/status bar)
+	// still register textured rows accurately.
+	minTexEnergy := s.adaptiveTexThreshold()
+
 	// 2. Detect sticky top header and sticky bottom footer between prevFrame & currFrame.
-	staticTop, staticBot := s.detectStickyBands()
+	staticTop, staticBot := s.detectStickyBands(minTexEnergy)
 
 	// Align sticky footer state conservatively so bodyH always matches prevFrame[0..botY).
 	targetFooterH := s.footerH
@@ -210,10 +225,10 @@ func (s *Stitcher) Feed(currFrame *image.RGBA) FeedResult {
 	}
 
 	// 3. Search for downward vertical shift dy > 0 inside [topY .. botY).
-	dy, bestErr, secondErr, texRows, ok := s.findDownwardShift(currFrame, topY, botY)
+	dy, bestErr, secondErr, texRows, ok := s.findDownwardShift(currFrame, topY, botY, minTexEnergy)
 	if !ok {
 		// Check if the user accidentally scrolled slightly upward (jitter) so we ignore cleanly.
-		if s.detectUpwardScroll(currFrame, topY, botY) {
+		if s.detectUpwardScroll(currFrame, topY, botY, minTexEnergy) {
 			return FeedResult{Status: StatusScrolledUp, TotalHeight: s.TotalHeight()}
 		}
 		return FeedResult{Status: StatusTooFast, TotalHeight: s.TotalHeight()}
@@ -287,6 +302,7 @@ func (s *Stitcher) Feed(currFrame *image.RGBA) FeedResult {
 	s.prevSigs, s.currSigs = s.currSigs, s.prevSigs
 	s.framesAccepted++
 	s.totalShift += dy
+	s.lastShiftY = dy
 
 	conf := 1.0
 	if secondErr > 0 {
@@ -306,6 +322,36 @@ func (s *Stitcher) Feed(currFrame *image.RGBA) FeedResult {
 		TotalHeight: s.TotalHeight(),
 		Confidence:  conf,
 	}
+}
+
+// adaptiveTexThreshold lowers the texture-energy floor on low-contrast dark-mode
+// frames while preserving the standard sigCols*3 floor on normal pages.
+// Sampling the middle 60% of the viewport and requiring >=10% high-contrast rows
+// prevents a single bright titlebar, status bar, or accent badge from disabling
+// dark-mode adaptation.
+func (s *Stitcher) adaptiveTexThreshold() uint32 {
+	const defaultFloor uint32 = sigCols * 3
+	const darkFloor uint32 = sigCols
+	const highContrastCut uint32 = defaultFloor * 2
+
+	yStart := s.frameH / 5
+	yEnd := s.frameH - s.frameH/5
+	if yEnd-yStart < 16 {
+		yStart = 0
+		yEnd = s.frameH
+	}
+	sampled := 0
+	highContrast := 0
+	for y := yStart; y < yEnd; y += 4 {
+		sampled++
+		if s.currSigs[y].energy >= highContrastCut {
+			highContrast++
+		}
+	}
+	if sampled > 0 && highContrast*10 < sampled {
+		return darkFloor
+	}
+	return defaultFloor
 }
 
 // Compose returns a standalone *image.RGBA containing the complete stitched image.
@@ -433,24 +479,18 @@ func (s *Stitcher) ensureBodyCap(needRows int) {
 }
 
 func (s *Stitcher) computeSigs(img *image.RGBA, out []rowSig) {
-	b := img.Bounds()
-	span := s.x1 - s.x0
-	if span < 1 {
-		span = 1
-	}
-	var xs [sigCols]int
-	for i := 0; i < sigCols; i++ {
-		xs[i] = b.Min.X + s.x0 + (i*span)/sigCols
-	}
+	pix := img.Pix
+	stride := img.Stride
 
+	// Note: in Go's image.RGBA, SubImage already advances img.Pix to Rect.Min,
+	// so row 0 / col 0 of the frame is always at Pix[0].
 	for y := 0; y < s.frameH; y++ {
-		rowOff := (b.Min.Y + y) * img.Stride
-		pix := img.Pix
+		rowOff := y * stride
 		sig := &out[y]
 		var energy uint32
 		var prevL int
 		for i := 0; i < sigCols; i++ {
-			off := rowOff + xs[i]*4
+			off := rowOff + s.xs[i]*4
 			r := pix[off+0]
 			g := pix[off+1]
 			bl := pix[off+2]
@@ -498,19 +538,21 @@ func (s *Stitcher) frameDiff(a, b []rowSig) (meanDiff float64, changedRatio floa
 
 func sigRowMAD(a, b *rowSig) float64 {
 	var sum uint32
-	for i := 0; i < sigCols*3; i++ {
-		sum += uint32(absDiff8(a.rgb[i], b.rgb[i]))
+	ar := &a.rgb
+	br := &b.rgb
+	for i := 0; i < sigCols*3; i += 3 {
+		sum += uint32(absDiff8(ar[i+0], br[i+0])) +
+			uint32(absDiff8(ar[i+1], br[i+1])) +
+			uint32(absDiff8(ar[i+2], br[i+2]))
 	}
 	return float64(sum) / float64(sigCols*3)
 }
 
-func (s *Stitcher) detectStickyBands() (stickyTop, stickyBot int) {
+func (s *Stitcher) detectStickyBands(minTexEnergy uint32) (stickyTop, stickyBot int) {
 	maxBand := s.frameH * 38 / 100
 	if maxBand < 8 {
 		return 0, 0
 	}
-	// Minimum horizontal gradient energy indicating real UI content vs solid whitespace.
-	const minTexEnergy uint32 = sigCols * 3
 
 	// Scan from top downward.
 	identTop := 0
@@ -552,7 +594,7 @@ type shiftCand struct {
 	err float64
 }
 
-func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int) (bestDy int, bestErr, secondErr float64, texRows int, ok bool) {
+func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int, minTexEnergy uint32) (bestDy int, bestErr, secondErr float64, texRows int, ok bool) {
 	scrollH := botY - topY
 	minOverlap := max(24, scrollH*14/100)
 	maxShift := scrollH - minOverlap
@@ -564,24 +606,39 @@ func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int) (bestDy i
 	const maxCands = 8
 	var cands [maxCands]shiftCand
 	nCands := 0
+	worstIdx := 0
+	worstErr := -1.0
 	addCand := func(dy int, err float64) {
+		for i := 0; i < nCands; i++ {
+			if cands[i].dy == dy {
+				return
+			}
+		}
 		if nCands < maxCands {
 			cands[nCands] = shiftCand{dy: dy, err: err}
+			if err > worstErr {
+				worstErr = err
+				worstIdx = nCands
+			}
 			nCands++
 			return
 		}
-		worst := 0
-		for i := 1; i < nCands; i++ {
-			if cands[i].err > cands[worst].err {
-				worst = i
+		if err < worstErr {
+			cands[worstIdx] = shiftCand{dy: dy, err: err}
+			worstIdx = 0
+			worstErr = cands[0].err
+			for i := 1; i < nCands; i++ {
+				if cands[i].err > worstErr {
+					worstErr = cands[i].err
+					worstIdx = i
+				}
 			}
-		}
-		if err < cands[worst].err {
-			cands[worst] = shiftCand{dy: dy, err: err}
 		}
 	}
 
-	for dy := 2; dy <= maxShift; dy += 2 {
+	// Pre-seed candidate buffer with momentum hint so worstErr tightens early.
+	if s.lastShiftY >= 2 && s.lastShiftY <= maxShift {
+		dy := s.lastShiftY
 		ov := scrollH - dy
 		rowStep := 2
 		if ov > 360 {
@@ -598,9 +655,51 @@ func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int) (bestDy i
 		}
 	}
 
-	// Always include small shifts [1..4] in fine pass for precision trackpad nudges.
-	// Stack-allocated array avoids per-frame map allocations at 25fps (max 4 + 8*5 = 44 shifts).
-	var tested [48]shiftCand
+	for dy := 2; dy <= maxShift; dy += 2 {
+		if dy == s.lastShiftY {
+			continue
+		}
+		ov := scrollH - dy
+		rowStep := 2
+		if ov > 360 {
+			rowStep = 3
+		}
+		totalRows := (ov + rowStep - 1) / rowStep
+		var limit float64
+		hasLimit := nCands == maxCands
+		if hasLimit {
+			limit = worstErr * float64(totalRows)
+		}
+		var sum float64
+		cnt := 0
+		aborted := false
+		for k := 0; k < ov; k += rowStep {
+			sum += sigRowMAD(&s.prevSigs[topY+dy+k], &s.currSigs[topY+k])
+			cnt++
+			if hasLimit && sum >= limit {
+				aborted = true
+				break
+			}
+		}
+		if !aborted && cnt > 0 {
+			addCand(dy, sum/float64(cnt))
+		}
+	}
+
+	// Sort coarse candidates ascending so fine search locks onto a tight bestErr
+	// immediately, maximizing early-abort pruning on poorer candidates.
+	for i := 1; i < nCands; i++ {
+		key := cands[i]
+		j := i - 1
+		for j >= 0 && cands[j].err > key.err {
+			cands[j+1] = cands[j]
+			j--
+		}
+		cands[j+1] = key
+	}
+
+	// Stack-allocated array avoids per-frame map allocations at 25fps.
+	var tested [56]shiftCand
 	nTested := 0
 	bestErr = math.MaxFloat64
 	bestDy = 0
@@ -615,7 +714,13 @@ func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int) (bestDy i
 				return
 			}
 		}
-		err, tRows := s.exactOverlapMAD(curr, topY+dy, topY, scrollH-dy)
+		// Conservative cutoff for early abort while preserving accurate secondErr
+		// discrimination for near-contenders.
+		cutoff := 255.0
+		if bestErr < 14.0 {
+			cutoff = math.Max(18.0, bestErr*2.2+6.0)
+		}
+		err, tRows := s.exactOverlapMAD(curr, topY+dy, topY, scrollH-dy, minTexEnergy, cutoff)
 		if nTested < len(tested) {
 			tested[nTested] = shiftCand{dy: dy, err: err}
 			nTested++
@@ -627,14 +732,23 @@ func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int) (bestDy i
 		}
 	}
 
-	for dy := 1; dy <= min(4, maxShift); dy++ {
-		evalFine(dy)
+	// Momentum hint: probe lastShiftY neighborhood first so steady scrolling locks
+	// in an immediate tight upper bound.
+	if s.lastShiftY > 0 {
+		evalFine(s.lastShiftY)
+		evalFine(s.lastShiftY - 1)
+		evalFine(s.lastShiftY + 1)
 	}
+	// Evaluate top coarse candidates first (sorted ascending by coarse error).
 	for i := 0; i < nCands; i++ {
 		base := cands[i].dy
 		for delta := -2; delta <= 2; delta++ {
 			evalFine(base + delta)
 		}
+	}
+	// Always include small shifts [1..4] for precision trackpad nudges.
+	for dy := 1; dy <= min(4, maxShift); dy++ {
+		evalFine(dy)
 	}
 
 	if bestDy <= 0 {
@@ -675,7 +789,7 @@ func (s *Stitcher) findDownwardShift(curr *image.RGBA, topY, botY int) (bestDy i
 	return 0, bestErr, secondErr, bestTexRows, false
 }
 
-func (s *Stitcher) detectUpwardScroll(curr *image.RGBA, topY, botY int) bool {
+func (s *Stitcher) detectUpwardScroll(curr *image.RGBA, topY, botY int, minTexEnergy uint32) bool {
 	scrollH := botY - topY
 	maxUp := min(scrollH/2, scrollH-max(24, scrollH*20/100))
 	if maxUp < 2 {
@@ -707,7 +821,7 @@ func (s *Stitcher) detectUpwardScroll(curr *image.RGBA, topY, botY int) bool {
 		if dy < 1 || dy > maxUp {
 			continue
 		}
-		err, tRows := s.exactOverlapMAD(curr, topY, topY+dy, scrollH-dy)
+		err, tRows := s.exactOverlapMAD(curr, topY, topY+dy, scrollH-dy, minTexEnergy, 12.0)
 		if err <= 8.0 && tRows >= 4 {
 			return true
 		}
@@ -716,12 +830,12 @@ func (s *Stitcher) detectUpwardScroll(curr *image.RGBA, topY, botY int) bool {
 }
 
 // exactOverlapMAD compares prevFrame[prevStartY..prevStartY+ov) with
-// currFrame[currStartY..currStartY+ov) across the inner horizontal band.
-func (s *Stitcher) exactOverlapMAD(curr *image.RGBA, prevStartY, currStartY, ov int) (mad float64, texRows int) {
+// currFrame[currStartY..currStartY+ov) across the inner horizontal band with
+// early-abort upper-bound pruning when accumulated error already exceeds cutoff.
+func (s *Stitcher) exactOverlapMAD(curr *image.RGBA, prevStartY, currStartY, ov int, minTexEnergy uint32, cutoff float64) (mad float64, texRows int) {
 	if ov <= 0 {
 		return 255, 0
 	}
-	cb := curr.Bounds()
 	prevPix := s.prevFrame.Pix
 	prevStride := s.prevFrame.Stride
 	currPix := curr.Pix
@@ -736,26 +850,31 @@ func (s *Stitcher) exactOverlapMAD(curr *image.RGBA, prevStartY, currStartY, ov 
 		yStep = 2
 	}
 
-	const minTexEnergy uint32 = sigCols * 3
+	x0, x1 := s.x0, s.x1
+	samplesPerRow := uint64((x1 - x0 + xStep - 1) / xStep)
+	totalRowsEst := uint64((ov + yStep - 1) / yStep)
+	maxTotalDiff := uint64(cutoff * float64(samplesPerRow*totalRowsEst*3))
+	doEarlyAbort := cutoff < 250.0
+
 	var totalDiff uint64
 	var totalPx uint64
 	var texDiff uint64
 	var texPx uint64
+	rowsChecked := 0
 
 	for k := 0; k < ov; k += yStep {
 		py := prevStartY + k
 		cy := currStartY + k
-		pOff := py * prevStride
-		cOff := (cb.Min.Y + cy) * currStride
+		pRow := prevPix[py*prevStride:]
+		cRow := currPix[cy*currStride:]
 		isTex := s.prevSigs[py].energy >= minTexEnergy || s.currSigs[cy].energy >= minTexEnergy
 		var rowDiff uint64
 		var rowPx uint64
-		for x := s.x0; x < s.x1; x += xStep {
-			po := pOff + x*4
-			co := cOff + (cb.Min.X+x)*4
-			d := uint64(absDiff8(prevPix[po+0], currPix[co+0])) +
-				uint64(absDiff8(prevPix[po+1], currPix[co+1])) +
-				uint64(absDiff8(prevPix[po+2], currPix[co+2]))
+		for x := x0; x < x1; x += xStep {
+			off := x * 4
+			p0, p1, p2 := pRow[off+0], pRow[off+1], pRow[off+2]
+			c0, c1, c2 := cRow[off+0], cRow[off+1], cRow[off+2]
+			d := uint64(absDiff8(p0, c0)) + uint64(absDiff8(p1, c1)) + uint64(absDiff8(p2, c2))
 			rowDiff += d
 			rowPx++
 		}
@@ -765,6 +884,10 @@ func (s *Stitcher) exactOverlapMAD(curr *image.RGBA, prevStartY, currStartY, ov 
 			texRows++
 			texDiff += rowDiff
 			texPx += rowPx
+		}
+		rowsChecked++
+		if doEarlyAbort && rowsChecked&15 == 0 && totalDiff > maxTotalDiff {
+			return cutoff + 1.0, texRows
 		}
 	}
 	if totalPx == 0 {
@@ -780,10 +903,9 @@ func (s *Stitcher) exactOverlapMAD(curr *image.RGBA, prevStartY, currStartY, ov 
 }
 
 func copyRectBytes(dst []byte, dstStride int, src *image.RGBA, srcStartY, rows int) {
-	b := src.Bounds()
-	rowBytes := b.Dx() * 4
+	rowBytes := src.Bounds().Dx() * 4
 	for y := 0; y < rows; y++ {
-		sOff := (b.Min.Y+srcStartY+y)*src.Stride + b.Min.X*4
+		sOff := (srcStartY + y) * src.Stride
 		dOff := y * dstStride
 		copy(dst[dOff:dOff+rowBytes], src.Pix[sOff:sOff+rowBytes])
 	}

@@ -269,3 +269,86 @@ func TestStitcherUnchangedUpwardTooFastAndPreview(t *testing.T) {
 		t.Fatalf("expected Release to clear stitcher state")
 	}
 }
+
+func TestStitcherDarkModeWithBrightChrome(t *testing.T) {
+	// Dark IDE body (#1E1E1E background with muted low-contrast text) combined with
+	// a bright high-contrast top titlebar and bottom status bar. adaptiveTexThreshold
+	// must stay in dark-mode floor despite the high-contrast chrome bars.
+	const w, viewH, contentH = 640, 420, 1400
+	const headerH, footerH = 36, 28
+	const scrollH = viewH - headerH - footerH
+
+	content := image.NewRGBA(image.Rect(0, 0, w, contentH))
+	for y := 0; y < contentH; y++ {
+		band := (y / 22) * 29
+		for x := 0; x < w; x++ {
+			r, g, b := uint8(30), uint8(30), uint8(32)
+			if y%22 >= 6 && y%22 <= 14 && x >= 24 && x < w-30 && ((x+band)%13 < 6) {
+				r = uint8(58 + (band+x)%24)
+				g = uint8(62 + (band+y)%24)
+				b = uint8(70 + (band+x+y)%24)
+			}
+			content.SetRGBA(x, y, color.RGBA{r, g, b, 255})
+		}
+	}
+
+	makeFrame := func(off int) *image.RGBA {
+		f := image.NewRGBA(image.Rect(0, 0, w, viewH))
+		for y := 0; y < scrollH; y++ {
+			copy(f.Pix[(headerH+y)*f.Stride:(headerH+y+1)*f.Stride], content.Pix[(off+y)*content.Stride:(off+y+1)*content.Stride])
+		}
+		// High-contrast bright top titlebar + bottom status bar (energy >> defaultFloor*2)
+		for y := 0; y < headerH; y++ {
+			for x := 0; x < w; x++ {
+				if (x/6)%2 == 0 {
+					f.SetRGBA(x, y, color.RGBA{250, 250, 252, 255})
+				} else {
+					f.SetRGBA(x, y, color.RGBA{20, 24, 30, 255})
+				}
+			}
+		}
+		for y := viewH - footerH; y < viewH; y++ {
+			for x := 0; x < w; x++ {
+				if (x/8)%2 == 0 {
+					f.SetRGBA(x, y, color.RGBA{0, 122, 255, 255})
+				} else {
+					f.SetRGBA(x, y, color.RGBA{245, 248, 255, 255})
+				}
+			}
+		}
+		return f
+	}
+
+	st := New(makeFrame(0), DefaultMaxHeight)
+	if got := st.adaptiveTexThreshold(); got != sigCols {
+		t.Fatalf("expected dark-mode floor (%d) despite bright header/footer chrome, got %d", sigCols, got)
+	}
+	for _, off := range []int{110, 220, 330, 440} {
+		res := st.Feed(makeFrame(off))
+		if res.Status != StatusStitched || res.ShiftY != 110 {
+			t.Fatalf("dark-mode frame off=%d failed: %+v", off, res)
+		}
+	}
+	if st.TotalHeight() != viewH+440 {
+		t.Fatalf("dark-mode TotalHeight = %d, want %d", st.TotalHeight(), viewH+440)
+	}
+}
+
+func TestStitcherSubImageFrames(t *testing.T) {
+	// Feeding non-zero-origin SubImage views must not panic or misalign pixels.
+	page := makeSyntheticPage(600, 1200)
+	subFrame := func(y0 int) *image.RGBA {
+		return page.SubImage(image.Rect(40, y0, 520, y0+360)).(*image.RGBA)
+	}
+	st := New(subFrame(40), DefaultMaxHeight)
+	for _, y0 := range []int{140, 260, 400} {
+		res := st.Feed(subFrame(y0))
+		if res.Status != StatusStitched {
+			t.Fatalf("SubImage feed y0=%d failed: %+v", y0, res)
+		}
+	}
+	wantH := 360 + (400 - 40)
+	if st.TotalHeight() != wantH {
+		t.Fatalf("SubImage TotalHeight = %d, want %d", st.TotalHeight(), wantH)
+	}
+}
