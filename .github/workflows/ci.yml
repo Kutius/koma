@@ -3,30 +3,56 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "AGENTS.md"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "AGENTS.md"
+      - "LICENSE"
   workflow_call:
+    inputs:
+      skip-build-check:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Run tests
-        env:
-          CGO_ENABLED: "0"
-        run: go test -v -count=1 ./...
+        run: go test -v -count=1 -timeout 5m ./...
       - name: Run mygo vet
         run: go tool mygo vet ./...
-      - name: Verify windows/arm64 build
-        shell: pwsh
-        run: |
-          $env:CGO_ENABLED = "0"
-          $env:GOOS = "windows"
-          $env:GOARCH = "arm64"
-          go build ./...
+
+  build-check:
+    if: ${{ !inputs.skip-build-check }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Verify windows/amd64 and windows/arm64 builds
+        run: go tool mygo build -platform windows/amd64,windows/arm64 -skip-installer
