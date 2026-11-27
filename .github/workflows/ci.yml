@@ -33,14 +33,14 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 15
-    env:
-      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Run tests
+        env:
+          CGO_ENABLED: "0"
         run: go test -v -count=1 -timeout 5m ./...
       - name: Run mygo vet
         run: go tool mygo vet ./...
