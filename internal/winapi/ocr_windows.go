@@ -184,7 +184,9 @@ func recognizeTextOnThread(img *image.RGBA) (OCRResult, error) {
 		defer procRoUninitialize.Call()
 	}
 
-	// 1. Obtain IOcrEngineStatics and create OcrEngine for user profile languages.
+	// 1. Obtain IOcrEngineStatics and prefer a CJK-capable recognizer (zh-Hans
+	// recognizes both Simplified Chinese and English/digits, whereas en-US
+	// mangles Chinese when it sits first in Windows user profile languages).
 	ocrStatics, err := getActivationFactory("Windows.Media.Ocr.OcrEngine", &iidIOcrEngineStatics)
 	if err != nil {
 		return OCRResult{}, fmt.Errorf("当前系统不支持 Windows 原生 OCR: %w", err)
@@ -196,12 +198,10 @@ func recognizeTextOnThread(img *image.RGBA) (OCRResult, error) {
 		maxDim = 4096
 	}
 
-	var engine *comObj
-	rEng, _, _ := syscall.SyscallN(ocrStatics.vtblSlot(10), uintptr(unsafe.Pointer(ocrStatics)), uintptr(unsafe.Pointer(&engine)))
-	if uint32(rEng) != hrOK || engine == nil {
-		// Fallback: pick first language from AvailableRecognizerLanguages (slot 7) -> TryCreateFromLanguage (slot 9).
-		engine = tryCreateFirstAvailableOcrEngine(ocrStatics)
-		if engine == nil {
+	engine := tryCreatePreferredOcrEngine(ocrStatics)
+	if engine == nil {
+		rEng, _, _ := syscall.SyscallN(ocrStatics.vtblSlot(10), uintptr(unsafe.Pointer(ocrStatics)), uintptr(unsafe.Pointer(&engine)))
+		if uint32(rEng) != hrOK || engine == nil {
 			return OCRResult{}, ErrOCRNoLanguage
 		}
 	}
@@ -383,7 +383,10 @@ done:
 	}, nil
 }
 
-func tryCreateFirstAvailableOcrEngine(ocrStatics *comObj) *comObj {
+// tryCreatePreferredOcrEngine inspects Windows.Media.Ocr.OcrEngine.AvailableRecognizerLanguages
+// and prioritizes zh-Hans (handles both Chinese & English/digits cleanly), then zh-Hant,
+// then user profile / first available recognizer.
+func tryCreatePreferredOcrEngine(ocrStatics *comObj) *comObj {
 	var langs *comObj
 	rL, _, _ := syscall.SyscallN(ocrStatics.vtblSlot(7), uintptr(unsafe.Pointer(ocrStatics)), uintptr(unsafe.Pointer(&langs)))
 	if uint32(rL) != hrOK || langs == nil {
@@ -395,56 +398,170 @@ func tryCreateFirstAvailableOcrEngine(ocrStatics *comObj) *comObj {
 	if rCnt, _, _ := syscall.SyscallN(langs.vtblSlot(7), uintptr(unsafe.Pointer(langs)), uintptr(unsafe.Pointer(&count))); uint32(rCnt) != hrOK || count == 0 {
 		return nil
 	}
+
+	bestIdx := int32(-1)
+	bestPrio := -1
 	for i := uint32(0); i < count; i++ {
 		var lang *comObj
 		if rAt, _, _ := syscall.SyscallN(langs.vtblSlot(6), uintptr(unsafe.Pointer(langs)), uintptr(i), uintptr(unsafe.Pointer(&lang))); uint32(rAt) != hrOK || lang == nil {
 			continue
 		}
-		var engine *comObj
-		rCreate, _, _ := syscall.SyscallN(ocrStatics.vtblSlot(9), uintptr(unsafe.Pointer(ocrStatics)), uintptr(unsafe.Pointer(lang)), uintptr(unsafe.Pointer(&engine)))
+		// ILanguage::get_LanguageTag is slot 6 (after IInspectable 0..5).
+		var hs uintptr
+		tag := ""
+		if rTag, _, _ := syscall.SyscallN(lang.vtblSlot(6), uintptr(unsafe.Pointer(lang)), uintptr(unsafe.Pointer(&hs))); uint32(rTag) == hrOK && hs != 0 {
+			tag = strings.ToLower(hstringToGo(hs))
+			deleteHString(hs)
+		}
 		lang.release()
-		if uint32(rCreate) == hrOK && engine != nil {
-			return engine
+
+		prio := 1
+		switch {
+		case strings.HasPrefix(tag, "zh-hans") || tag == "zh-cn":
+			prio = 100
+		case strings.HasPrefix(tag, "zh-hant") || tag == "zh-tw" || tag == "zh-hk":
+			prio = 80
+		case strings.HasPrefix(tag, "zh"):
+			prio = 70
+		case strings.HasPrefix(tag, "en"):
+			prio = 40
+		}
+		if prio > bestPrio {
+			bestPrio = prio
+			bestIdx = int32(i)
+		}
+	}
+
+	if bestIdx >= 0 {
+		var lang *comObj
+		if rAt, _, _ := syscall.SyscallN(langs.vtblSlot(6), uintptr(unsafe.Pointer(langs)), uintptr(bestIdx), uintptr(unsafe.Pointer(&lang))); uint32(rAt) == hrOK && lang != nil {
+			var engine *comObj
+			rCreate, _, _ := syscall.SyscallN(ocrStatics.vtblSlot(9), uintptr(unsafe.Pointer(ocrStatics)), uintptr(unsafe.Pointer(lang)), uintptr(unsafe.Pointer(&engine)))
+			lang.release()
+			if uint32(rCreate) == hrOK && engine != nil {
+				return engine
+			}
 		}
 	}
 	return nil
 }
 
-// prepareOCRImage pads/upscales tiny crops (which Windows OCR otherwise skips) and
-// downscales oversized captures above maxDim while keeping memory bounded.
+// prepareOCRImage enhances desktop screenshots for Windows.Media.Ocr:
+//  1. Bilinear 2× upscale (desktop 12-14px UI fonts are too small for WinRT OCR);
+//  2. Auto-invert dark-background screenshots into crisp dark-text-on-light-background;
+//  3. Add 24px solid background-matched border padding so edge glyphs never clip.
 func prepareOCRImage(src *image.RGBA, maxDim int) *image.RGBA {
 	if maxDim < 256 {
 		maxDim = 4096
 	}
 	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
-	scale := 1.0
-	if sw < 120 || sh < 48 {
-		scale = 2.0
+	const pad = 24
+
+	// Estimate border background luminance to detect dark-mode captures and pick padding color.
+	bgR, bgG, bgB := sampleEdgeColor(src)
+	darkBg := (0.2126*float64(bgR) + 0.7152*float64(bgG) + 0.0722*float64(bgB)) < 115.0
+
+	scale := 2.0
+	if sw < 160 || sh < 64 {
+		scale = 2.5
 	}
-	if float64(sw)*scale > float64(maxDim) {
-		scale = float64(maxDim) / float64(sw)
+	maxContent := float64(maxDim - pad*2)
+	if float64(sw)*scale > maxContent {
+		scale = maxContent / float64(sw)
 	}
-	if float64(sh)*scale > float64(maxDim) {
-		if s := float64(maxDim) / float64(sh); s < scale {
+	if float64(sh)*scale > maxContent {
+		if s := maxContent / float64(sh); s < scale {
 			scale = s
 		}
 	}
-	if scale == 1.0 && src.Bounds().Min == (image.Point{}) {
-		return src
+	if scale <= 0 {
+		scale = 1.0
 	}
-	dw := max(1, int(float64(sw)*scale+0.5))
-	dh := max(1, int(float64(sh)*scale+0.5))
+
+	cw := max(1, int(float64(sw)*scale+0.5))
+	ch := max(1, int(float64(sh)*scale+0.5))
+	dw := cw + pad*2
+	dh := ch + pad*2
 	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
-	for y := 0; y < dh; y++ {
-		sy := ClampInt(int(float64(y)/scale), 0, sh-1)
-		sRow := sy * src.Stride
-		dRow := y * dst.Stride
-		for x := 0; x < dw; x++ {
-			sx := ClampInt(int(float64(x)/scale), 0, sw-1)
-			copy(dst.Pix[dRow+x*4:dRow+x*4+4], src.Pix[sRow+sx*4:sRow+sx*4+4])
+
+	padR, padG, padB := bgR, bgG, bgB
+	if darkBg {
+		padR, padG, padB = 255-padR, 255-padG, 255-padB
+	}
+	for i := 0; i < len(dst.Pix); i += 4 {
+		dst.Pix[i+0] = padR
+		dst.Pix[i+1] = padG
+		dst.Pix[i+2] = padB
+		dst.Pix[i+3] = 255
+	}
+
+	invScale := 1.0 / scale
+	for y := 0; y < ch; y++ {
+		sy := (float64(y)+0.5)*invScale - 0.5
+		y0 := ClampInt(int(sy), 0, sh-1)
+		y1 := ClampInt(y0+1, 0, sh-1)
+		fy := sy - float64(y0)
+		if fy < 0 {
+			fy = 0
+		}
+		dRow := (y + pad) * dst.Stride
+		sRow0 := y0 * src.Stride
+		sRow1 := y1 * src.Stride
+		for x := 0; x < cw; x++ {
+			sx := (float64(x)+0.5)*invScale - 0.5
+			x0 := ClampInt(int(sx), 0, sw-1)
+			x1 := ClampInt(x0+1, 0, sw-1)
+			fx := sx - float64(x0)
+			if fx < 0 {
+				fx = 0
+			}
+			o00 := sRow0 + x0*4
+			o10 := sRow0 + x1*4
+			o01 := sRow1 + x0*4
+			o11 := sRow1 + x1*4
+			do := dRow + (x+pad)*4
+			for c := 0; c < 3; c++ {
+				top := float64(src.Pix[o00+c])*(1-fx) + float64(src.Pix[o10+c])*fx
+				bot := float64(src.Pix[o01+c])*(1-fx) + float64(src.Pix[o11+c])*fx
+				v := uint8(ClampInt(int(top*(1-fy)+bot*fy+0.5), 0, 255))
+				if darkBg {
+					v = 255 - v
+				}
+				dst.Pix[do+c] = v
+			}
+			dst.Pix[do+3] = 255
 		}
 	}
 	return dst
+}
+
+func sampleEdgeColor(src *image.RGBA) (r, g, b uint8) {
+	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
+	if sw <= 0 || sh <= 0 {
+		return 255, 255, 255
+	}
+	var sr, sg, sb, n int
+	stepX := max(1, sw/24)
+	stepY := max(1, sh/24)
+	add := func(x, y int) {
+		o := y*src.Stride + x*4
+		sr += int(src.Pix[o])
+		sg += int(src.Pix[o+1])
+		sb += int(src.Pix[o+2])
+		n++
+	}
+	for x := 0; x < sw; x += stepX {
+		add(x, 0)
+		add(x, sh-1)
+	}
+	for y := 0; y < sh; y += stepY {
+		add(0, y)
+		add(sw-1, y)
+	}
+	if n == 0 {
+		return 255, 255, 255
+	}
+	return uint8(sr / n), uint8(sg / n), uint8(sb / n)
 }
 
 // CleanOCRLine removes spurious inter-character spaces Windows OCR inserts between

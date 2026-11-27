@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+
+	"koma/internal/ocr"
 )
 
 // HotkeyAction identifies one of Koma's configurable global capture shortcuts.
@@ -63,6 +66,7 @@ type persistedSettings struct {
 	SaveDir     *string `json:"save_dir,omitempty"`
 	SaveFormat  *string `json:"save_format,omitempty"`
 	QuickSave   *bool   `json:"quick_save,omitempty"`
+	OCREngine   *string `json:"ocr_engine,omitempty"`
 }
 
 // SetSettingsPath overrides where settings.json is stored (used by tests and startup).
@@ -131,6 +135,9 @@ func (a *App) LoadSettings() error {
 	if ps.QuickSave != nil {
 		a.quickSave = *ps.QuickSave
 	}
+	if ps.OCREngine != nil {
+		a.ocrEngine = ocr.NormalizeEngine(*ps.OCREngine)
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -148,6 +155,7 @@ func (a *App) SaveSettings() error {
 	saveDir := a.saveDir
 	saveFmt := normalizeSaveFormat(a.saveFormat)
 	quickSave := a.quickSave
+	ocrEng := string(ocr.NormalizeEngine(string(a.ocrEngine)))
 	a.mu.Unlock()
 
 	if path == "" {
@@ -166,12 +174,200 @@ func (a *App) SaveSettings() error {
 		SaveDir:     &saveDir,
 		SaveFormat:  &saveFmt,
 		QuickSave:   &quickSave,
+		OCREngine:   &ocrEng,
 	}
 	data, err := json.MarshalIndent(ps, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+// OCRDownloadState summarizes PP-OCRv6 availability and active download progress for UI rendering.
+type OCRDownloadState struct {
+	Engine      ocr.Engine
+	Installed   bool
+	DiskBytes   int64
+	Downloading bool
+	Percent     float64
+	Stage       string
+	ErrMsg      string
+}
+
+// SetOCRDataDir overrides where on-demand PP-OCRv6 models are stored (used by tests).
+func (a *App) SetOCRDataDir(dir string) {
+	a.mu.Lock()
+	a.ocrDataDir = strings.TrimSpace(dir)
+	p := a.ppocr
+	a.mu.Unlock()
+	if p != nil {
+		p.SetDir(a.OCRDataDir())
+	}
+}
+
+// OCRDataDir returns the local storage directory for on-demand PP-OCRv6 models and runtime.
+func (a *App) OCRDataDir() string {
+	a.mu.Lock()
+	dir := a.ocrDataDir
+	settingsPath := a.settingsPath
+	a.mu.Unlock()
+	if dir != "" {
+		return dir
+	}
+	if userData, err := mygo.App.Path(mygo.PathUserData); err == nil && userData != "" {
+		return filepath.Join(userData, "ocr")
+	}
+	if settingsPath != "" {
+		return filepath.Join(filepath.Dir(settingsPath), "ocr")
+	}
+	if cfgDir, err := os.UserConfigDir(); err == nil && cfgDir != "" {
+		return filepath.Join(cfgDir, "Koma", "ocr")
+	}
+	return filepath.Join(".", "ocr")
+}
+
+// OCREngine returns the user's selected offline OCR engine.
+func (a *App) OCREngine() ocr.Engine {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return ocr.NormalizeEngine(string(a.ocrEngine))
+}
+
+// SetOCREngine updates and persists the preferred OCR engine.
+func (a *App) SetOCREngine(eng ocr.Engine) {
+	eng = ocr.NormalizeEngine(string(eng))
+	a.mu.Lock()
+	a.ocrEngine = eng
+	a.mu.Unlock()
+	_ = a.SaveSettings()
+}
+
+// PPOCRInstalled reports whether PP-OCRv6 models and ONNX Runtime are installed locally.
+func (a *App) PPOCRInstalled() bool {
+	return ocr.Installed(a.OCRDataDir())
+}
+
+// PPOCRStatus returns a snapshot of PP-OCRv6 installation & download status.
+func (a *App) PPOCRStatus() OCRDownloadState {
+	dir := a.OCRDataDir()
+	installed := ocr.Installed(dir)
+	var disk int64
+	if installed {
+		disk = ocr.DiskUsageBytes(dir)
+	}
+	a.mu.Lock()
+	st := OCRDownloadState{
+		Engine:      ocr.NormalizeEngine(string(a.ocrEngine)),
+		Installed:   installed,
+		DiskBytes:   disk,
+		Downloading: a.ocrDownloading,
+		Percent:     a.ocrDownloadPct,
+		Stage:       a.ocrDownloadMsg,
+		ErrMsg:      a.ocrDownloadErr,
+	}
+	a.mu.Unlock()
+	return st
+}
+
+// StartPPOCRDownload downloads and verifies PP-OCRv6 models + ONNX Runtime in the background.
+// When download completes successfully, Koma automatically switches to PP-OCRv6.
+func (a *App) StartPPOCRDownload() {
+	a.mu.Lock()
+	if a.ocrDownloading {
+		a.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.ocrDownloading = true
+	a.ocrDownloadPct = 0
+	a.ocrDownloadMsg = "准备下载…"
+	a.ocrDownloadErr = ""
+	a.ocrDownloadStop = cancel
+	a.mu.Unlock()
+	a.invalidateEditor()
+
+	dir := a.OCRDataDir()
+	go func() {
+		err := ocr.DownloadPPOCRv6(ctx, dir, func(p ocr.DownloadProgress) {
+			a.mu.Lock()
+			a.ocrDownloadPct = p.Percent
+			a.ocrDownloadMsg = p.Stage
+			a.mu.Unlock()
+			a.invalidateEditor()
+		})
+
+		a.mu.Lock()
+		a.ocrDownloading = false
+		a.ocrDownloadStop = nil
+		if err != nil {
+			a.ocrDownloadErr = err.Error()
+			a.ocrDownloadMsg = ""
+		} else {
+			a.ocrDownloadPct = 100
+			a.ocrDownloadMsg = ""
+			a.ocrDownloadErr = ""
+			a.ocrEngine = ocr.EnginePPOCRv6
+		}
+		p := a.ppocr
+		a.mu.Unlock()
+
+		if err == nil {
+			if p != nil {
+				p.SetDir(dir)
+			}
+			_ = a.SaveSettings()
+			a.NotifyToast("PP-OCRv6 模型已就绪，已切换为高精度识别")
+		} else if !strings.Contains(err.Error(), "取消") {
+			a.NotifyToast("PP-OCRv6 下载失败")
+		}
+		a.invalidateEditor()
+	}()
+}
+
+// CancelPPOCRDownload cancels an active PP-OCRv6 download if one is in progress.
+func (a *App) CancelPPOCRDownload() {
+	a.mu.Lock()
+	cancel := a.ocrDownloadStop
+	a.ocrDownloadStop = nil
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// DeletePPOCRModels unloads active ONNX sessions, removes local PP-OCRv6 files,
+// and switches the active OCR engine back to system native OCR.
+func (a *App) DeletePPOCRModels() error {
+	a.CancelPPOCRDownload()
+	a.mu.Lock()
+	p := a.ppocr
+	a.mu.Unlock()
+	if p != nil {
+		p.Release()
+	}
+	err := ocr.Uninstall(a.OCRDataDir())
+	a.mu.Lock()
+	if a.ocrEngine == ocr.EnginePPOCRv6 {
+		a.ocrEngine = ocr.EngineSystem
+	}
+	a.ocrDownloadErr = ""
+	a.mu.Unlock()
+	_ = a.SaveSettings()
+	reclaimMemoryAsync()
+	a.invalidateEditor()
+	if err == nil {
+		a.NotifyToast("已清理 PP-OCRv6 模型并切换回系统原生 OCR")
+	}
+	return err
+}
+
+func (a *App) invalidateEditor() {
+	a.mu.Lock()
+	w := a.editorWin
+	a.mu.Unlock()
+	if w != nil {
+		w.Update(func() {})
+	}
 }
 
 func normalizeSaveFormat(f string) string {

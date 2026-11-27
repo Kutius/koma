@@ -14,6 +14,7 @@ import (
 	"koma/internal/canvas"
 	"koma/internal/glasswork"
 	"koma/internal/icons"
+	"koma/internal/ocr"
 	"koma/internal/winapi"
 )
 
@@ -2112,141 +2113,297 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 						})
 					})
 
-					// Right column: Global Hotkeys
-					ui.Column(c).Grow(1).Gap(8).Children(func() {
-						ui.Row(c).AlignItems(ui.Center).Children(func() {
-							ui.Text(c, "全局快捷键").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent).Grow(1)
-							resetBtn := ui.Row(c.Key("settings-reset-hotkeys")).
-								Height(24).Padding(0, 10, 0, 10).Radius(12).AlignItems(ui.Center).
-								Role(ui.RoleButton).Label("恢复默认").
-								Cursor(ui.CursorPointer).Tooltip("恢复全部默认快捷键")
-							rCol := tk.textSecondary
-							if resetBtn.Hovered() {
-								resetBtn.Background(tk.hoverFill)
-								rCol = tk.inks.Accent
-							}
-							resetBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-							glasswork.ApplyLiquidButton(resetBtn, glasswork.CompactButtonOpts())
-							resetBtn.Children(func() {
-								ui.Text(c, "恢复默认").FontSize(11.5).FontWeight(600).TextColor(rCol).SingleLine()
-							})
-							if resetBtn.Clicked() {
-								e.stopRecordingHotkey()
-								if err := e.app.ResetDefaultHotkeys(); err != nil {
-									e.settingsErr = err.Error()
-								} else {
-									e.settingsErr = ""
-									e.SetToast("已恢复默认快捷键")
+					// Right column: Global Hotkeys + Offline OCR Engine
+					ui.Column(c).Grow(1).Gap(14).Children(func() {
+						// Section 4: Global Hotkeys
+						ui.Column(c).Gap(8).Children(func() {
+							ui.Row(c).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, "全局快捷键").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent).Grow(1)
+								resetBtn := ui.Row(c.Key("settings-reset-hotkeys")).
+									Height(24).Padding(0, 10, 0, 10).Radius(12).AlignItems(ui.Center).
+									Role(ui.RoleButton).Label("恢复默认").
+									Cursor(ui.CursorPointer).Tooltip("恢复全部默认快捷键")
+								rCol := tk.textSecondary
+								if resetBtn.Hovered() {
+									resetBtn.Background(tk.hoverFill)
+									rCol = tk.inks.Accent
 								}
+								resetBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+								glasswork.ApplyLiquidButton(resetBtn, glasswork.CompactButtonOpts())
+								resetBtn.Children(func() {
+									ui.Text(c, "恢复默认").FontSize(11.5).FontWeight(600).TextColor(rCol).SingleLine()
+								})
+								if resetBtn.Clicked() {
+									e.stopRecordingHotkey()
+									if err := e.app.ResetDefaultHotkeys(); err != nil {
+										e.settingsErr = err.Error()
+									} else {
+										e.settingsErr = ""
+										e.SetToast("已恢复默认快捷键")
+									}
+								}
+							})
+
+							for i, meta := range hotkeyOrder {
+								idx := i
+								m := meta
+								acc := e.app.Hotkey(m.Action)
+								recording := e.recordingHotkey == m.Action
+
+								ui.Row(c.Key("hk-row-"+string(m.Action))).
+									Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(6).
+									Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+									ui.Text(c, m.Label).FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
+
+									recLabel := FormatHotkeyDisplay(acc)
+									recTip := "点击录制快捷键（录制时按 Backspace 可取消）"
+									if recording {
+										recLabel = "请按下快捷键…"
+										recTip = "按下组合键保存，Esc 退出，Backspace 取消快捷键"
+									}
+
+									pill := ui.Row(c.Key("hk-rec-"+string(m.Action))).
+										Height(28).MinWidth(124).Padding(0, 11, 0, 11).Radius(14).
+										AlignItems(ui.Center).Justify(ui.Center).
+										Focusable().Bind(&e.hotkeyRecHandles[idx]).
+										Role(ui.RoleButton).Label("修改" + m.Label + "快捷键").
+										Cursor(ui.CursorPointer).Tooltip(recTip)
+
+									fg := tk.textPrimary
+									if recording {
+										pill.Background(tk.inks.AccentFill).Border(1.5, tk.inks.Accent)
+										fg = tk.inks.Accent
+									} else {
+										if acc == "" {
+											fg = tk.textTertiary
+										}
+										if pill.Hovered() {
+											pill.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+										} else {
+											pill.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+										}
+									}
+									pill.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+									glasswork.ApplyLiquidButton(pill, glasswork.CompactButtonOpts())
+
+									if recording {
+										pill.HandleInput(func(ev ui.InputEvent) bool {
+											if ev.Kind != ui.InputKeyDown {
+												return false
+											}
+											nextAcc, clear, cancel, ignored, errMsg := ParseHotkeyInput(ev)
+											if ignored {
+												return true
+											}
+											if cancel {
+												e.stopRecordingHotkey()
+												e.settingsErr = ""
+												return true
+											}
+											if clear {
+												e.commitHotkey(m.Action, "")
+												return true
+											}
+											if errMsg != "" {
+												e.settingsErr = errMsg
+												return true
+											}
+											e.commitHotkey(m.Action, nextAcc)
+											return true
+										})
+									}
+
+									pill.Children(func() {
+										ui.Text(c, recLabel).FontSize(11.5).FontWeight(600).TextColor(fg).SingleLine()
+									})
+
+									if pill.Clicked() {
+										if recording {
+											e.stopRecordingHotkey()
+											e.settingsErr = ""
+										} else {
+											e.startRecordingHotkey(c, idx, m.Action)
+										}
+									}
+
+									if acc != "" && !recording {
+										clrBtn := ui.Box(c.Key("hk-clr-"+string(m.Action))).
+											Size(24, 24).Center().Radius(12).
+											Role(ui.RoleButton).Label("取消" + m.Label + "快捷键").
+											Cursor(ui.CursorPointer).Tooltip("取消快捷键")
+										cCol := tk.textTertiary
+										hov := clrBtn.Hovered()
+										if hov {
+											clrBtn.Background(tk.inks.DangerFill)
+											cCol = tk.inks.Danger
+										}
+										clrBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+										glasswork.ApplyLiquidButton(clrBtn, glasswork.CompactButtonOpts())
+										clrBtn.Children(func() {
+											ui.Icon(c, icons.Close.For(hov || clrBtn.Pressed())).Size(14, 14).TextColor(cCol).ContentTransition(ui.ContentTransition{})
+										})
+										if clrBtn.Clicked() {
+											e.commitHotkey(m.Action, "")
+										}
+									} else {
+										ui.Box(c).Size(24, 24)
+									}
+								})
 							}
 						})
 
-						for i, meta := range hotkeyOrder {
-							idx := i
-							m := meta
-							acc := e.app.Hotkey(m.Action)
-							recording := e.recordingHotkey == m.Action
+						// Section 5: Offline OCR Engine & On-Demand PP-OCRv6
+						ocrSt := e.app.PPOCRStatus()
+						ui.Column(c).Gap(8).Children(func() {
+							ui.Text(c, "文字识别").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
 
-							ui.Row(c.Key("hk-row-"+string(m.Action))).
-								Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(6).
+							ui.Row(c.Key("settings-ocr-engine-row")).
+								Height(38).Padding(0, 12, 0, 12).Radius(13).
 								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
-								ui.Text(c, m.Label).FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
-
-								recLabel := FormatHotkeyDisplay(acc)
-								recTip := "点击录制快捷键（录制时按 Backspace 可取消）"
-								if recording {
-									recLabel = "请按下快捷键…"
-									recTip = "按下组合键保存，Esc 退出，Backspace 取消快捷键"
-								}
-
-								pill := ui.Row(c.Key("hk-rec-"+string(m.Action))).
-									Height(28).MinWidth(124).Padding(0, 11, 0, 11).Radius(14).
-									AlignItems(ui.Center).Justify(ui.Center).
-									Focusable().Bind(&e.hotkeyRecHandles[idx]).
-									Role(ui.RoleButton).Label("修改" + m.Label + "快捷键").
-									Cursor(ui.CursorPointer).Tooltip(recTip)
-
-								fg := tk.textPrimary
-								if recording {
-									pill.Background(tk.inks.AccentFill).Border(1.5, tk.inks.Accent)
-									fg = tk.inks.Accent
-								} else {
-									if acc == "" {
-										fg = tk.textTertiary
+								ui.Text(c, "识别引擎").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).Grow(1)
+								ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+									if appleSubChipScoped(c, tk, "系统原生", ocrSt.Engine == ocr.EngineSystem, "settings-ocr-engine") {
+										e.app.SetOCREngine(ocr.EngineSystem)
+										e.SetToast("已切换为系统原生文字识别")
 									}
-									if pill.Hovered() {
-										pill.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
-									} else {
-										pill.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									if appleSubChipScoped(c, tk, "PP-OCRv6", ocrSt.Engine == ocr.EnginePPOCRv6, "settings-ocr-engine") {
+										if ocrSt.Installed {
+											e.app.SetOCREngine(ocr.EnginePPOCRv6)
+											e.SetToast("已切换为本地 PP-OCRv6 高精度识别")
+										} else if !ocrSt.Downloading {
+											e.app.StartPPOCRDownload()
+											e.SetToast("开始按需下载 PP-OCRv6 本地模型…")
+										} else {
+											e.SetToast("PP-OCRv6 模型正在下载中…")
+										}
 									}
-								}
-								pill.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-								glasswork.ApplyLiquidButton(pill, glasswork.CompactButtonOpts())
-
-								if recording {
-									pill.HandleInput(func(ev ui.InputEvent) bool {
-										if ev.Kind != ui.InputKeyDown {
-											return false
-										}
-										nextAcc, clear, cancel, ignored, errMsg := ParseHotkeyInput(ev)
-										if ignored {
-											return true
-										}
-										if cancel {
-											e.stopRecordingHotkey()
-											e.settingsErr = ""
-											return true
-										}
-										if clear {
-											e.commitHotkey(m.Action, "")
-											return true
-										}
-										if errMsg != "" {
-											e.settingsErr = errMsg
-											return true
-										}
-										e.commitHotkey(m.Action, nextAcc)
-										return true
-									})
-								}
-
-								pill.Children(func() {
-									ui.Text(c, recLabel).FontSize(11.5).FontWeight(600).TextColor(fg).SingleLine()
 								})
+							})
 
-								if pill.Clicked() {
-									if recording {
-										e.stopRecordingHotkey()
-										e.settingsErr = ""
-									} else {
-										e.startRecordingHotkey(c, idx, m.Action)
+							ui.Row(c.Key("settings-ocr-model-row")).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(8).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								if ocrSt.Downloading {
+									stage := ocrSt.Stage
+									if stage == "" {
+										stage = "下载中…"
 									}
-								}
+									ui.Text(c, stage).FontSize(12).FontWeight(500).TextColor(tk.textPrimary).SingleLine().Shrink(0)
 
-								if acc != "" && !recording {
-									clrBtn := ui.Box(c.Key("hk-clr-"+string(m.Action))).
-										Size(24, 24).Center().Radius(12).
-										Role(ui.RoleButton).Label("取消" + m.Label + "快捷键").
-										Cursor(ui.CursorPointer).Tooltip("取消快捷键")
-									cCol := tk.textTertiary
-									hov := clrBtn.Hovered()
-									if hov {
-										clrBtn.Background(tk.inks.DangerFill)
-										cCol = tk.inks.Danger
+									pct := float32(ocrSt.Percent / 100.0)
+									if pct < 0 {
+										pct = 0
+									} else if pct > 1 {
+										pct = 1
 									}
-									clrBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
-									glasswork.ApplyLiquidButton(clrBtn, glasswork.CompactButtonOpts())
-									clrBtn.Children(func() {
-										ui.Icon(c, icons.Close.For(hov || clrBtn.Pressed())).Size(14, 14).TextColor(cCol).ContentTransition(ui.ContentTransition{})
+									trackCol := tk.hairline
+									if tk.dark {
+										trackCol = ui.RGBA(255, 255, 255, 0.16)
+									}
+									accentCol := tk.accent
+									ui.Box(c.Key("settings-ocr-progress")).Height(6).Grow(1).Radius(3).Draw(func(pt *ui.Painter, r ui.Rect) {
+										pt.Fill(r, trackCol, r.H/2)
+										if pct > 0.01 {
+											fillW := r.W * pct
+											if fillW < r.H {
+												fillW = r.H
+											}
+											pt.Fill(ui.Rect{X: r.X, Y: r.Y, W: fillW, H: r.H}, accentCol, r.H/2)
+										}
 									})
-									if clrBtn.Clicked() {
-										e.commitHotkey(m.Action, "")
+
+									ui.Textf(c, "%d%%", int(math.Round(ocrSt.Percent))).
+										FontSize(11.5).FontWeight(600).TextColor(tk.inks.Accent).SingleLine().Shrink(0).
+										ContentTransition(glasswork.ContentNumeric)
+
+									cancelBtn := ui.Row(c.Key("settings-ocr-cancel")).
+										Height(26).Padding(0, 10, 0, 10).Radius(13).AlignItems(ui.Center).Shrink(0).
+										Role(ui.RoleButton).Label("取消下载").
+										Cursor(ui.CursorPointer).Tooltip("取消 PP-OCRv6 模型下载")
+									cFg := tk.textSecondary
+									if cancelBtn.Hovered() {
+										cancelBtn.Background(tk.inks.DangerFill)
+										cFg = tk.inks.Danger
+									} else {
+										cancelBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									}
+									cancelBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+									glasswork.ApplyLiquidButton(cancelBtn, glasswork.CompactButtonOpts())
+									cancelBtn.Children(func() {
+										ui.Text(c, "取消").FontSize(11.5).FontWeight(600).TextColor(cFg).SingleLine()
+									})
+									if cancelBtn.Clicked() {
+										e.app.CancelPPOCRDownload()
+									}
+								} else if ocrSt.Installed {
+									mb := float64(ocrSt.DiskBytes) / (1024 * 1024)
+									ui.Row(c).AlignItems(ui.Center).Gap(6).Grow(1).Children(func() {
+										ui.Text(c, "PP-OCRv6").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine()
+										ui.Box(c).Padding(2, 7, 2, 7).Radius(8).
+											Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder).Children(func() {
+											ui.Textf(c, "已就绪 · %.1f MB", mb).FontSize(11).FontWeight(600).TextColor(tk.inks.Accent).SingleLine()
+										})
+									})
+
+									delBtn := ui.Row(c.Key("settings-ocr-delete")).
+										Height(26).Padding(0, 10, 0, 10).Radius(13).AlignItems(ui.Center).Shrink(0).
+										Role(ui.RoleButton).Label("清理模型").
+										Cursor(ui.CursorPointer).Tooltip("删除本地 PP-OCRv6 模型并切回系统原生")
+									dFg := tk.textSecondary
+									if delBtn.Hovered() {
+										delBtn.Background(tk.inks.DangerFill)
+										dFg = tk.inks.Danger
+									} else {
+										delBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									}
+									delBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+									glasswork.ApplyLiquidButton(delBtn, glasswork.CompactButtonOpts())
+									delBtn.Children(func() {
+										ui.Text(c, "清理").FontSize(11.5).FontWeight(600).TextColor(dFg).SingleLine()
+									})
+									if delBtn.Clicked() {
+										if err := e.app.DeletePPOCRModels(); err != nil {
+											e.settingsErr = err.Error()
+										} else {
+											e.settingsErr = ""
+										}
 									}
 								} else {
-									ui.Box(c).Size(24, 24)
+									ui.Row(c).AlignItems(ui.Center).Gap(6).Grow(1).Children(func() {
+										ui.Text(c, "PP-OCRv6").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine()
+										if ocrSt.ErrMsg != "" {
+											ui.Text(c, "下载失败").FontSize(11.5).FontWeight(600).TextColor(tk.inks.Danger).SingleLine().Tooltip(ocrSt.ErrMsg)
+										} else {
+											ui.Text(c, "未下载 · ~30 MB").FontSize(11.5).FontWeight(500).TextColor(tk.textSecondary).SingleLine()
+										}
+									})
+
+									dlLabel := "下载模型"
+									if ocrSt.ErrMsg != "" {
+										dlLabel = "重试"
+									}
+									dlBtn := ui.Row(c.Key("settings-ocr-download")).
+										Height(28).Padding(0, 12, 0, 12).Radius(14).AlignItems(ui.Center).Shrink(0).
+										Role(ui.RoleButton).Label(dlLabel).
+										Cursor(ui.CursorPointer).Tooltip("按需下载 PP-OCRv6 模型与 ONNX Runtime (~30 MB)")
+									dlFg := tk.textPrimary
+									if dlBtn.Hovered() {
+										dlBtn.Background(tk.hoverFill).Border(1, tk.inks.AccentBorder)
+										dlFg = tk.inks.Accent
+									} else {
+										dlBtn.Background(tk.cardBg.Alpha(0.55)).Border(1, tk.hairline)
+									}
+									dlBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+									glasswork.ApplyLiquidButton(dlBtn, glasswork.CompactButtonOpts())
+									dlBtn.Children(func() {
+										ui.Text(c, dlLabel).FontSize(11.5).FontWeight(600).TextColor(dlFg).SingleLine()
+									})
+									if dlBtn.Clicked() {
+										e.app.StartPPOCRDownload()
+									}
 								}
 							})
-						}
+						})
 					})
 				})
 

@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/draw"
@@ -20,6 +21,7 @@ import (
 
 	"koma/internal/canvas"
 	"koma/internal/icons"
+	"koma/internal/ocr"
 	"koma/internal/winapi"
 )
 
@@ -77,6 +79,16 @@ type App struct {
 	saveFormat     string
 	quickSave      bool
 
+	// Offline OCR engine selection & on-demand PP-OCRv6 model manager
+	ocrEngine       ocr.Engine
+	ocrDataDir      string
+	ppocr           *ocr.PPOCREngine
+	ocrDownloading  bool
+	ocrDownloadPct  float64
+	ocrDownloadMsg  string
+	ocrDownloadErr  string
+	ocrDownloadStop context.CancelFunc
+
 	// Auto-updater state (backed by MyGo's native updater plugin when running)
 	updaterReady     bool
 	autoCheckUpdates bool
@@ -98,12 +110,14 @@ func New() *App {
 		darkMode:         false, // Crisp Apple Light Studio default (toggleable to Space Graphite Dark)
 		autoCheckUpdates: true,
 		saveFormat:       SaveFormatPNG,
+		ocrEngine:        ocr.EngineSystem,
 		hotkeyArea:       DefaultHotkeyArea,
 		hotkeyLong:       DefaultHotkeyLong,
 		hotkeyFull:       DefaultHotkeyFull,
 		hotkeyDelay:      DefaultHotkeyDelay,
 		hotkeyPin:        DefaultHotkeyPin,
 	}
+	a.ppocr = ocr.NewPPOCREngine("")
 	a.toastHUD = newGlobalToastHUD(a)
 	a.delayHUD = newDelayCountdownHUD(a)
 	a.editor = NewEditorState(a)
@@ -364,6 +378,10 @@ func (a *App) Quit() {
 	}
 	if ocrW != nil {
 		ocrW.Close()
+	}
+	a.CancelPPOCRDownload()
+	if a.ppocr != nil {
+		a.ppocr.Release()
 	}
 	if ov != nil {
 		ov.closeAll()

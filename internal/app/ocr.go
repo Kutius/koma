@@ -11,55 +11,89 @@ import (
 
 	"koma/internal/glasswork"
 	"koma/internal/icons"
+	"koma/internal/ocr"
 	"koma/internal/winapi"
 )
 
 // ocrResultWindow is a lightweight, transient Liquid Glass card presenting
-// offline Windows OCR results with selectable/editable text and one-click copy.
+// offline OCR results (PP-OCRv6 or enhanced Windows native OCR) with
+// selectable/editable text, one-click engine switch, and one-click copy.
 // Closing the window drops all buffers and triggers immediate memory reclaim.
 type ocrResultWindow struct {
 	mu      sync.Mutex
 	app     *App
 	win     *mygo.Window
+	srcImg  *image.RGBA
+	engine  ocr.Engine
 	loading bool
 	text    string
 	errMsg  string
 	lines   int
 }
 
-// RecognizeTextFromImage runs Windows native offline OCR on img asynchronously
-// and presents the recognized text in a lightweight Liquid Glass result card.
+// RecognizeTextFromImage runs offline OCR (PP-OCRv6 when selected & installed,
+// otherwise enhanced Windows native OCR) asynchronously and presents the result
+// in a lightweight Liquid Glass card.
 func (a *App) RecognizeTextFromImage(img *image.RGBA) {
 	if img == nil {
 		return
 	}
-
+	eng := a.OCREngine()
+	if eng == ocr.EnginePPOCRv6 && !a.PPOCRInstalled() {
+		eng = ocr.EngineSystem
+	}
 	ow := a.openOCRWindow()
-	ow.mu.Lock()
-	ow.loading = true
-	ow.text = ""
-	ow.errMsg = ""
-	ow.lines = 0
-	w := ow.win
-	ow.mu.Unlock()
+	ow.runRecognition(img, eng)
+}
+
+func (o *ocrResultWindow) runRecognition(img *image.RGBA, eng ocr.Engine) {
+	o.mu.Lock()
+	o.srcImg = img
+	o.engine = eng
+	o.loading = true
+	o.text = ""
+	o.errMsg = ""
+	o.lines = 0
+	w := o.win
+	o.mu.Unlock()
 	if w != nil {
 		w.Update(func() {})
 	}
 
 	go func() {
-		res, err := winapi.RecognizeText(img)
-		ow.mu.Lock()
-		ow.loading = false
-		if err != nil {
-			ow.errMsg = err.Error()
-		} else if strings.TrimSpace(res.Text) == "" {
-			ow.errMsg = "未在选区中识别到可提取的文字"
+		var (
+			res winapi.OCRResult
+			err error
+		)
+		used := eng
+		if eng == ocr.EnginePPOCRv6 {
+			o.app.ppocr.SetDir(o.app.OCRDataDir())
+			res, err = o.app.ppocr.Recognize(img)
+			if err != nil {
+				// Graceful fallback to Windows native OCR if PP-OCRv6 fails to load/infer.
+				if sysRes, sysErr := winapi.RecognizeText(img); sysErr == nil {
+					res = sysRes
+					err = nil
+					used = ocr.EngineSystem
+				}
+			}
 		} else {
-			ow.text = res.Text
-			ow.lines = len(res.Lines)
+			res, err = winapi.RecognizeText(img)
 		}
-		win := ow.win
-		ow.mu.Unlock()
+
+		o.mu.Lock()
+		o.engine = used
+		o.loading = false
+		if err != nil {
+			o.errMsg = err.Error()
+		} else if strings.TrimSpace(res.Text) == "" {
+			o.errMsg = "未在选区中识别到可提取的文字"
+		} else {
+			o.text = res.Text
+			o.lines = len(res.Lines)
+		}
+		win := o.win
+		o.mu.Unlock()
 		if win != nil {
 			win.Update(func() {})
 		}
@@ -125,6 +159,7 @@ func (a *App) openOCRWindow() *ocrResultWindow {
 		}
 		a.mu.Unlock()
 		ow.mu.Lock()
+		ow.srcImg = nil
 		ow.text = ""
 		ow.errMsg = ""
 		ow.win = nil
@@ -179,8 +214,13 @@ func (o *ocrResultWindow) view(c *ui.Context) {
 	loading := o.loading
 	errMsg := o.errMsg
 	lines := o.lines
+	eng := o.engine
+	srcImg := o.srcImg
 	textLen := len([]rune(o.text))
 	o.mu.Unlock()
+	if eng == "" {
+		eng = o.app.OCREngine()
+	}
 
 	kind := glasswork.KindLight
 	textPrimary := ui.Hex("#0F172A")
@@ -207,6 +247,46 @@ func (o *ocrResultWindow) view(c *ui.Context) {
 			ui.Row(c).AlignItems(ui.Center).Gap(8).DragWindow().Children(func() {
 				ui.Icon(c, icons.OCR.Idle).Size(19, 19).TextColor(inks.Accent).Shrink(0)
 				ui.Text(c, "文字识别").FontSize(15).FontWeight(700).TextColor(textPrimary).SingleLine()
+
+				// Interactive engine pill: switch engines immediately if PP-OCRv6 is installed,
+				// or jump straight to Settings to download PP-OCRv6 on demand.
+				ppInstalled := o.app.PPOCRInstalled()
+				engTip := "点击前往「设置 → 文字识别」按需下载高精度 PP-OCRv6"
+				if ppInstalled {
+					if eng == ocr.EnginePPOCRv6 {
+						engTip = "当前使用 PP-OCRv6，点击切换为系统原生重识别"
+					} else {
+						engTip = "当前使用系统原生，点击切换为 PP-OCRv6 重识别"
+					}
+				}
+				engPill := ui.Row(c.Key("ocr-engine-pill")).
+					Padding(2, 8, 2, 8).Radius(8).AlignItems(ui.Center).Shrink(0).
+					Background(inks.Hover).Border(1, hairline).
+					Role(ui.RoleButton).Label("切换识别引擎").
+					Cursor(ui.CursorPointer).Tooltip(engTip)
+				if eng == ocr.EnginePPOCRv6 {
+					engPill.Background(inks.AccentFill).Border(1, inks.AccentBorder)
+				}
+				engCol := textSecondary
+				if eng == ocr.EnginePPOCRv6 {
+					engCol = inks.Accent
+				}
+				engPill.Children(func() {
+					ui.Text(c, eng.DisplayName()).FontSize(11).FontWeight(600).TextColor(engCol).SingleLine()
+				})
+				if engPill.Clicked() && !loading {
+					if ppInstalled && srcImg != nil {
+						next := ocr.EnginePPOCRv6
+						if eng == ocr.EnginePPOCRv6 {
+							next = ocr.EngineSystem
+						}
+						o.app.SetOCREngine(next)
+						o.runRecognition(srcImg, next)
+					} else {
+						o.app.ShowSettings()
+					}
+				}
+
 				if !loading && errMsg == "" && textLen > 0 {
 					ui.Box(c).Padding(2, 8, 2, 8).Radius(8).
 						Background(inks.AccentFill).Border(1, inks.AccentBorder).Children(func() {
@@ -292,6 +372,7 @@ func (o *ocrResultWindow) view(c *ui.Context) {
 func NewTestOCRView(a *App, text string, lines int) func(*ui.Context) {
 	ow := &ocrResultWindow{
 		app:     a,
+		engine:  a.OCREngine(),
 		loading: false,
 		text:    text,
 		lines:   lines,

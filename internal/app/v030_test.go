@@ -11,6 +11,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"koma/internal/canvas"
+	"koma/internal/ocr"
 )
 
 func TestFormatPickedColorFormats(t *testing.T) {
@@ -84,6 +85,7 @@ func TestQuickSaveAndSettingsSavePreferences(t *testing.T) {
 	a.SetSaveDir(saveDir)
 	a.SetSaveFormat(SaveFormatJPEG)
 	a.SetQuickSave(true)
+	a.SetOCREngine(ocr.EnginePPOCRv6)
 	if err := a.SetHotkey(HotkeyLong, "Alt+L"); err != nil {
 		t.Fatalf("SetHotkey(HotkeyLong) failed: %v", err)
 	}
@@ -94,9 +96,9 @@ func TestQuickSaveAndSettingsSavePreferences(t *testing.T) {
 	if err := b.LoadSettings(); err != nil {
 		t.Fatalf("LoadSettings failed: %v", err)
 	}
-	if b.SaveDir() != saveDir || b.SaveFormat() != SaveFormatJPEG || !b.QuickSave() || b.Hotkey(HotkeyLong) != "Alt+L" {
-		t.Fatalf("reloaded settings mismatch: dir=%q fmt=%q quick=%v long=%q",
-			b.SaveDir(), b.SaveFormat(), b.QuickSave(), b.Hotkey(HotkeyLong))
+	if b.SaveDir() != saveDir || b.SaveFormat() != SaveFormatJPEG || !b.QuickSave() || b.Hotkey(HotkeyLong) != "Alt+L" || b.OCREngine() != ocr.EnginePPOCRv6 {
+		t.Fatalf("reloaded settings mismatch: dir=%q fmt=%q quick=%v long=%q ocr=%q",
+			b.SaveDir(), b.SaveFormat(), b.QuickSave(), b.Hotkey(HotkeyLong), b.OCREngine())
 	}
 
 	// QuickSaveImage writes a valid JPEG file into saveDir without any dialog
@@ -139,13 +141,30 @@ func TestPinImageTransforms(t *testing.T) {
 
 func TestOCRResultWindowHeadless(t *testing.T) {
 	a := New()
+	a.SetOCRDataDir(t.TempDir())
 	view := NewTestOCRView(a, "Koma 截图工具\n一帧清光，恰如其分。", 2)
 	tt := ui.NewTester(view, 480, 380)
 	if !tt.HasText("文字识别") || !tt.HasText("复制并关闭") {
 		t.Fatalf("expected OCR card header and CTA, got texts: %q", tt.Texts())
 	}
+	if !tt.HasText("系统原生") {
+		t.Fatalf("expected OCR engine badge in result header, got texts: %q", tt.Texts())
+	}
 	if _, ok := tt.Find("仅复制"); !ok {
 		t.Fatalf("expected 仅复制 button in OCR result window")
+	}
+}
+
+func TestSettingsOCRControlsHeadless(t *testing.T) {
+	a := New()
+	a.SetSettingsPath(filepath.Join(t.TempDir(), "settings.json"))
+	a.SetOCRDataDir(t.TempDir())
+	a.editor.OpenSettings()
+	tt := ui.NewTester(a.editor.View, 1180, 760)
+	for _, want := range []string{"文字识别", "识别引擎", "系统原生", "PP-OCRv6", "下载模型"} {
+		if !tt.HasText(want) {
+			t.Fatalf("expected Settings sheet to display %q, got texts: %q", want, tt.Texts())
+		}
 	}
 }
 

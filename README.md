@@ -35,7 +35,7 @@
 ## 特性
 
 - **QQ 截图式原位交互**：按下 `Ctrl+Shift+A` 原地冻结多显示器画面，自动吸附 DWM 窗口轮廓；直接在遮罩上框选、原地文字输入、拖拽微调标注、打码、测距与方向键 1px 调边，双击选区或按 `Enter` 即刻复制并退出，右键重新框选或退出。
-- **原生离线 OCR 取字**：直接调用 Windows 系统内置 `Windows.Media.Ocr`（零额外模型与常驻内存），在原位截屏、桌面贴图与工作台中均可一键提取中英文文字并划词或整段复制。
+- **双引擎离线 OCR 取字**：默认调用经 2× 超分与深色反色增强的 Windows 原生 `Windows.Media.Ocr`（零额外模型），并支持在「设置 → 文字识别」中按需下载纯 Go 本地 **PP-OCRv6** 模型实现中英混排与代码高精度识别，空闲 60 秒自动释放推理内存。
 - **滚动长截图**：按下 `Ctrl+Shift+L` 或选区后按 `L` 即刻进入穿透式滚动拼接，支持手动滚轮与一键自动滚动（自动检测到达底部、智能剔除固定顶栏/底栏与滚动条），右侧悬浮液态玻璃实时长图预览，完成后一键复制、编辑、贴图或保存。
 - **桌面悬浮贴图（Pin）**：将任意截图或剪贴板图像钉在桌面最顶层，左键自由拖拽、滚轮无级缩放（25%–400%）、`Alt + 滚轮` 调节透明度，右键菜单支持保存、OCR、旋转/翻转与鼠标穿透。
 - **物理光学 Liquid Glass**：GPU 着色器实现曲面穹顶折射、边缘色散、定向高光、底部暖色焦散，以及基于背景亮度的自适应对比度。
@@ -46,7 +46,7 @@
 
 前往 [Releases](https://github.com/Kutius/koma/releases) 下载：
 - `Koma.exe` — 单文件便携版，双击即用
-- `koma-setup-0.3.0-amd64.exe` — Windows 安装程序（支持应用内自动更新）
+- `koma-setup-0.3.1-amd64.exe` — Windows 安装程序（支持应用内自动更新）
 
 ## 快捷键
 
@@ -80,13 +80,14 @@ go tool mygo build
 
 构建产物位于 `build/windows-amd64/`：
 - `Koma.exe` — 独立便携版
-- `koma-setup-0.3.0-amd64.exe` — Windows 安装程序
+- `koma-setup-0.3.1-amd64.exe` — Windows 安装程序
 
 ## 致谢
 
 - 原生 UI 框架：[MyGo](https://github.com/egoist/mygo)
 - 界面图标：[Solar Icons](https://icon-sets.iconify.design/solar/)（CC BY 4.0）
 - 光学玻璃着色器与动效灵感：[liquid-glass](https://github.com/bilalgursen/liquid-glass)、[glasswork](https://github.com/kubai087/glasswork)
+- 本地高精度 OCR 模型与推理引擎：[RapidOCR](https://github.com/RapidAI/RapidOCR)（PP-OCRv6）、[ONNX Runtime](https://github.com/microsoft/onnxruntime)
 
 ## License
 

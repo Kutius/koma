@@ -64,6 +64,25 @@ func TestWindowsNativeOCREndToEnd(t *testing.T) {
 	if len(res.Lines) < 2 {
 		t.Fatalf("expected at least 2 recognized lines, got %d (%q)", len(res.Lines), res.Text)
 	}
+
+	// Dark background UI screenshot (auto-inverted + 2x bilinear upscaled + padded).
+	darkSVG := `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="120" viewBox="0 0 480 120">
+		<rect width="480" height="120" fill="#18181b"/>
+		<text x="28" y="72" fill="#f4f4f5" font-family="Segoe UI, Arial, sans-serif" font-size="34" font-weight="600">DARK MODE OCR</text>
+	</svg>`
+	darkParsed, err := ui.ParseSVG([]byte(darkSVG))
+	if err != nil {
+		t.Fatalf("ParseSVG dark failed: %v", err)
+	}
+	darkImg := darkParsed.Image(480, 120, color.RGBA{0x18, 0x18, 0x1b, 0xff})
+	darkRes, err := RecognizeText(darkImg)
+	if err != nil {
+		t.Fatalf("RecognizeText(dark) failed: %v", err)
+	}
+	t.Logf("Native Windows OCR Dark output: %q", darkRes.Text)
+	if !strings.Contains(strings.ToUpper(darkRes.Text), "DARK") && !strings.Contains(strings.ToUpper(darkRes.Text), "MODE") {
+		t.Fatalf("expected dark-mode OCR to recognize DARK or MODE, got %q", darkRes.Text)
+	}
 }
 
 func TestRecognizeTextRejectsTinyOrNil(t *testing.T) {

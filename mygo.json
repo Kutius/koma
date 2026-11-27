@@ -1,7 +1,7 @@
 {
   "name": "Koma",
   "identifier": "app.koma.capture",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "out": "build",
   "updates": {
     "publicKey": "kTd5/5mclWb0Gy9B2U4NoqY4M4tUdlc+IzfFgRKlbz8=",
