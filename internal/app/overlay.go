@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -13,6 +14,7 @@ import (
 	"koma/internal/canvas"
 	"koma/internal/glasswork"
 	"koma/internal/icons"
+	"koma/internal/redact"
 	"koma/internal/winapi"
 )
 
@@ -101,6 +103,7 @@ type overlayPane struct {
 
 	// In-place QQ-style annotation state (monitor physical pixels)
 	activeTool  canvas.Tool
+	mosaicStyle canvas.MosaicStyle
 	colorIdx    int
 	strokeWidth float32
 	filled      bool
@@ -110,6 +113,17 @@ type overlayPane struct {
 	blockSize   float64
 	nextAnnID   int
 	nextCounter int
+
+	// Offline smart redaction & point-to-redact OCR word cache (scoped to current selection)
+	redactMu      sync.Mutex
+	redactBusy    bool
+	redactGen     int
+	ocrWords      []winapi.OCRWord
+	ocrLines      []winapi.OCRWord
+	ocrSelRect    image.Rectangle
+	pendingRedact *pendingRedactOutcome
+	redactNotice  string
+	redactUntil   time.Time
 
 	annotations []canvas.Annotation
 	undoStack   [][]canvas.Annotation
@@ -164,6 +178,16 @@ func (s *overlaySession) closeAll() {
 	s.app.scheduleTrayTrim()
 }
 
+type pendingRedactOutcome struct {
+	gen       int
+	selRect   image.Rectangle
+	words     []winapi.OCRWord
+	kind      canvas.Tool
+	style     canvas.MosaicStyle
+	blockSize int
+	errMsg    string
+}
+
 func (p *overlayPane) releaseBuffers() {
 	p.bmp = nil
 	p.loupeRGBA = nil
@@ -174,6 +198,20 @@ func (p *overlayPane) releaseBuffers() {
 	p.annotations = nil
 	p.undoStack = nil
 	p.redoStack = nil
+	p.clearRedactCache()
+}
+
+func (p *overlayPane) clearRedactCache() {
+	p.redactMu.Lock()
+	p.redactGen++
+	p.redactBusy = false
+	p.pendingRedact = nil
+	p.redactMu.Unlock()
+	p.ocrWords = nil
+	p.ocrLines = nil
+	p.ocrSelRect = image.Rectangle{}
+	p.redactNotice = ""
+	p.redactUntil = time.Time{}
 }
 
 // StartAreaCapture freezes all monitors instantaneously, detects desktop windows
@@ -271,11 +309,16 @@ type TestOverlayHandle struct {
 	View func(*ui.Context)
 }
 
-func (h *TestOverlayHandle) ActiveTool() canvas.Tool { return h.pane.activeTool }
-func (h *TestOverlayHandle) HasSelection() bool      { return h.pane.hasSelection }
-func (h *TestOverlayHandle) ColorIdx() int           { return h.pane.colorIdx }
+func (h *TestOverlayHandle) ActiveTool() canvas.Tool          { return h.pane.activeTool }
+func (h *TestOverlayHandle) MosaicStyle() canvas.MosaicStyle  { return h.pane.mosaicStyle }
+func (h *TestOverlayHandle) SetMosaicStyle(s canvas.MosaicStyle) { h.pane.mosaicStyle = s }
+func (h *TestOverlayHandle) HasSelection() bool               { return h.pane.hasSelection }
+func (h *TestOverlayHandle) ColorIdx() int                    { return h.pane.colorIdx }
 func (h *TestOverlayHandle) Annotations() []canvas.Annotation {
 	return canvas.CloneAnnotations(h.pane.annotations)
+}
+func (h *TestOverlayHandle) ApplyOCRWordsForTest(words []winapi.OCRWord) int {
+	return h.pane.applySmartRedactWords(words, h.pane.capture.Image.Bounds(), h.pane.activeTool, h.pane.mosaicStyle, int(math.Round(h.pane.blockSize)))
 }
 func (h *TestOverlayHandle) SelectedAnnIdx() int { return h.pane.selectedAnnIdx }
 func (h *TestOverlayHandle) TextEditing() bool   { return h.pane.textEditing }
@@ -698,6 +741,7 @@ func (p *overlayPane) nudgeSelection(dxPx, dyPx int, resizeEnd, resizeStart bool
 	}
 	p.selX0, p.selY0, p.selX1, p.selY1 = x0, y0, x1, y1
 	p.effectDirty = true
+	p.clearRedactCache()
 }
 
 func (p *overlayPane) activeColor() ui.Color {
@@ -988,6 +1032,184 @@ func (p *overlayPane) resetSelection() {
 	p.redoStack = nil
 	p.nextCounter = 1
 	p.selEffectBmp = nil
+	p.clearRedactCache()
+}
+
+func (p *overlayPane) setRedactNotice(msg string) {
+	p.redactNotice = msg
+	p.redactUntil = time.Now().Add(2600 * time.Millisecond)
+}
+
+func (p *overlayPane) isRedactBusy() bool {
+	p.redactMu.Lock()
+	busy := p.redactBusy
+	p.redactMu.Unlock()
+	return busy
+}
+
+func (p *overlayPane) drainPendingRedact() {
+	p.redactMu.Lock()
+	out := p.pendingRedact
+	gen := p.redactGen
+	p.pendingRedact = nil
+	p.redactMu.Unlock()
+	if out == nil || out.gen != gen {
+		return
+	}
+	if out.errMsg != "" {
+		p.setRedactNotice(out.errMsg)
+		return
+	}
+	n := p.applySmartRedactWords(out.words, out.selRect, out.kind, out.style, out.blockSize)
+	if n > 0 {
+		p.setRedactNotice(fmt.Sprintf("已智能打码 %d 处", n))
+	} else {
+		p.setRedactNotice("未发现敏感信息 · 点击文字可单独打码")
+	}
+}
+
+func (p *overlayPane) applySmartRedactWords(words []winapi.OCRWord, selRect image.Rectangle, kind canvas.Tool, style canvas.MosaicStyle, blockSize int) int {
+	if p.capture.Image == nil {
+		return 0
+	}
+	// Shift OCR words from selection-local coords into full monitor pixel space and
+	// build semantically split, ink-tightened interactive word & whole-line caches.
+	shifted := make([]winapi.OCRWord, 0, len(words))
+	for _, w := range words {
+		shifted = append(shifted, winapi.OCRWord{
+			Text: w.Text,
+			Rect: w.Rect.Add(selRect.Min),
+		})
+	}
+	p.ocrWords, p.ocrLines = redact.BuildInteractiveTokens(shifted, p.capture.Image)
+	p.ocrSelRect = selRect
+
+	var customKWs []string
+	if p.session != nil && p.session.app != nil {
+		customKWs = redact.ParseKeywords(p.session.app.RedactKeywords())
+	}
+	localBounds := image.Rect(0, 0, selRect.Dx(), selRect.Dy())
+	candidates := buildRedactionAnnotations(words, localBounds, p.capture.Image, selRect.Min.X, selRect.Min.Y, customKWs, kind, style, blockSize, &p.nextAnnID)
+	added := filterNonOverlappingRedactions(p.annotations, candidates)
+	if len(added) == 0 {
+		return 0
+	}
+	p.pushUndo()
+	p.annotations = append(p.annotations, added...)
+	p.selectedAnnIdx = -1
+	p.effectDirty = true
+	return len(added)
+}
+
+func (p *overlayPane) triggerSmartRedact(viewW, viewH float32) {
+	if !p.hasSelection || p.capture.Image == nil {
+		return
+	}
+	p.commitTextEdit()
+	kind := p.activeTool
+	if kind != canvas.ToolBlur {
+		kind = canvas.ToolPixelate
+		p.activeTool = canvas.ToolPixelate
+	}
+	style := p.mosaicStyle
+	bs := int(math.Round(p.blockSize))
+	relPx := p.selectionPxRect(viewW, viewH)
+	if relPx.Dx() < 8 || relPx.Dy() < 8 {
+		return
+	}
+
+	// Fast path: reuse already-refined cached OCR words without re-running token/ink passes.
+	if len(p.ocrWords) > 0 && p.ocrSelRect == relPx {
+		var customKWs []string
+		if p.session != nil && p.session.app != nil {
+			customKWs = redact.ParseKeywords(p.session.app.RedactKeywords())
+		}
+		candidates := buildRedactionAnnotations(p.ocrWords, p.capture.Image.Bounds(), p.capture.Image, 0, 0, customKWs, kind, style, bs, &p.nextAnnID)
+		added := filterNonOverlappingRedactions(p.annotations, candidates)
+		if len(added) > 0 {
+			p.pushUndo()
+			p.annotations = append(p.annotations, added...)
+			p.selectedAnnIdx = -1
+			p.effectDirty = true
+			p.setRedactNotice(fmt.Sprintf("已智能打码 %d 处", len(added)))
+		} else {
+			p.setRedactNotice("未发现新的敏感信息")
+		}
+		return
+	}
+
+	p.redactMu.Lock()
+	if p.redactBusy {
+		p.redactMu.Unlock()
+		return
+	}
+	p.redactBusy = true
+	p.redactGen++
+	gen := p.redactGen
+	p.redactMu.Unlock()
+
+	crop := winapi.CropRGBA(p.capture.Image, relPx)
+	appRef := p.session.app
+	winRef := p.win
+	go func() {
+		var out pendingRedactOutcome
+		out.gen = gen
+		out.selRect = relPx
+		out.kind = kind
+		out.style = style
+		out.blockSize = bs
+		if appRef == nil {
+			out.errMsg = "离线识别不可用"
+		} else {
+			res, _, err := appRef.RecognizeOCR(crop)
+			if err != nil {
+				out.errMsg = "识别失败"
+			} else {
+				out.words = res.Words
+			}
+		}
+		p.redactMu.Lock()
+		if p.redactGen == gen {
+			p.redactBusy = false
+			p.pendingRedact = &out
+		}
+		p.redactMu.Unlock()
+		if winRef != nil {
+			winRef.Update(func() {})
+		}
+	}()
+}
+
+func filterNonOverlappingRedactions(existing, candidates []canvas.Annotation) []canvas.Annotation {
+	if len(candidates) == 0 {
+		return nil
+	}
+	out := make([]canvas.Annotation, 0, len(candidates))
+	for _, cand := range candidates {
+		cMinX, cMinY, cMaxX, cMaxY := cand.Bounds()
+		cr := image.Rect(int(cMinX), int(cMinY), int(cMaxX), int(cMaxY))
+		cArea := cr.Dx() * cr.Dy()
+		if cArea <= 0 {
+			continue
+		}
+		dup := false
+		for _, ex := range existing {
+			if ex.Kind != canvas.ToolPixelate && ex.Kind != canvas.ToolBlur {
+				continue
+			}
+			eMinX, eMinY, eMaxX, eMaxY := ex.Bounds()
+			er := image.Rect(int(eMinX), int(eMinY), int(eMaxX), int(eMaxY))
+			inter := cr.Intersect(er)
+			if !inter.Empty() && float64(inter.Dx()*inter.Dy())/float64(cArea) >= 0.72 {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, cand)
+		}
+	}
+	return out
 }
 
 func (p *overlayPane) hitHandle(mx, my float32) dragMode {
@@ -1039,6 +1261,7 @@ func (p *overlayPane) view(c *ui.Context) {
 	}
 	c.SetTheme(ui.DarkTheme())
 	viewW, viewH := c.Size()
+	p.drainPendingRedact()
 
 	// Keyboard shortcuts (instant, zero animation delay)
 	if c.Shortcut(0, ui.KeyEscape) {
@@ -1097,6 +1320,9 @@ func (p *overlayPane) view(c *ui.Context) {
 		if (c.Shortcut(ui.Ctrl, ui.KeyY) || c.Shortcut(ui.Ctrl|ui.Shift, ui.KeyZ)) && !c.FocusTakesText() {
 			p.redo()
 		}
+		if c.Shortcut(ui.Shift, ui.KeyX) && !c.FocusTakesText() {
+			p.triggerSmartRedact(viewW, viewH)
+		}
 		if !c.FocusTakesText() {
 			if (c.Shortcut(0, ui.KeyDelete) || c.Shortcut(0, ui.KeyBackspace)) && p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
 				p.pushUndo()
@@ -1142,6 +1368,17 @@ func (p *overlayPane) view(c *ui.Context) {
 				}
 			}
 
+			if c.Shortcut(0, ui.KeyB) {
+				p.commitTextEdit()
+				if p.activeTool == canvas.ToolPixelate && p.mosaicStyle == canvas.MosaicBlur {
+					p.activeTool = canvas.ToolSelect
+				} else {
+					p.activeTool = canvas.ToolPixelate
+					p.mosaicStyle = canvas.MosaicBlur
+					p.selectedAnnIdx = -1
+				}
+			}
+
 			shortcuts := []struct {
 				k ui.Key
 				t canvas.Tool
@@ -1152,7 +1389,6 @@ func (p *overlayPane) view(c *ui.Context) {
 				{ui.KeyP, canvas.ToolPen},
 				{ui.KeyH, canvas.ToolHighlighter},
 				{ui.KeyX, canvas.ToolPixelate},
-				{ui.KeyB, canvas.ToolBlur},
 				{ui.KeyT, canvas.ToolText},
 				{ui.KeyN, canvas.ToolCounter},
 				{ui.KeyM, canvas.ToolMeasure},
@@ -1174,10 +1410,35 @@ func (p *overlayPane) view(c *ui.Context) {
 
 	p.ensureRasterCache(viewW, viewH)
 
+	altLineMode := c.Modifiers()&ui.Alt != 0
+	hoverRemoveIdx := -1
+	var hoverWord winapi.OCRWord
+	hasHoverWord := false
+	hoverWordIsLine := false
+
 	cur := ui.CursorCrosshair
 	if p.hasSelection && p.dragMode == dragNone {
 		if p.activeTool == canvas.ToolText {
 			cur = ui.CursorText
+		} else if (p.activeTool == canvas.ToolPixelate || p.activeTool == canvas.ToolBlur) && !p.drawing && p.mouseInside {
+			mpx, mpy := p.dipToPxF(p.mouseX, p.mouseY, viewW, viewH)
+			if hit := hitRedactionAnnotation(p.annotations, mpx, mpy); hit >= 0 {
+				hoverRemoveIdx = hit
+				cur = ui.CursorPointer
+			} else if altLineMode && len(p.ocrLines) > 0 {
+				if lineW, ok := redact.FindLineAt(p.ocrLines, mpx, mpy); ok {
+					hoverWord = lineW
+					hasHoverWord = true
+					hoverWordIsLine = true
+					cur = ui.CursorPointer
+				}
+			} else if len(p.ocrWords) > 0 {
+				if word, ok := redact.FindWordAt(p.ocrWords, mpx, mpy); ok {
+					hoverWord = word
+					hasHoverWord = true
+					cur = ui.CursorPointer
+				}
+			}
 		} else if p.activeTool == canvas.ToolSelect {
 			switch p.hitHandle(p.mouseX, p.mouseY) {
 			case dragResizeNW, dragResizeSE:
@@ -1440,6 +1701,7 @@ func (p *overlayPane) view(c *ui.Context) {
 								Filled:      p.filled,
 								Rounded:     p.rounded,
 								BlockSize:   int(math.Round(p.blockSize)),
+								MosaicStyle: p.mosaicStyle,
 							}
 							if p.activeTool == canvas.ToolPen || p.activeTool == canvas.ToolHighlighter {
 								p.draftAnn.Points = []canvas.PointF{pt}
@@ -1503,12 +1765,50 @@ func (p *overlayPane) view(c *ui.Context) {
 					p.drawing = false
 					if !ev.Canceled {
 						minX, minY, maxX, maxY := p.draftAnn.Bounds()
-						if maxX-minX >= 3 || maxY-minY >= 3 || len(p.draftAnn.Points) >= 2 {
+						isRedactTool := p.draftAnn.Kind == canvas.ToolPixelate || p.draftAnn.Kind == canvas.ToolBlur
+						clickTol := float32(3)
+						if isRedactTool {
+							clickTol = 5
+						}
+						if maxX-minX >= clickTol || maxY-minY >= clickTol || len(p.draftAnn.Points) >= 2 {
 							p.pushUndo()
 							p.annotations = append(p.annotations, p.draftAnn)
 							p.selectedAnnIdx = len(p.annotations) - 1
-							if p.draftAnn.Kind == canvas.ToolPixelate || p.draftAnn.Kind == canvas.ToolBlur || p.draftAnn.Kind == canvas.ToolSpotlight {
+							if isRedactTool || p.draftAnn.Kind == canvas.ToolSpotlight {
 								p.effectDirty = true
+							}
+						} else if isRedactTool {
+							// One-click toggle: clicking an existing mosaic/blur block removes it;
+							// otherwise clicking a recognized OCR word tightly redacts that token.
+							if hit := hitRedactionAnnotation(p.annotations, p.draftAnn.Start.X, p.draftAnn.Start.Y); hit >= 0 {
+								p.pushUndo()
+								p.annotations = append(p.annotations[:hit], p.annotations[hit+1:]...)
+								if p.selectedAnnIdx == hit {
+									p.selectedAnnIdx = -1
+								} else if p.selectedAnnIdx > hit {
+									p.selectedAnnIdx--
+								}
+								p.effectDirty = true
+							} else if (ev.Mods&ui.Alt != 0) && len(p.ocrLines) > 0 {
+								if lineW, ok := redact.FindLineAt(p.ocrLines, p.draftAnn.Start.X, p.draftAnn.Start.Y); ok {
+									p.nextAnnID++
+									if ann, valid := makeWordRedactionAnnotation(lineW, p.capture.Image.Bounds(), p.draftAnn.Kind, p.mosaicStyle, int(math.Round(p.blockSize)), p.nextAnnID); valid {
+										p.pushUndo()
+										p.annotations = append(p.annotations, ann)
+										p.selectedAnnIdx = len(p.annotations) - 1
+										p.effectDirty = true
+									}
+								}
+							} else if len(p.ocrWords) > 0 {
+								if word, ok := redact.FindWordAt(p.ocrWords, p.draftAnn.Start.X, p.draftAnn.Start.Y); ok {
+									p.nextAnnID++
+									if ann, valid := makeWordRedactionAnnotation(word, p.capture.Image.Bounds(), p.draftAnn.Kind, p.mosaicStyle, int(math.Round(p.blockSize)), p.nextAnnID); valid {
+										p.pushUndo()
+										p.annotations = append(p.annotations, ann)
+										p.selectedAnnIdx = len(p.annotations) - 1
+										p.effectDirty = true
+									}
+								}
 							}
 						}
 					}
@@ -1542,6 +1842,7 @@ func (p *overlayPane) view(c *ui.Context) {
 					}
 				} else if mode != dragNone {
 					p.selX0, p.selY0, p.selX1, p.selY1 = p.normSel()
+					p.clearRedactCache()
 				}
 				return true
 			}
@@ -1601,6 +1902,26 @@ func (p *overlayPane) view(c *ui.Context) {
 						if p.drawing {
 							canvas.DrawAnnotationLive(pt, p.draftAnn, 0, 0, scale, false, true)
 						}
+						if !p.drawing && (p.activeTool == canvas.ToolPixelate || p.activeTool == canvas.ToolBlur) && p.mouseInside {
+							if hoverRemoveIdx >= 0 && hoverRemoveIdx < len(p.annotations) {
+								minX, minY, maxX, maxY := p.annotations[hoverRemoveIdx].Bounds()
+								hr := ui.Rect{
+									X: minX * pxToDipX,
+									Y: minY * pxToDipY,
+									W: (maxX - minX) * pxToDipX,
+									H: (maxY - minY) * pxToDipY,
+								}
+								drawRedactionRemoveHint(pt, hr)
+							} else if hasHoverWord {
+								wr := ui.Rect{
+									X: float32(hoverWord.Rect.Min.X-3) * pxToDipX,
+									Y: float32(hoverWord.Rect.Min.Y-2) * pxToDipY,
+									W: float32(hoverWord.Rect.Dx()+6) * pxToDipX,
+									H: float32(hoverWord.Rect.Dy()+4) * pxToDipY,
+								}
+								drawWordRedactHint(pt, wr, hoverWordIsLine)
+							}
+						}
 						if p.activeTool == canvas.ToolMeasure && p.mouseInside && p.lastMeasure.Valid {
 							m := p.lastMeasure
 							preview := canvas.Annotation{
@@ -1647,6 +1968,9 @@ func (p *overlayPane) view(c *ui.Context) {
 				}
 				if p.session.longMode {
 					badge = "长截图 · " + badge
+				}
+				if p.redactNotice != "" && time.Now().Before(p.redactUntil) {
+					badge = badge + "  ·  " + p.redactNotice
 				}
 				span := ui.Span{Text: badge, Size: 12, Weight: 600, Color: ui.Hex("#FFFFFF")}
 				tw, th := pt.MeasureText(0, span)
@@ -1786,11 +2110,11 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 
 	mainW := p.measuredMainW
 	if mainW < 520 {
-		mainW = 740
+		mainW = 706
 	}
 	subW := p.measuredSubW
 	if subW < 180 {
-		subW = 420
+		subW = 470
 	}
 
 	showSub := p.activeTool != canvas.ToolSelect
@@ -1830,7 +2154,6 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 			{canvas.ToolPen, icons.Pen},
 			{canvas.ToolHighlighter, icons.Highlighter},
 			{canvas.ToolPixelate, icons.Pixelate},
-			{canvas.ToolBlur, icons.Blur},
 			{canvas.ToolText, icons.Text},
 			{canvas.ToolCounter, icons.Counter},
 			{canvas.ToolMeasure, icons.Measure},
@@ -1889,8 +2212,8 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 			Cursor(ui.CursorPointer).Tooltip("完成并复制到剪贴板 (Enter / 双击选区)")
 		glasswork.ApplyLiquidButton(doneBtn, glasswork.PrimaryButtonOpts())
 		doneBtn.Children(func() {
-			ui.Icon(c, icons.Check.Idle).Size(17, 17).TextColor(ui.Hex("#FFFFFF"))
-			ui.Text(c, "完成").FontSize(12.5).FontWeight(600).TextColor(ui.Hex("#FFFFFF"))
+			ui.Icon(c, icons.Check.Idle).Size(17, 17).TextColor(ui.Hex("#FFFFFF")).Shrink(0)
+			ui.Text(c, "完成").FontSize(12.5).FontWeight(600).TextColor(ui.Hex("#FFFFFF")).SingleLine().Shrink(0)
 		})
 		if doneBtn.Clicked() {
 			p.commitCopy(viewW, viewH)
@@ -1919,14 +2242,68 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 		subBar.Children(func() {
 			switch p.activeTool {
 			case canvas.ToolPixelate, canvas.ToolBlur:
-				tip := "马赛克粒度"
-				if p.activeTool == canvas.ToolBlur {
-					tip = "模糊强度"
+				styles := []canvas.MosaicStyle{
+					canvas.MosaicCrystal,
+					canvas.MosaicBlur,
+					canvas.MosaicPixel,
+					canvas.MosaicRedact,
 				}
-				ui.Slider(c, &p.blockSize, 6, 32).Width(136).Label(tip).Tooltip(tip)
-				ui.Textf(c, "%d px", int(math.Round(p.blockSize))).
-					FontSize(11.5).FontWeight(600).TextColor(inks.Primary).SingleLine().Shrink(0).
-					ContentTransition(glasswork.ContentNumeric)
+				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+					for _, st := range styles {
+						if glassChipScoped(c, inks, st.Name(), p.mosaicStyle == st, "qq-mosaic-style") {
+							p.activeTool = canvas.ToolPixelate
+							p.mosaicStyle = st
+							if p.selectedAnnIdx >= 0 && p.selectedAnnIdx < len(p.annotations) {
+								if k := p.annotations[p.selectedAnnIdx].Kind; k == canvas.ToolPixelate || k == canvas.ToolBlur {
+									p.annotations[p.selectedAnnIdx].Kind = canvas.ToolPixelate
+									p.annotations[p.selectedAnnIdx].MosaicStyle = st
+									p.effectDirty = true
+								}
+							}
+						}
+					}
+				})
+				if p.mosaicStyle != canvas.MosaicRedact {
+					glassSep(c, inks)
+					tip := "马赛克粒度"
+					if p.mosaicStyle == canvas.MosaicBlur {
+						tip = "模糊强度"
+					}
+					ui.Slider(c, &p.blockSize, 6, 32).Width(92).Label(tip).Tooltip(tip)
+					ui.Textf(c, "%d px", int(math.Round(p.blockSize))).
+						FontSize(11.5).FontWeight(600).TextColor(inks.Primary).SingleLine().Shrink(0).
+						ContentTransition(glasswork.ContentNumeric)
+				}
+				glassSep(c, inks)
+				busy := p.isRedactBusy()
+				smartLabel := "智能打码"
+				if busy {
+					smartLabel = "扫描中…"
+				}
+				smartBtn := ui.Row(c.Key("qq-smart-redact")).
+					Height(26).Padding(0, 10, 0, 8).Gap(5).Radius(13).
+					AlignItems(ui.Center).Shrink(0).
+					Role(ui.RoleButton).Label("智能打码").
+					Cursor(ui.CursorPointer).Tooltip("离线识别并打码敏感信息 (Shift+X)")
+				fg := inks.Accent
+				if busy {
+					smartBtn.Background(inks.AccentFill).Border(1, inks.AccentBorder).Opacity(0.75)
+				} else if smartBtn.Hovered() {
+					smartBtn.Background(inks.AccentFill).Border(1, inks.AccentBorder)
+				} else {
+					smartBtn.Background(inks.Hover).Border(1, inks.Hairline)
+					fg = inks.Primary
+				}
+				smartBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+				glasswork.ApplyLiquidButton(smartBtn, glasswork.CompactButtonOpts())
+				smartBtn.Children(func() {
+					ui.Icon(c, icons.SmartRedact.For(busy || smartBtn.Hovered() || smartBtn.Pressed())).
+						Size(14.5, 14.5).TextColor(fg).Shrink(0).ContentTransition(ui.ContentTransition{})
+					ui.Text(c, smartLabel).FontSize(11.5).FontWeight(600).TextColor(fg).SingleLine().Shrink(0)
+				})
+				if smartBtn.Clicked() && !busy {
+					p.triggerSmartRedact(viewW, viewH)
+				}
 
 			case canvas.ToolText:
 				for _, sz := range []float32{16, 22, 30} {

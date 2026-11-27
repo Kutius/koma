@@ -22,14 +22,20 @@ func DrawAnnotationLive(p *ui.Painter, a Annotation, ox, oy, zoom float32, selec
 		if isPreview || selected {
 			minX, minY, maxX, maxY := a.Bounds()
 			r := ui.Rect{X: tx(minX), Y: ty(minY), W: (maxX - minX) * zoom, H: (maxY - minY) * zoom}
+			rad := min(float32(10)*zoom, min(r.W, r.H)*0.28)
+			if rad < 3 {
+				rad = 3
+			}
 			if isPreview {
 				fill := ui.Hex("#38BDF8").Alpha(0.18)
-				if a.Kind == ToolBlur {
+				if a.Kind == ToolBlur || a.MosaicStyle == MosaicBlur {
 					fill = ui.Hex("#A855F7").Alpha(0.20)
+				} else if a.MosaicStyle == MosaicRedact {
+					fill = ui.Hex("#1E2028").Alpha(0.36)
 				}
-				p.Fill(r, fill, 4)
+				p.Fill(r, fill, rad)
 			}
-			p.StrokeDashed(r, ui.Hex("#38BDF8"), 4, 1.5)
+			p.StrokeDashed(r, ui.Hex("#38BDF8"), rad, 1.5)
 		}
 
 	case ToolSpotlight:

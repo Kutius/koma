@@ -257,6 +257,11 @@ var (
 		`<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.1" d="M5.5 12.75L10 17.25L18.75 7.5"/>`,
 		`<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.45" d="M5.5 12.75L10 17.25L18.75 7.5"/>`,
 	)
+	// SmartRedact: Solar-matched privacy shield with optical starlight for smart sensitive redaction
+	SmartRedact = pair(
+		`<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.72"><path d="M12 2.5C15.1 4.1 17.6 4.7 19.6 5.1C19.9 5.16 20.1 5.42 20.1 5.72V11.3C20.1 16.25 16.65 19.75 12.42 21.34C12.15 21.44 11.85 21.44 11.58 21.34C7.35 19.75 3.9 16.25 3.9 11.3V5.72C3.9 5.42 4.1 5.16 4.4 5.1C6.4 4.7 8.9 4.1 12 2.5Z" opacity=".5"/><path d="M12 7.4L13.15 10.35L16.1 11.5L13.15 12.65L12 15.6L10.85 12.65L7.9 11.5L10.85 10.35L12 7.4Z"/></g>`,
+		`<path fill="currentColor" d="M12 2.3C15.15 3.95 17.7 4.58 19.75 4.98C20.1 5.05 20.35 5.36 20.35 5.72V11.3C20.35 16.38 16.82 19.95 12.48 21.56C12.17 21.68 11.83 21.68 11.52 21.56C7.18 19.95 3.65 16.38 3.65 11.3V5.72C3.65 5.36 3.9 5.05 4.25 4.98C6.3 4.58 8.85 3.95 12 2.3Z" opacity=".46"/><path fill="currentColor" d="M12 6.8C12.28 6.8 12.53 6.97 12.63 7.23L13.68 9.92L16.37 10.97C16.86 11.16 16.86 11.84 16.37 12.03L13.68 13.08L12.63 15.77C12.44 16.26 11.76 16.26 11.57 15.77L10.52 13.08L7.83 12.03C7.34 11.84 7.34 11.16 7.83 10.97L10.52 9.92L11.57 7.23C11.67 6.97 11.92 6.8 12 6.8Z"/>`,
+	)
 )
 
 // AppIconPNG generates Koma's Liquid Glass + Solar squircle app icon PNG (size×size)

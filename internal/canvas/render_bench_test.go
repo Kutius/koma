@@ -33,6 +33,39 @@ func BenchmarkApplyBlur_1080pRegion(b *testing.B) {
 	}
 }
 
+func BenchmarkApplyCrystalMosaic_1080pRegion(b *testing.B) {
+	base := makeBenchImage(1920, 1080)
+	region := image.Rect(200, 150, 1160, 690) // 960x540 region
+	work := CloneRGBA(base)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		applyCrystalMosaic(work, region, 14)
+	}
+}
+
+func BenchmarkApplyRedactBar_1080pRegion(b *testing.B) {
+	base := makeBenchImage(1920, 1080)
+	region := image.Rect(200, 150, 1160, 690) // 960x540 region
+	work := CloneRGBA(base)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		applyRedactBar(work, region)
+	}
+}
+
+func BenchmarkApplyPixelate_1080pRegion(b *testing.B) {
+	base := makeBenchImage(1920, 1080)
+	region := image.Rect(200, 150, 1160, 690) // 960x540 region
+	work := CloneRGBA(base)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		applyPixelate(work, region, 14)
+	}
+}
+
 func BenchmarkApplySpotlights_1080p(b *testing.B) {
 	base := makeBenchImage(1920, 1080)
 	spots := []image.Rectangle{

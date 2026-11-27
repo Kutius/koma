@@ -206,3 +206,33 @@ func TestScrollSessionCloseReleasesBuffers(t *testing.T) {
 	}
 	runtime.KeepAlive(h)
 }
+
+func TestRedactCacheReleasedOnClearAndPark(t *testing.T) {
+	a := New()
+	ed := NewEditorState(a)
+	img := image.NewRGBA(image.Rect(0, 0, 400, 200))
+	ed.loadOwnedImage(img, nil, "redact-mem")
+	ed.ApplyOCRWordsForTest([]winapi.OCRWord{
+		{Text: "alice@koma.dev", Rect: image.Rect(20, 20, 180, 44)},
+		{Text: "普通标签", Rect: image.Rect(20, 60, 120, 84)},
+	})
+	if len(ed.ocrWords) == 0 || len(ed.ocrLines) == 0 {
+		t.Fatalf("expected interactive OCR token and line caches to be populated")
+	}
+	ed.ParkForTray()
+	if ed.ocrWords != nil || ed.ocrLines != nil {
+		t.Fatalf("expected ParkForTray to release OCR token and line caches")
+	}
+
+	ov := NewTestOverlayView(a, img, canvas.ToolPixelate)
+	ov.ApplyOCRWordsForTest([]winapi.OCRWord{
+		{Text: "13800138000", Rect: image.Rect(20, 20, 140, 44)},
+	})
+	if len(ov.pane.ocrWords) == 0 || len(ov.pane.ocrLines) == 0 {
+		t.Fatalf("expected overlay OCR caches to be populated")
+	}
+	ov.pane.releaseBuffers()
+	if ov.pane.ocrWords != nil || ov.pane.ocrLines != nil {
+		t.Fatalf("expected overlay releaseBuffers to release OCR caches")
+	}
+}

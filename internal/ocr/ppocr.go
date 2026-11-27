@@ -186,24 +186,41 @@ func (e *PPOCREngine) Recognize(img *image.RGBA) (winapi.OCRResult, error) {
 		crops[i] = cropBoxRGBA(padded, b)
 	}
 
-	// 3. Batched CTC Text Recognition (PP-OCRv6 Rec)
-	texts, scores, err := e.recognizeCropsLocked(crops)
+	// 3. Batched CTC Text Recognition (PP-OCRv6 Rec) with per-character timestep alignment
+	recs, err := e.recognizeCropsLocked(crops)
 	if err != nil {
 		return winapi.OCRResult{}, fmt.Errorf("PP-OCRv6 文本识别失败: %w", err)
 	}
 
-	// 4. Filter low-confidence noise and assemble into natural reading-order lines
+	// 4. Filter low-confidence noise, derive timestep-aligned word boxes, and assemble reading lines
 	type recognizedBox struct {
 		box  textBox
 		text string
 	}
+	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
 	var kept []recognizedBox
+	var words []winapi.OCRWord
 	for i := range boxes {
-		txt := strings.TrimSpace(texts[i])
-		if txt == "" || scores[i] < recScoreThresh {
+		rc := recs[i]
+		txt := strings.TrimSpace(rc.Text)
+		if txt == "" || rc.Score < recScoreThresh {
 			continue
 		}
 		kept = append(kept, recognizedBox{box: boxes[i], text: txt})
+		if aligned := ctcSpansToWords(boxes[i], pad, origW, origH, rc.ResizedW, rc.BatchW, rc.TimeSteps, rc.Chars); len(aligned) > 0 {
+			words = append(words, aligned...)
+		} else {
+			x0 := clampInt(boxes[i].X0-pad, 0, max(0, origW-1))
+			y0 := clampInt(boxes[i].Y0-pad, 0, max(0, origH-1))
+			x1 := clampInt(boxes[i].X1-pad, x0+1, origW)
+			y1 := clampInt(boxes[i].Y1-pad, y0+1, origH)
+			if x1 > x0 && y1 > y0 {
+				words = append(words, winapi.OCRWord{
+					Text: txt,
+					Rect: image.Rect(x0, y0, x1, y1),
+				})
+			}
+		}
 	}
 	if len(kept) == 0 {
 		return winapi.OCRResult{}, nil
@@ -213,15 +230,30 @@ func (e *PPOCREngine) Recognize(img *image.RGBA) (winapi.OCRResult, error) {
 	return winapi.OCRResult{
 		Text:  strings.Join(lines, "\n"),
 		Lines: lines,
+		Words: words,
 	}, nil
 }
 
-func (e *PPOCREngine) recognizeCropsLocked(crops []*image.RGBA) ([]string, []float32, error) {
+type ctcChar struct {
+	Text   string
+	TStart int
+	TEnd   int // exclusive
+}
+
+type cropRecResult struct {
+	Text      string
+	Score     float32
+	Chars     []ctcChar
+	ResizedW  int
+	BatchW    int
+	TimeSteps int
+}
+
+func (e *PPOCREngine) recognizeCropsLocked(crops []*image.RGBA) ([]cropRecResult, error) {
 	n := len(crops)
-	texts := make([]string, n)
-	scores := make([]float32, n)
+	results := make([]cropRecResult, n)
 	if n == 0 {
-		return texts, scores, nil
+		return results, nil
 	}
 
 	// Sort by aspect ratio (w/h) to minimize padding overhead within each batch.
@@ -257,6 +289,7 @@ func (e *PPOCREngine) recognizeCropsLocked(crops []*image.RGBA) ([]string, []flo
 		planeSize := recImgHeight * batchW
 		itemSize := 3 * planeSize
 		batchTensor := make([]float32, batchN*itemSize)
+		resizedWs := make([]int, batchN)
 
 		for bi := 0; bi < batchN; bi++ {
 			crop := crops[order[start+bi]]
@@ -268,29 +301,36 @@ func (e *PPOCREngine) recognizeCropsLocked(crops []*image.RGBA) ([]string, []flo
 			if resizedW > batchW {
 				resizedW = batchW
 			}
+			resizedWs[bi] = resizedW
 			fillRecCropBGR(crop, batchTensor[bi*itemSize:(bi+1)*itemSize], resizedW, batchW, recImgHeight)
 		}
 
 		out, outShape, err := e.recSess.RunFloat32(batchTensor, []int64{int64(batchN), 3, recImgHeight, int64(batchW)})
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if len(outShape) < 3 {
-			return nil, nil, fmt.Errorf("异常的识别输出形状: %v", outShape)
+			return nil, fmt.Errorf("异常的识别输出形状: %v", outShape)
 		}
 		timeSteps := int(outShape[1])
 		numClasses := int(outShape[2])
 
 		for bi := 0; bi < batchN; bi++ {
 			slice := out[bi*timeSteps*numClasses : (bi+1)*timeSteps*numClasses]
-			txt, sc := decodeCTC(slice, timeSteps, numClasses, e.charList)
+			txt, sc, spans := decodeCTCWithSpans(slice, timeSteps, numClasses, e.charList)
 			origIdx := order[start+bi]
-			texts[origIdx] = txt
-			scores[origIdx] = sc
+			results[origIdx] = cropRecResult{
+				Text:      txt,
+				Score:     sc,
+				Chars:     spans,
+				ResizedW:  resizedWs[bi],
+				BatchW:    batchW,
+				TimeSteps: timeSteps,
+			}
 		}
 	}
 
-	return texts, scores, nil
+	return results, nil
 }
 
 // parseCharacterList reproduces RapidOCR CTCLabelDecode's exact dictionary indexing:
@@ -308,10 +348,18 @@ func parseCharacterList(raw string) []string {
 
 // decodeCTC performs greedy argmax CTC decoding with consecutive duplicate collapse.
 func decodeCTC(probs []float32, timeSteps, numClasses int, charList []string) (string, float32) {
+	txt, sc, _ := decodeCTCWithSpans(probs, timeSteps, numClasses, charList)
+	return txt, sc
+}
+
+// decodeCTCWithSpans performs greedy CTC decoding while preserving each emitted
+// character's horizontal timestep span [TStart, TEnd) for pixel-accurate word splitting.
+func decodeCTCWithSpans(probs []float32, timeSteps, numClasses int, charList []string) (string, float32, []ctcChar) {
 	if timeSteps <= 0 || numClasses <= 0 || len(probs) < timeSteps*numClasses {
-		return "", 0
+		return "", 0, nil
 	}
 	var sb strings.Builder
+	var spans []ctcChar
 	var scoreSum float64
 	var count int
 	prevIdx := -1
@@ -326,20 +374,182 @@ func decodeCTC(probs []float32, timeSteps, numClasses int, charList []string) (s
 				bestIdx = c
 			}
 		}
-		if bestIdx != 0 && bestIdx != prevIdx {
-			if bestIdx < len(charList) {
-				sb.WriteString(charList[bestIdx])
-				scoreSum += float64(bestVal)
-				count++
+		if bestIdx != 0 {
+			if bestIdx != prevIdx {
+				if bestIdx < len(charList) {
+					tok := charList[bestIdx]
+					sb.WriteString(tok)
+					spans = append(spans, ctcChar{Text: tok, TStart: t, TEnd: t + 1})
+					scoreSum += float64(bestVal)
+					count++
+				}
+			} else if len(spans) > 0 {
+				spans[len(spans)-1].TEnd = t + 1
 			}
 		}
 		prevIdx = bestIdx
 	}
 
 	if count == 0 {
-		return "", 0
+		return "", 0, nil
 	}
-	return sb.String(), float32(scoreSum / float64(count))
+	return sb.String(), float32(scoreSum / float64(count)), spans
+}
+
+func ctcCharHalfWidth(s string, boxH float64) float64 {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return boxH * 0.25
+	}
+	r := runes[0]
+	if r >= 0x2E80 && r <= 0x9FFF || r >= 0xF900 && r <= 0xFAFF || r >= 0xFF00 && r <= 0xFFEF {
+		return boxH * 0.50
+	}
+	switch r {
+	case 'i', 'l', 'I', '!', '|', '.', ',', ':', ';', '\'', '`':
+		return boxH * 0.20
+	case 'm', 'w', 'M', 'W', '@', '%':
+		return boxH * 0.40
+	default:
+		return boxH * 0.30
+	}
+}
+
+// ctcSpansToWords projects PP-OCRv6 CTC character timesteps back into original
+// image pixel coordinates using Voronoi midpoint expansion clamped by glyph half-widths,
+// then splits the line into pixel-accurate words at explicit spaces or real visual gaps.
+func ctcSpansToWords(box textBox, pad, origW, origH, resizedW, batchW, timeSteps int, chars []ctcChar) []winapi.OCRWord {
+	if len(chars) == 0 || resizedW <= 0 || batchW <= 0 || timeSteps <= 0 {
+		return nil
+	}
+	boxX0 := float64(box.X0 - pad)
+	boxY0 := clampInt(box.Y0-pad, 0, max(0, origH-1))
+	boxX1 := float64(box.X1 - pad)
+	boxY1 := clampInt(box.Y1-pad, boxY0+1, origH)
+	boxW := boxX1 - boxX0
+	boxH := float64(boxY1 - boxY0)
+	if boxW < 2 || boxH < 2 {
+		return nil
+	}
+
+	stepToOrigX := (float64(batchW) / float64(timeSteps)) * (boxW / float64(resizedW))
+
+	type glyphPos struct {
+		text    string
+		isSpace bool
+		cx      float64
+		halfW   float64
+		x0, x1  float64
+	}
+	glyphs := make([]glyphPos, 0, len(chars))
+	for _, ch := range chars {
+		isSp := strings.TrimSpace(ch.Text) == ""
+		tMid := (float64(ch.TStart) + float64(ch.TEnd)) * 0.5
+		cx := boxX0 + tMid*stepToOrigX
+		if cx < boxX0 {
+			cx = boxX0
+		} else if cx > boxX1 {
+			cx = boxX1
+		}
+		hw := ctcCharHalfWidth(ch.Text, boxH)
+		spanHalf := float64(ch.TEnd-ch.TStart) * stepToOrigX * 0.5
+		if spanHalf > hw {
+			hw = spanHalf
+		}
+		glyphs = append(glyphs, glyphPos{
+			text:    ch.Text,
+			isSpace: isSp,
+			cx:      cx,
+			halfW:   hw,
+		})
+	}
+
+	visIdx := make([]int, 0, len(glyphs))
+	for i := range glyphs {
+		if !glyphs[i].isSpace {
+			visIdx = append(visIdx, i)
+		}
+	}
+	if len(visIdx) == 0 {
+		return nil
+	}
+	for k, gi := range visIdx {
+		g := &glyphs[gi]
+		left := g.cx - g.halfW
+		right := g.cx + g.halfW
+		if k > 0 {
+			prev := glyphs[visIdx[k-1]]
+			mid := (prev.cx + g.cx) * 0.5
+			if left < mid {
+				left = mid
+			}
+		}
+		if k+1 < len(visIdx) {
+			next := glyphs[visIdx[k+1]]
+			mid := (g.cx + next.cx) * 0.5
+			if right > mid {
+				right = mid
+			}
+		}
+		if left < boxX0 {
+			left = boxX0
+		}
+		if right > boxX1 {
+			right = boxX1
+		}
+		if right <= left {
+			right = left + 1
+		}
+		g.x0, g.x1 = left, right
+	}
+
+	gapBreak := math.Max(4.0, boxH*0.28)
+	var out []winapi.OCRWord
+	var curTxt strings.Builder
+	var curX0, curX1 float64
+	hasCur := false
+	flush := func() {
+		if !hasCur {
+			return
+		}
+		txt := strings.TrimSpace(curTxt.String())
+		if txt != "" {
+			ix0 := clampInt(int(math.Floor(curX0)), 0, max(0, origW-1))
+			ix1 := clampInt(int(math.Ceil(curX1)), ix0+1, origW)
+			if ix1 > ix0 && boxY1 > boxY0 {
+				out = append(out, winapi.OCRWord{
+					Text: txt,
+					Rect: image.Rect(ix0, boxY0, ix1, boxY1),
+				})
+			}
+		}
+		curTxt.Reset()
+		hasCur = false
+	}
+
+	for _, g := range glyphs {
+		if g.isSpace {
+			flush()
+			continue
+		}
+		if hasCur && g.x0-curX1 > gapBreak {
+			flush()
+		}
+		if !hasCur {
+			curX0, curX1 = g.x0, g.x1
+			hasCur = true
+		} else {
+			if g.x0 < curX0 {
+				curX0 = g.x0
+			}
+			if g.x1 > curX1 {
+				curX1 = g.x1
+			}
+		}
+		curTxt.WriteString(g.text)
+	}
+	flush()
+	return out
 }
 
 type textBox struct {

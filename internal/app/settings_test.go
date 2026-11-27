@@ -22,6 +22,7 @@ func TestSettingsPersistenceAndClearedHotkeys(t *testing.T) {
 		t.Fatalf("SetHotkey(pin, empty) failed: %v", err)
 	}
 	a.SetDarkMode(true)
+	a.SetRedactKeywords("张三, 星辰科技, corp.internal")
 
 	// Duplicate conflict must be rejected
 	if err := a.SetHotkey(HotkeyFull, "Alt+Q"); err == nil {
@@ -45,6 +46,9 @@ func TestSettingsPersistenceAndClearedHotkeys(t *testing.T) {
 	}
 	if !b.darkMode {
 		t.Fatalf("expected reloaded darkMode = true")
+	}
+	if got := b.RedactKeywords(); got != "张三, 星辰科技, corp.internal" {
+		t.Fatalf("reloaded RedactKeywords = %q, want %q", got, "张三, 星辰科技, corp.internal")
 	}
 
 	// Reset defaults restores all 4 shortcuts

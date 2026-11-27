@@ -12,10 +12,18 @@ import (
 // ErrOCRNoLanguage indicates Windows has no OCR language pack installed.
 var ErrOCRNoLanguage = errors.New("OCR is only supported on Windows")
 
-// OCRResult holds recognized text lines.
+// OCRWord represents a single recognized text token/segment with its bounding
+// box in the original input image's pixel coordinate space.
+type OCRWord struct {
+	Text string
+	Rect image.Rectangle
+}
+
+// OCRResult holds recognized text lines and optional per-word bounding boxes.
 type OCRResult struct {
 	Text  string
 	Lines []string
+	Words []OCRWord
 }
 
 // RecognizeText is a non-Windows compile stub.

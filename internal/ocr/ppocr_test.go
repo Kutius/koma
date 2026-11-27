@@ -57,6 +57,29 @@ func TestParseCharacterListAndDecodeCTC(t *testing.T) {
 	}
 }
 
+func TestCTCSpansToWordsSplitsWideVisualGap(t *testing.T) {
+	// Simulate a wide table row box [16..416] (pad=16 => orig [0..400]) where
+	// "姓名" appears on the far left (t=2,4) and "张三" on the far right (t=30,32)
+	// with NO explicit space token emitted by CTC—only blank timesteps between them.
+	box := textBox{X0: 16, Y0: 36, X1: 416, Y1: 66, Score: 0.95}
+	chars := []ctcChar{
+		{Text: "姓", TStart: 2, TEnd: 3},
+		{Text: "名", TStart: 4, TEnd: 5},
+		{Text: "张", TStart: 30, TEnd: 31},
+		{Text: "三", TStart: 32, TEnd: 33},
+	}
+	words := ctcSpansToWords(box, 16, 500, 200, 400, 400, 40, chars)
+	if len(words) != 2 {
+		t.Fatalf("expected 2 words split across wide visual gap, got %d: %+v", len(words), words)
+	}
+	if words[0].Text != "姓名" || words[1].Text != "张三" {
+		t.Fatalf("unexpected split texts: %+v", words)
+	}
+	if words[0].Rect.Max.X >= 150 || words[1].Rect.Min.X <= 220 {
+		t.Fatalf("expected tight pixel alignment around left/right columns, got %+v", words)
+	}
+}
+
 func TestExtractTextBoxesAndAssembleReadingLines(t *testing.T) {
 	// Synthesize a 64x64 DBNet probability map with two horizontal text lines.
 	const w, h = 64, 64

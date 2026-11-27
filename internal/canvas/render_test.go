@@ -149,6 +149,57 @@ func TestBlendOverExactDiv255(t *testing.T) {
 	}
 }
 
+func TestModernMosaicStyles(t *testing.T) {
+	base := image.NewRGBA(image.Rect(0, 0, 260, 120))
+	for y := 0; y < 120; y++ {
+		for x := 0; x < 260; x++ {
+			// High-contrast stripe pattern simulating crisp text on light UI.
+			if (x/3+y/5)%2 == 0 {
+				base.SetRGBA(x, y, color.RGBA{245, 247, 250, 255})
+			} else {
+				base.SetRGBA(x, y, color.RGBA{25, 45, 95, 255})
+			}
+		}
+	}
+
+	anns := []Annotation{
+		{ID: 1, Kind: ToolPixelate, MosaicStyle: MosaicCrystal, Start: PointF{10, 14}, End: PointF{84, 52}, BlockSize: 12},
+		{ID: 2, Kind: ToolPixelate, MosaicStyle: MosaicPixel, Start: PointF{94, 14}, End: PointF{168, 52}, BlockSize: 12},
+		{ID: 3, Kind: ToolPixelate, MosaicStyle: MosaicRedact, Start: PointF{178, 14}, End: PointF{250, 52}, BlockSize: 12},
+	}
+
+	out := RenderRasterEffects(base, anns)
+	if out == nil {
+		t.Fatalf("RenderRasterEffects returned nil")
+	}
+
+	// Verify corner anti-aliasing keeps the very corner outside the rounded capsule untouched.
+	cornerOrig := base.RGBAAt(178, 14)
+	cornerGot := out.RGBAAt(178, 14)
+	if cornerGot != cornerOrig {
+		t.Fatalf("expected rounded redact corner (178,14) to stay untouched, got %+v vs orig %+v", cornerGot, cornerOrig)
+	}
+
+	// Verify redact center is deeply obscured matte charcoal (low luminance, completely destroys pattern).
+	centerRedact := out.RGBAAt(214, 33)
+	if centerRedact.R > 70 || centerRedact.G > 75 || centerRedact.B > 85 {
+		t.Fatalf("expected dark matte redact center on light bg, got %+v", centerRedact)
+	}
+
+	// Verify crystal mosaic actually modifies pixels inside its center.
+	diffCount := 0
+	for y := 20; y < 46; y++ {
+		for x := 16; x < 78; x++ {
+			if out.RGBAAt(x, y) != base.RGBAAt(x, y) {
+				diffCount++
+			}
+		}
+	}
+	if diffCount < 200 {
+		t.Fatalf("expected crystal mosaic to visibly transform pixels, diffCount=%d", diffCount)
+	}
+}
+
 func absDiffU8(a, b uint8) uint8 {
 	if a >= b {
 		return a - b

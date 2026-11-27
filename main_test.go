@@ -13,6 +13,7 @@ import (
 	"koma/internal/app"
 	"koma/internal/canvas"
 	"koma/internal/icons"
+	"koma/internal/winapi"
 )
 
 func TestFullscreenToolbarPlacementAlwaysVisible(t *testing.T) {
@@ -147,6 +148,52 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	if !ov.HasSelection() || ov.ActiveTool() != canvas.ToolPixelate {
 		t.Fatalf("after clicking 马赛克: hasSelection=%v tool=%v, want true / ToolPixelate", ov.HasSelection(), ov.ActiveTool())
 	}
+	if ov.MosaicStyle() != canvas.MosaicCrystal {
+		t.Fatalf("expected default mosaic style MosaicCrystal, got %v", ov.MosaicStyle())
+	}
+	if _, ok := ttOv.Find("智能打码"); !ok {
+		t.Fatalf("expected 智能打码 button in overlay mosaic secondary bar")
+	}
+	if err := ttOv.Click("遮盖"); err != nil {
+		t.Fatalf("overlay click 遮盖 failed: %v", err)
+	}
+	if ov.MosaicStyle() != canvas.MosaicRedact {
+		t.Fatalf("after clicking 遮盖: mosaicStyle=%v, want MosaicRedact", ov.MosaicStyle())
+	}
+	if err := ttOv.Click("模糊"); err != nil {
+		t.Fatalf("overlay click 模糊 style failed: %v", err)
+	}
+	if ov.MosaicStyle() != canvas.MosaicBlur {
+		t.Fatalf("after clicking 模糊: mosaicStyle=%v, want MosaicBlur", ov.MosaicStyle())
+	}
+	if err := ttOv.Click("晶格"); err != nil {
+		t.Fatalf("overlay click 晶格 failed: %v", err)
+	}
+	if ov.MosaicStyle() != canvas.MosaicCrystal {
+		t.Fatalf("after clicking 晶格: mosaicStyle=%v, want MosaicCrystal", ov.MosaicStyle())
+	}
+	if n := ov.ApplyOCRWordsForTest([]winapi.OCRWord{
+		{Text: "API Key: sk-proj-9a8b7c6d5e4f3a2b1c0d9e8f", Rect: image.Rect(190, 140, 560, 166)},
+		{Text: "13800138000", Rect: image.Rect(190, 186, 330, 210)},
+		{Text: "alice@koma.dev", Rect: image.Rect(360, 186, 520, 210)},
+	}); n != 3 {
+		t.Fatalf("expected 3 smart redactions applied on overlay, got %d", n)
+	}
+	ttOv.Advance(450 * time.Millisecond)
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_02b_qq_overlay_mosaic_smart.png", ttOv.Image())
+	}
+	// Clicking directly on an existing mosaic block in ToolPixelate mode removes it cleanly,
+	// and Ctrl+Z restores it.
+	beforeRemove := len(ov.Annotations())
+	ttOv.ClickAt(260, 198) // center of "13800138000" mosaic (190..330, 186..210)
+	if got := len(ov.Annotations()); got != beforeRemove-1 {
+		t.Fatalf("clicking existing mosaic block should remove it: got %d annotations, want %d", got, beforeRemove-1)
+	}
+	ttOv.Key(ui.Ctrl, ui.KeyZ)
+	if got := len(ov.Annotations()); got != beforeRemove {
+		t.Fatalf("Ctrl+Z should restore clicked-off mosaic block: got %d annotations, want %d", got, beforeRemove)
+	}
 
 	// Verify 100% fullscreen selection keeps the ENTIRE toolbar (including rightmost 完成) strictly inside viewport!
 	ov.SetSelectionBounds(0, 0, 860, 520)
@@ -180,6 +227,23 @@ func TestKomaGlassworkAndToolbarClicks(t *testing.T) {
 	}
 	if ed.ActiveTool() != canvas.ToolPixelate {
 		t.Fatalf("studio tool after clicking 马赛克 = %v, want ToolPixelate", ed.ActiveTool())
+	}
+	if _, ok := ttStudio.Find("智能打码"); !ok {
+		t.Fatalf("expected 智能打码 button in studio mosaic secondary bar")
+	}
+	if err := ttStudio.Click("像素"); err != nil {
+		t.Fatalf("studio click 像素 failed: %v", err)
+	}
+	if ed.MosaicStyle() != canvas.MosaicPixel {
+		t.Fatalf("studio mosaicStyle after clicking 像素 = %v, want MosaicPixel", ed.MosaicStyle())
+	}
+	if err := ttStudio.Click("晶格"); err != nil {
+		t.Fatalf("studio click 晶格 failed: %v", err)
+	}
+	ttStudio.Advance(450 * time.Millisecond)
+	if dumpDir != "" {
+		savePreview(t, dumpDir, "v3_03b_studio_mosaic_bar.png", ttStudio.Image())
+		savePreview(t, dumpDir, "v3_11_modern_mosaic_showcase.png", renderModernMosaicShowcase())
 	}
 
 	if err := ttStudio.Click("测距"); err != nil {
@@ -401,6 +465,61 @@ func generateTestScrollFrames(w, h int) []*image.RGBA {
 		frames = append(frames, f)
 	}
 	return frames
+}
+
+func renderModernMosaicShowcase() *image.RGBA {
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" width="820" height="420" viewBox="0 0 820 420">
+		<rect width="820" height="420" fill="#F4F6FA"/>
+		<rect x="24" y="24" width="374" height="372" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+		<text x="48" y="64" fill="#0F172A" font-family="Segoe UI, sans-serif" font-size="18" font-weight="700">Light UI · Sensitive Redaction</text>
+		<text x="48" y="114" fill="#64748B" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Crystal:</text>
+		<text x="128" y="114" fill="#0F172A" font-family="Consolas, monospace" font-size="15" font-weight="600">sk-proj-9a8b7c6d5e4f3a2b1c</text>
+		<text x="48" y="170" fill="#64748B" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Pixel:</text>
+		<text x="128" y="170" fill="#0F172A" font-family="Consolas, monospace" font-size="15" font-weight="600">138-0013-8000 / alice@koma.dev</text>
+		<text x="48" y="226" fill="#64748B" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Redact:</text>
+		<text x="128" y="226" fill="#0F172A" font-family="Consolas, monospace" font-size="15" font-weight="600">Bearer eyJhbGciOiJIUzI1NiJ9</text>
+		<text x="48" y="282" fill="#64748B" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Blur:</text>
+		<text x="128" y="282" fill="#0F172A" font-family="Consolas, monospace" font-size="15" font-weight="600">192.168.10.42:8443</text>
+		<rect x="48" y="314" width="324" height="58" rx="12" fill="#DBEAFE"/>
+		<circle cx="90" cy="343" r="18" fill="#2563EB"/>
+		<rect x="124" y="328" width="160" height="11" rx="5" fill="#1E40AF"/>
+		<rect x="124" y="348" width="218" height="10" rx="5" fill="#60A5FA"/>
+
+		<rect x="422" y="24" width="374" height="372" rx="18" fill="#151821" stroke="#2A3040" stroke-width="1.5"/>
+		<text x="446" y="64" fill="#F8FAFC" font-family="Segoe UI, sans-serif" font-size="18" font-weight="700">Dark Terminal · Redaction</text>
+		<text x="446" y="114" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Crystal:</text>
+		<text x="526" y="114" fill="#38BDF8" font-family="Consolas, monospace" font-size="15" font-weight="600">sk-proj-9a8b7c6d5e4f3a2b1c</text>
+		<text x="446" y="170" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Pixel:</text>
+		<text x="526" y="170" fill="#34D399" font-family="Consolas, monospace" font-size="15" font-weight="600">138-0013-8000 / alice@koma.dev</text>
+		<text x="446" y="226" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Redact:</text>
+		<text x="526" y="226" fill="#F472B6" font-family="Consolas, monospace" font-size="15" font-weight="600">Bearer eyJhbGciOiJIUzI1NiJ9</text>
+		<text x="446" y="282" fill="#94A3B8" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">Blur:</text>
+		<text x="526" y="282" fill="#FBBF24" font-family="Consolas, monospace" font-size="15" font-weight="600">192.168.10.42:8443</text>
+		<rect x="446" y="314" width="324" height="58" rx="12" fill="#1E293B"/>
+		<circle cx="488" cy="343" r="18" fill="#0EA5E9"/>
+		<rect x="522" y="328" width="160" height="11" rx="5" fill="#38BDF8"/>
+		<rect x="522" y="348" width="218" height="10" rx="5" fill="#818CF8"/>
+	</svg>`
+	parsed, err := ui.ParseSVG([]byte(svg))
+	if err != nil {
+		return nil
+	}
+	base := parsed.Image(820, 420, color.White)
+	anns := []canvas.Annotation{
+		// Light card
+		{ID: 1, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicCrystal, Start: canvas.PointF{X: 122, Y: 95}, End: canvas.PointF{X: 372, Y: 124}, BlockSize: 12},
+		{ID: 2, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicPixel, Start: canvas.PointF{X: 122, Y: 151}, End: canvas.PointF{X: 378, Y: 180}, BlockSize: 12},
+		{ID: 3, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicRedact, Start: canvas.PointF{X: 122, Y: 207}, End: canvas.PointF{X: 374, Y: 236}, BlockSize: 12},
+		{ID: 4, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicBlur, Start: canvas.PointF{X: 122, Y: 263}, End: canvas.PointF{X: 312, Y: 292}, BlockSize: 14},
+		{ID: 5, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicCrystal, Start: canvas.PointF{X: 48, Y: 314}, End: canvas.PointF{X: 372, Y: 372}, BlockSize: 14},
+		// Dark card
+		{ID: 6, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicCrystal, Start: canvas.PointF{X: 520, Y: 95}, End: canvas.PointF{X: 770, Y: 124}, BlockSize: 12},
+		{ID: 7, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicPixel, Start: canvas.PointF{X: 520, Y: 151}, End: canvas.PointF{X: 776, Y: 180}, BlockSize: 12},
+		{ID: 8, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicRedact, Start: canvas.PointF{X: 520, Y: 207}, End: canvas.PointF{X: 772, Y: 236}, BlockSize: 12},
+		{ID: 9, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicBlur, Start: canvas.PointF{X: 520, Y: 263}, End: canvas.PointF{X: 710, Y: 292}, BlockSize: 14},
+		{ID: 10, Kind: canvas.ToolPixelate, MosaicStyle: canvas.MosaicCrystal, Start: canvas.PointF{X: 446, Y: 314}, End: canvas.PointF{X: 770, Y: 372}, BlockSize: 14},
+	}
+	return canvas.RenderRasterEffects(base, anns)
 }
 
 func savePreview(t *testing.T, dir, name string, img *image.RGBA) {

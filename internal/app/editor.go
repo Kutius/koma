@@ -15,6 +15,7 @@ import (
 	"koma/internal/glasswork"
 	"koma/internal/icons"
 	"koma/internal/ocr"
+	"koma/internal/redact"
 	"koma/internal/winapi"
 )
 
@@ -58,6 +59,7 @@ type EditorState struct {
 	rasterDirty     bool
 
 	tool        canvas.Tool
+	mosaicStyle canvas.MosaicStyle
 	colorIdx    int
 	strokeWidth float32
 	filled      bool
@@ -66,6 +68,14 @@ type EditorState struct {
 	textDraft   string
 	blockSize   float64
 	measureSens float64
+
+	// Offline smart redaction & point-to-redact OCR cache (scoped to current document)
+	redactMu      sync.Mutex
+	redactBusy    bool
+	redactGen     int
+	ocrWords      []winapi.OCRWord
+	ocrLines      []winapi.OCRWord
+	pendingRedact *pendingEditorRedact
 
 	selectedIdx  int
 	drawing      bool
@@ -115,6 +125,7 @@ type EditorState struct {
 	ocrEngineChoice        ocr.Engine
 	ocrEngineSynced        ocr.Engine
 	ocrEngineSelectOpen    bool
+	redactKeywordsInput    string
 	recordingHotkey        HotkeyAction
 	settingsErr            string
 	hotkeyRecHandles       [5]ui.Handle
@@ -149,6 +160,17 @@ func NewEditorState(a *App) *EditorState {
 // ActiveTool exposes the selected tool for automated testing.
 func (e *EditorState) ActiveTool() canvas.Tool { return e.tool }
 
+// MosaicStyle returns the active mosaic visual style.
+func (e *EditorState) MosaicStyle() canvas.MosaicStyle { return e.mosaicStyle }
+
+// SetMosaicStyle updates the active mosaic visual style.
+func (e *EditorState) SetMosaicStyle(s canvas.MosaicStyle) { e.mosaicStyle = s }
+
+// ApplyOCRWordsForTest injects recognized OCR words and runs smart redaction synchronously (used by tests).
+func (e *EditorState) ApplyOCRWordsForTest(words []winapi.OCRWord) int {
+	return e.applySmartRedactWords(words, e.tool, e.mosaicStyle, int(math.Round(e.blockSize)))
+}
+
 // SettingsOpen reports whether the Settings sheet is currently visible.
 func (e *EditorState) SettingsOpen() bool { return e.settingsOpen }
 
@@ -162,6 +184,7 @@ func (e *EditorState) OpenSettings() {
 	e.openAtLoginToggle = e.app.OpenAtLogin()
 	e.autoCheckUpdatesToggle = e.app.AutomaticUpdateChecks()
 	e.quickSaveToggle = e.app.QuickSave()
+	e.redactKeywordsInput = e.app.RedactKeywords()
 	e.syncSettingsSelectChoices()
 	e.themeSelectOpen = false
 	e.formatSelectOpen = false
@@ -201,6 +224,7 @@ func (e *EditorState) SyncUpdaterState() {
 // CloseSettings closes the Settings sheet and restores paused global shortcuts.
 func (e *EditorState) CloseSettings() {
 	e.stopRecordingHotkey()
+	e.app.SetRedactKeywords(e.redactKeywordsInput)
 	e.themeSelectOpen = false
 	e.formatSelectOpen = false
 	e.ocrEngineSelectOpen = false
@@ -247,11 +271,160 @@ func (e *EditorState) LoadImage(img *image.RGBA, title string) {
 	e.loadOwnedImage(canvas.CloneRGBA(img), nil, title)
 }
 
+type pendingEditorRedact struct {
+	gen       int
+	words     []winapi.OCRWord
+	kind      canvas.Tool
+	style     canvas.MosaicStyle
+	blockSize int
+	errMsg    string
+}
+
+func (e *EditorState) clearRedactCache() {
+	e.redactMu.Lock()
+	e.redactGen++
+	e.redactBusy = false
+	e.pendingRedact = nil
+	e.redactMu.Unlock()
+	e.ocrWords = nil
+	e.ocrLines = nil
+}
+
+func (e *EditorState) isRedactBusy() bool {
+	e.redactMu.Lock()
+	busy := e.redactBusy
+	e.redactMu.Unlock()
+	return busy
+}
+
+func (e *EditorState) drainPendingRedact() {
+	e.redactMu.Lock()
+	out := e.pendingRedact
+	gen := e.redactGen
+	e.pendingRedact = nil
+	e.redactMu.Unlock()
+	if out == nil || out.gen != gen {
+		return
+	}
+	if out.errMsg != "" {
+		e.SetToast(out.errMsg)
+		return
+	}
+	n := e.applySmartRedactWords(out.words, out.kind, out.style, out.blockSize)
+	if n > 0 {
+		e.SetToast(fmt.Sprintf("已智能打码 %d 处敏感信息", n))
+	} else {
+		e.SetToast("未检测到敏感信息 · 单击文字可精准打码")
+	}
+}
+
+func (e *EditorState) applySmartRedactWords(words []winapi.OCRWord, kind canvas.Tool, style canvas.MosaicStyle, blockSize int) int {
+	if e.baseImg == nil {
+		return 0
+	}
+	e.ocrWords, e.ocrLines = redact.BuildInteractiveTokens(words, e.baseImg)
+	return e.applySmartRedactFromWords(words, kind, style, blockSize)
+}
+
+func (e *EditorState) applySmartRedactFromCached(kind canvas.Tool, style canvas.MosaicStyle, blockSize int) int {
+	return e.applySmartRedactFromWords(e.ocrWords, kind, style, blockSize)
+}
+
+func (e *EditorState) applySmartRedactFromWords(words []winapi.OCRWord, kind canvas.Tool, style canvas.MosaicStyle, blockSize int) int {
+	if e.baseImg == nil {
+		return 0
+	}
+	var customKWs []string
+	if e.app != nil {
+		customKWs = redact.ParseKeywords(e.app.RedactKeywords())
+	}
+	candidates := buildRedactionAnnotations(words, e.baseImg.Bounds(), e.baseImg, 0, 0, customKWs, kind, style, blockSize, &e.nextAnnID)
+	added := filterNonOverlappingRedactions(e.annotations, candidates)
+	if len(added) == 0 {
+		return 0
+	}
+	e.pushUndo()
+	e.annotations = append(e.annotations, added...)
+	e.selectedIdx = -1
+	e.rasterDirty = true
+	return len(added)
+}
+
+func (e *EditorState) triggerSmartRedact() {
+	if e.baseImg == nil {
+		return
+	}
+	kind := e.tool
+	if kind != canvas.ToolBlur {
+		kind = canvas.ToolPixelate
+		e.tool = canvas.ToolPixelate
+	}
+	style := e.mosaicStyle
+	bs := int(math.Round(e.blockSize))
+
+	if len(e.ocrWords) > 0 {
+		n := e.applySmartRedactFromCached(kind, style, bs)
+		if n > 0 {
+			e.SetToast(fmt.Sprintf("已智能打码 %d 处敏感信息", n))
+		} else {
+			e.SetToast("未发现新的敏感信息 · 单击文字可精准打码")
+		}
+		return
+	}
+
+	e.redactMu.Lock()
+	if e.redactBusy {
+		e.redactMu.Unlock()
+		return
+	}
+	e.redactBusy = true
+	e.redactGen++
+	gen := e.redactGen
+	e.redactMu.Unlock()
+
+	// baseImg is immutable during an edit session (applyCrop replaces the pointer),
+	// so passing it read-only avoids an extra 15-35 MB full-resolution CloneRGBA.
+	src := e.baseImg
+	appRef := e.app
+	go func() {
+		var out pendingEditorRedact
+		out.gen = gen
+		out.kind = kind
+		out.style = style
+		out.blockSize = bs
+		if appRef == nil {
+			out.errMsg = "离线识别不可用"
+		} else {
+			res, _, err := appRef.RecognizeOCR(src)
+			if err != nil {
+				out.errMsg = "识别失败：" + err.Error()
+			} else {
+				out.words = res.Words
+			}
+		}
+		e.redactMu.Lock()
+		if e.redactGen == gen {
+			e.redactBusy = false
+			e.pendingRedact = &out
+		}
+		e.redactMu.Unlock()
+		if appRef != nil {
+			appRef.mu.Lock()
+			w := appRef.editorWin
+			appRef.mu.Unlock()
+			if w != nil {
+				w.Update(func() {})
+			}
+		}
+	}()
+}
+
 // loadOwnedImage takes ownership of an already-fresh *image.RGBA without cloning it a second time.
 func (e *EditorState) loadOwnedImage(img *image.RGBA, pngBytes []byte, title string) {
 	if img == nil {
 		return
 	}
+	e.clearRedactCache()
 	e.title = title
 	e.baseImg = img
 	e.basePNG = pngBytes
@@ -272,6 +445,7 @@ func (e *EditorState) loadOwnedImage(img *image.RGBA, pngBytes []byte, title str
 
 // ClearDocument releases active document buffers when returning to Home stage.
 func (e *EditorState) ClearDocument() {
+	e.clearRedactCache()
 	e.baseImg = nil
 	e.basePNG = nil
 	e.rasterImg = nil
@@ -290,6 +464,7 @@ func (e *EditorState) ClearDocument() {
 // when the Studio window is closed to the system tray, keeping only compressed PNG
 // bytes (~200-500 KB) so reopening Studio restores the document and annotations seamlessly.
 func (e *EditorState) ParkForTray() {
+	e.clearRedactCache()
 	if e.baseImg != nil && len(e.basePNG) == 0 {
 		if encoded, err := canvas.EncodePNG(e.baseImg); err == nil {
 			e.basePNG = encoded
@@ -507,6 +682,7 @@ func (e *EditorState) applyCrop() {
 		return
 	}
 	e.pushUndo()
+	e.clearRedactCache()
 	e.baseImg = winapi.CropRGBA(e.baseImg, r)
 	e.basePNG = nil
 	e.rasterBmpOnBase = false
@@ -641,7 +817,7 @@ func (e *EditorState) View(c *ui.Context) {
 		c.SetTheme(ui.LightTheme())
 	}
 	tk := e.tokens()
-
+	e.drainPendingRedact()
 	e.handleShortcuts(c)
 
 	if e.baseImg != nil {
@@ -818,6 +994,17 @@ func (e *EditorState) handleShortcuts(c *ui.Context) {
 		return
 	}
 
+	if c.Shortcut(ui.Shift, ui.KeyX) {
+		e.triggerSmartRedact()
+		return
+	}
+	if c.Shortcut(0, ui.KeyB) {
+		e.tool = canvas.ToolPixelate
+		e.mosaicStyle = canvas.MosaicBlur
+		e.selectedIdx = -1
+		return
+	}
+
 	toolKeys := []struct {
 		key  ui.Key
 		tool canvas.Tool
@@ -832,7 +1019,6 @@ func (e *EditorState) handleShortcuts(c *ui.Context) {
 		{ui.KeyT, canvas.ToolText},
 		{ui.KeyN, canvas.ToolCounter},
 		{ui.KeyX, canvas.ToolPixelate},
-		{ui.KeyB, canvas.ToolBlur},
 		{ui.KeyS, canvas.ToolSpotlight},
 		{ui.KeyM, canvas.ToolMeasure},
 		{ui.KeyC, canvas.ToolCrop},
@@ -946,8 +1132,8 @@ func (e *EditorState) renderFloatingTopChrome(c *ui.Context, tk appleTokens) {
 				Cursor(ui.CursorPointer).Tooltip("复制成品图到剪贴板 (Ctrl+C)")
 			glasswork.ApplyLiquidButton(copyBtn, glasswork.PrimaryButtonOpts())
 			copyBtn.Children(func() {
-				ui.Icon(c, icons.Copy.Active).Size(16, 16).TextColor(ui.Hex("#FFFFFF"))
-				ui.Text(c, "复制").FontSize(12.5).FontWeight(600).TextColor(ui.Hex("#FFFFFF"))
+				ui.Icon(c, icons.Copy.Active).Size(16, 16).TextColor(ui.Hex("#FFFFFF")).Shrink(0)
+				ui.Text(c, "复制").FontSize(12.5).FontWeight(600).TextColor(ui.Hex("#FFFFFF")).SingleLine().Shrink(0)
 			})
 			if copyBtn.Clicked() {
 				e.copyComposite()
@@ -1169,14 +1355,62 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 						}
 
 					case canvas.ToolPixelate, canvas.ToolBlur:
-						tip := "马赛克粒度"
-						if e.tool == canvas.ToolBlur {
-							tip = "模糊强度"
+						ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+							for _, st := range []canvas.MosaicStyle{canvas.MosaicCrystal, canvas.MosaicBlur, canvas.MosaicPixel, canvas.MosaicRedact} {
+								if appleSubChipScoped(c, tk, st.Name(), e.mosaicStyle == st, "studio-mosaic-style") {
+									e.tool = canvas.ToolPixelate
+									e.mosaicStyle = st
+									if e.selectedIdx >= 0 && e.selectedIdx < len(e.annotations) {
+										if k := e.annotations[e.selectedIdx].Kind; k == canvas.ToolPixelate || k == canvas.ToolBlur {
+											e.annotations[e.selectedIdx].Kind = canvas.ToolPixelate
+											e.annotations[e.selectedIdx].MosaicStyle = st
+											e.rasterDirty = true
+										}
+									}
+								}
+							}
+						})
+						if e.mosaicStyle != canvas.MosaicRedact {
+							appleGlassDivider(c, tk)
+							tip := "马赛克粒度"
+							if e.mosaicStyle == canvas.MosaicBlur {
+								tip = "模糊强度"
+							}
+							ui.Slider(c, &e.blockSize, 6, 36).Width(100).Label(tip).Tooltip(tip)
+							ui.Textf(c, "%d px", int(math.Round(e.blockSize))).
+								FontSize(12).FontWeight(600).TextColor(tk.textPrimary).SingleLine().Shrink(0).
+								ContentTransition(glasswork.ContentNumeric)
 						}
-						ui.Slider(c, &e.blockSize, 6, 36).Width(136).Label(tip).Tooltip(tip)
-						ui.Textf(c, "%d px", int(math.Round(e.blockSize))).
-							FontSize(12).FontWeight(600).TextColor(tk.textPrimary).SingleLine().Shrink(0).
-							ContentTransition(glasswork.ContentNumeric)
+						appleGlassDivider(c, tk)
+						busy := e.isRedactBusy()
+						smartLabel := "智能打码"
+						if busy {
+							smartLabel = "扫描中…"
+						}
+						smartBtn := ui.Row(c.Key("studio-smart-redact")).
+							Height(26).Padding(0, 10, 0, 8).Gap(5).Radius(13).
+							AlignItems(ui.Center).Shrink(0).
+							Role(ui.RoleButton).Label("智能打码").
+							Cursor(ui.CursorPointer).Tooltip("离线识别并打码敏感信息 (Shift+X)")
+						sFg := tk.inks.Accent
+						if busy {
+							smartBtn.Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder).Opacity(0.75)
+						} else if smartBtn.Hovered() {
+							smartBtn.Background(tk.inks.AccentFill).Border(1, tk.inks.AccentBorder)
+						} else {
+							smartBtn.Background(tk.hoverFill).Border(1, tk.hairline)
+							sFg = tk.textPrimary
+						}
+						smartBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+						glasswork.ApplyLiquidButton(smartBtn, glasswork.CompactButtonOpts())
+						smartBtn.Children(func() {
+							ui.Icon(c, icons.SmartRedact.For(busy || smartBtn.Hovered() || smartBtn.Pressed())).
+								Size(14.5, 14.5).TextColor(sFg).Shrink(0).ContentTransition(ui.ContentTransition{})
+							ui.Text(c, smartLabel).FontSize(11.5).FontWeight(600).TextColor(sFg).SingleLine().Shrink(0)
+						})
+						if smartBtn.Clicked() && !busy {
+							e.triggerSmartRedact()
+						}
 
 					case canvas.ToolMeasure:
 						e.renderAppleColorDots(c, tk)
@@ -1297,13 +1531,12 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 					{canvas.ToolText, icons.Text},
 					{canvas.ToolCounter, icons.Counter},
 					{canvas.ToolPixelate, icons.Pixelate},
-					{canvas.ToolBlur, icons.Blur},
 					{canvas.ToolSpotlight, icons.Spotlight},
 					{canvas.ToolMeasure, icons.Measure},
 					{canvas.ToolCrop, icons.Crop},
 				}
 				for idx, item := range tools {
-					if idx == 1 || idx == 9 || idx == 12 {
+					if idx == 1 || idx == 9 || idx == 11 {
 						appleGlassDivider(c, tk)
 					}
 					active := e.tool == item.tool
@@ -1562,6 +1795,12 @@ func (e *EditorState) renderFloatingHistoryDrawer(c *ui.Context, tk appleTokens)
 
 func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 	vp := ui.Box(c).Absolute().Fill().Background(tk.canvasBg)
+	altLineMode := c.Modifiers()&ui.Alt != 0
+	hoverRemoveIdx := -1
+	var hoverWord winapi.OCRWord
+	hasHoverWord := false
+	hoverWordIsLine := false
+
 	cur := ui.CursorCrosshair
 	switch {
 	case e.panning:
@@ -1570,6 +1809,24 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 		cur = ui.CursorDefault
 	case e.tool == canvas.ToolText:
 		cur = ui.CursorText
+	case (e.tool == canvas.ToolPixelate || e.tool == canvas.ToolBlur) && !e.drawing && e.hoverValid:
+		if hit := hitRedactionAnnotation(e.annotations, float32(e.hoverImgX), float32(e.hoverImgY)); hit >= 0 {
+			hoverRemoveIdx = hit
+			cur = ui.CursorPointer
+		} else if altLineMode && len(e.ocrLines) > 0 {
+			if lineW, ok := redact.FindLineAt(e.ocrLines, float32(e.hoverImgX), float32(e.hoverImgY)); ok {
+				hoverWord = lineW
+				hasHoverWord = true
+				hoverWordIsLine = true
+				cur = ui.CursorPointer
+			}
+		} else if len(e.ocrWords) > 0 {
+			if word, ok := redact.FindWordAt(e.ocrWords, float32(e.hoverImgX), float32(e.hoverImgY)); ok {
+				hoverWord = word
+				hasHoverWord = true
+				cur = ui.CursorPointer
+			}
+		}
 	}
 	vp.Cursor(cur)
 
@@ -1710,6 +1967,7 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 					Filled:      e.filled,
 					Rounded:     e.rounded,
 					BlockSize:   int(math.Round(e.blockSize)),
+					MosaicStyle: e.mosaicStyle,
 				}
 				if e.tool == canvas.ToolPen || e.tool == canvas.ToolHighlighter {
 					e.draftAnn.Points = []canvas.PointF{pt}
@@ -1817,11 +2075,47 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 					return true
 				}
 				minX, minY, maxX, maxY := e.draftAnn.Bounds()
-				if maxX-minX >= 3 || maxY-minY >= 3 || len(e.draftAnn.Points) >= 2 {
+				isRedactTool := e.draftAnn.Kind == canvas.ToolPixelate || e.draftAnn.Kind == canvas.ToolBlur
+				clickTol := float32(3)
+				if isRedactTool {
+					clickTol = 5
+				}
+				if maxX-minX >= clickTol || maxY-minY >= clickTol || len(e.draftAnn.Points) >= 2 {
 					e.pushUndo()
 					e.annotations = append(e.annotations, e.draftAnn)
-					if e.draftAnn.Kind == canvas.ToolPixelate || e.draftAnn.Kind == canvas.ToolBlur || e.draftAnn.Kind == canvas.ToolSpotlight {
+					if isRedactTool || e.draftAnn.Kind == canvas.ToolSpotlight {
 						e.rasterDirty = true
+					}
+				} else if isRedactTool {
+					// One-click toggle: clicking an existing mosaic/blur block removes it;
+					// otherwise clicking a recognized OCR word tightly redacts that token.
+					if hit := hitRedactionAnnotation(e.annotations, e.draftAnn.Start.X, e.draftAnn.Start.Y); hit >= 0 {
+						e.pushUndo()
+						e.annotations = append(e.annotations[:hit], e.annotations[hit+1:]...)
+						if e.selectedIdx == hit {
+							e.selectedIdx = -1
+						} else if e.selectedIdx > hit {
+							e.selectedIdx--
+						}
+						e.rasterDirty = true
+					} else if (ev.Mods&ui.Alt != 0) && len(e.ocrLines) > 0 {
+						if lineW, ok := redact.FindLineAt(e.ocrLines, e.draftAnn.Start.X, e.draftAnn.Start.Y); ok {
+							e.nextAnnID++
+							if ann, valid := makeWordRedactionAnnotation(lineW, e.baseImg.Bounds(), e.draftAnn.Kind, e.mosaicStyle, int(math.Round(e.blockSize)), e.nextAnnID); valid {
+								e.pushUndo()
+								e.annotations = append(e.annotations, ann)
+								e.rasterDirty = true
+							}
+						}
+					} else if len(e.ocrWords) > 0 {
+						if word, ok := redact.FindWordAt(e.ocrWords, e.draftAnn.Start.X, e.draftAnn.Start.Y); ok {
+							e.nextAnnID++
+							if ann, valid := makeWordRedactionAnnotation(word, e.baseImg.Bounds(), e.draftAnn.Kind, e.mosaicStyle, int(math.Round(e.blockSize)), e.nextAnnID); valid {
+								e.pushUndo()
+								e.annotations = append(e.annotations, ann)
+								e.rasterDirty = true
+							}
+						}
 					}
 				}
 				return true
@@ -1870,6 +2164,26 @@ func (e *EditorState) renderCanvasViewport(c *ui.Context, tk appleTokens) {
 			}
 			if e.drawing {
 				canvas.DrawAnnotationLive(pt, e.draftAnn, ox, oy, e.zoom, false, true)
+			}
+			if !e.drawing && (e.tool == canvas.ToolPixelate || e.tool == canvas.ToolBlur) && e.hoverValid {
+				if hoverRemoveIdx >= 0 && hoverRemoveIdx < len(e.annotations) {
+					minX, minY, maxX, maxY := e.annotations[hoverRemoveIdx].Bounds()
+					hr := ui.Rect{
+						X: ox + minX*e.zoom,
+						Y: oy + minY*e.zoom,
+						W: (maxX - minX) * e.zoom,
+						H: (maxY - minY) * e.zoom,
+					}
+					drawRedactionRemoveHint(pt, hr)
+				} else if hasHoverWord {
+					wr := ui.Rect{
+						X: ox + float32(hoverWord.Rect.Min.X-3)*e.zoom,
+						Y: oy + float32(hoverWord.Rect.Min.Y-2)*e.zoom,
+						W: float32(hoverWord.Rect.Dx()+6) * e.zoom,
+						H: float32(hoverWord.Rect.Dy()+4) * e.zoom,
+					}
+					drawWordRedactHint(pt, wr, hoverWordIsLine)
+				}
 			}
 
 			if e.tool == canvas.ToolMeasure && e.hoverValid && e.liveMeasure.Valid {
@@ -1950,7 +2264,8 @@ func (e *EditorState) renderHelpSheet(c *ui.Context, tk appleTokens) {
 					ui.Column(c).Grow(1).Gap(7).Children(func() {
 						ui.Text(c, "标注与贴图").FontSize(11).FontWeight(700).TextColor(tk.inks.Accent)
 						appleHelpRow(c, tk, "R / O / A / P / H", "矩形 / 椭圆 / 箭头 / 画笔 / 荧光")
-						appleHelpRow(c, tk, "X / B / S", "马赛克 / 模糊 / 聚光灯")
+						appleHelpRow(c, tk, "X / B / S", "马赛克 / 模糊样式 / 聚光灯")
+						appleHelpRow(c, tk, "Shift+X / Alt+单击", "智能打码 / 整行打码")
 						appleHelpRow(c, tk, "T / N / M / C", "文字 / 序号 / 测距 / 裁剪")
 						appleHelpRow(c, tk, "Ctrl+Z / Ctrl+Y", "撤销 / 重做")
 						appleHelpRow(c, tk, "Ctrl+C / S / P", "复制 / 保存 / 贴图")
@@ -2508,6 +2823,21 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 									if dlBtn.Clicked() {
 										e.app.StartPPOCRDownload()
 									}
+								}
+							})
+
+							ui.Row(c.Key("settings-redact-kw-row")).
+								Height(40).Padding(0, 10, 0, 12).Radius(13).Gap(8).
+								Background(tk.hoverFill.Alpha(0.55)).AlignItems(ui.Center).Children(func() {
+								ui.Text(c, "敏感词").FontSize(13).FontWeight(500).TextColor(tk.textPrimary).SingleLine().Shrink(0)
+								kwInp := ui.TextInput(c.Key("settings-redact-keywords"), &e.redactKeywordsInput).
+									Grow(1).Height(28).Radius(9).Padding(0, 8, 0, 8).
+									FontSize(12).TextColor(tk.textPrimary).
+									Background(tk.cardBg.Alpha(0.65)).Border(1, tk.hairline).
+									Placeholder("姓名、公司、域名（逗号分隔）").
+									Label("自定义敏感词").Tooltip("智能打码时自动遮挡这些关键词（逗号分隔）")
+								if kwInp.Changed() {
+									e.app.SetRedactKeywords(e.redactKeywordsInput)
 								}
 							})
 						})

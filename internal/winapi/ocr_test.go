@@ -64,6 +64,14 @@ func TestWindowsNativeOCREndToEnd(t *testing.T) {
 	if len(res.Lines) < 2 {
 		t.Fatalf("expected at least 2 recognized lines, got %d (%q)", len(res.Lines), res.Text)
 	}
+	if len(res.Words) < 2 {
+		t.Fatalf("expected OCR word bounding boxes, got %d words", len(res.Words))
+	}
+	for _, wd := range res.Words {
+		if wd.Rect.Empty() || !wd.Rect.In(img.Bounds()) {
+			t.Fatalf("word %q has invalid rect %v outside %v", wd.Text, wd.Rect, img.Bounds())
+		}
+	}
 
 	// Dark background UI screenshot (auto-inverted + 2x bilinear upscaled + padded).
 	darkSVG := `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="120" viewBox="0 0 480 120">

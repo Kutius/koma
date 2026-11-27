@@ -9,9 +9,11 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
+	"koma/internal/canvas"
 	"koma/internal/glasswork"
 	"koma/internal/icons"
 	"koma/internal/ocr"
+	"koma/internal/redact"
 	"koma/internal/winapi"
 )
 
@@ -29,6 +31,179 @@ type ocrResultWindow struct {
 	text    string
 	errMsg  string
 	lines   int
+}
+
+// RecognizeOCR runs Koma's configured offline OCR engine (PP-OCRv6 with automatic
+// fallback to Windows native OCR) and returns lines plus per-word pixel bounding boxes.
+func (a *App) RecognizeOCR(img *image.RGBA) (winapi.OCRResult, ocr.Engine, error) {
+	if img == nil {
+		return winapi.OCRResult{}, ocr.EngineSystem, fmt.Errorf("图像为空")
+	}
+	eng := a.OCREngine()
+	if eng == ocr.EnginePPOCRv6 && !a.PPOCRInstalled() {
+		eng = ocr.EngineSystem
+	}
+	if eng == ocr.EnginePPOCRv6 && a.ppocr != nil {
+		a.ppocr.SetDir(a.OCRDataDir())
+		res, err := a.ppocr.Recognize(img)
+		if err == nil {
+			return res, ocr.EnginePPOCRv6, nil
+		}
+		if sysRes, sysErr := winapi.RecognizeText(img); sysErr == nil {
+			return sysRes, ocr.EngineSystem, nil
+		}
+		return winapi.OCRResult{}, ocr.EnginePPOCRv6, err
+	}
+	res, err := winapi.RecognizeText(img)
+	return res, ocr.EngineSystem, err
+}
+
+// buildRedactionAnnotations detects sensitive regions inside words and converts
+// them into standard, non-destructive Mosaic or Blur annotations shifted by (offsetX, offsetY).
+// When srcImg is non-nil, each box is ink-tightened to crisp glyph bounds with clean padding.
+func buildRedactionAnnotations(
+	words []winapi.OCRWord,
+	imgBounds image.Rectangle,
+	srcImg *image.RGBA,
+	offsetX, offsetY int,
+	customKeywords []string,
+	kind canvas.Tool,
+	style canvas.MosaicStyle,
+	blockSize int,
+	nextID *int,
+) []canvas.Annotation {
+	if kind != canvas.ToolBlur {
+		kind = canvas.ToolPixelate
+	}
+	findings := redact.Detect(words, imgBounds, customKeywords)
+	if len(findings) == 0 {
+		return nil
+	}
+	anns := make([]canvas.Annotation, 0, len(findings))
+	for _, f := range findings {
+		rc := image.Rect(
+			f.Rect.Min.X+offsetX,
+			f.Rect.Min.Y+offsetY,
+			f.Rect.Max.X+offsetX,
+			f.Rect.Max.Y+offsetY,
+		)
+		if srcImg != nil {
+			tight := redact.TightenRectToInk(srcImg, rc)
+			h := max(1, tight.Dy())
+			padX := max(3, h/6)
+			padY := max(2, h/8)
+			rc = image.Rect(tight.Min.X-padX, tight.Min.Y-padY, tight.Max.X+padX, tight.Max.Y+padY).Intersect(srcImg.Bounds())
+			if rc.Dx() < 4 || rc.Dy() < 4 {
+				continue
+			}
+		}
+		*nextID++
+		anns = append(anns, canvas.Annotation{
+			ID:          *nextID,
+			Kind:        kind,
+			Start:       canvas.PointF{X: float32(rc.Min.X), Y: float32(rc.Min.Y)},
+			End:         canvas.PointF{X: float32(rc.Max.X), Y: float32(rc.Max.Y)},
+			BlockSize:   blockSize,
+			MosaicStyle: style,
+		})
+	}
+	return anns
+}
+
+// makeWordRedactionAnnotation builds a tightly fitted Mosaic/Blur annotation
+// around a single clicked OCR word (with comfortable glyph padding).
+func makeWordRedactionAnnotation(
+	word winapi.OCRWord,
+	clipBounds image.Rectangle,
+	kind canvas.Tool,
+	style canvas.MosaicStyle,
+	blockSize int,
+	id int,
+) (canvas.Annotation, bool) {
+	if kind != canvas.ToolBlur {
+		kind = canvas.ToolPixelate
+	}
+	h := max(1, word.Rect.Dy())
+	padX := max(4, h/5)
+	padY := max(2, h/8)
+	rc := image.Rect(
+		word.Rect.Min.X-padX,
+		word.Rect.Min.Y-padY,
+		word.Rect.Max.X+padX,
+		word.Rect.Max.Y+padY,
+	).Intersect(clipBounds)
+	if rc.Dx() < 4 || rc.Dy() < 4 {
+		return canvas.Annotation{}, false
+	}
+	return canvas.Annotation{
+		ID:          id,
+		Kind:        kind,
+		Start:       canvas.PointF{X: float32(rc.Min.X), Y: float32(rc.Min.Y)},
+		End:         canvas.PointF{X: float32(rc.Max.X), Y: float32(rc.Max.Y)},
+		BlockSize:   blockSize,
+		MosaicStyle: style,
+	}, true
+}
+
+// hitRedactionAnnotation finds the top-most mosaic or blur annotation containing
+// image pixel (px, py) with a tiny tolerance so clicking an existing redaction
+// cleanly toggles it off without stealing clicks from adjacent words.
+func hitRedactionAnnotation(anns []canvas.Annotation, px, py float32) int {
+	const tol float32 = 2.0
+	for i := len(anns) - 1; i >= 0; i-- {
+		a := anns[i]
+		if a.Kind != canvas.ToolPixelate && a.Kind != canvas.ToolBlur {
+			continue
+		}
+		minX, minY, maxX, maxY := a.Bounds()
+		if px >= minX-tol && px <= maxX+tol && py >= minY-tol && py <= maxY+tol {
+			return i
+		}
+	}
+	return -1
+}
+
+// drawRedactionRemoveHint paints a subtle crimson outline and corner close badge
+// over a hovered mosaic/blur block to signal one-click removal.
+func drawRedactionRemoveHint(pt *ui.Painter, r ui.Rect) {
+	if r.W < 2 || r.H < 2 {
+		return
+	}
+	rad := min(float32(10), min(r.W, r.H)*0.28)
+	if rad < 3 {
+		rad = 3
+	}
+	pt.Fill(r, ui.Hex("#FF3B30").Alpha(0.14), rad)
+	pt.StrokeDashed(r, ui.Hex("#FF453A").Alpha(0.85), rad, 1.4)
+
+	const badge float32 = 14
+	bx := r.X + r.W - badge*0.55
+	by := r.Y - badge*0.45
+	br := ui.Rect{X: bx, Y: by, W: badge, H: badge}
+	pt.Shadow(br, badge/2, 0, 1, 4, 0, ui.RGBA(0, 0, 0, 0.30))
+	pt.Fill(br, ui.Hex("#FF3B30"), badge/2)
+	cx, cy := bx+badge*0.5, by+badge*0.5
+	const arm float32 = 3.0
+	pt.Line(cx-arm, cy-arm, cx+arm, cy+arm, 1.5, ui.Hex("#FFFFFF"))
+	pt.Line(cx+arm, cy-arm, cx-arm, cy+arm, 1.5, ui.Hex("#FFFFFF"))
+}
+
+// drawWordRedactHint paints the hover preview box for one-click word or Alt+whole-line redaction.
+func drawWordRedactHint(pt *ui.Painter, r ui.Rect, wholeLine bool) {
+	if r.W < 2 || r.H < 2 {
+		return
+	}
+	rad := min(float32(8), min(r.W, r.H)*0.26)
+	if rad < 3 {
+		rad = 3
+	}
+	if wholeLine {
+		pt.Fill(r, ui.Hex("#6366F1").Alpha(0.16), rad)
+		pt.StrokeDashed(r, ui.Hex("#818CF8").Alpha(0.88), rad, 1.4)
+		return
+	}
+	pt.Fill(r, ui.Hex("#0A84FF").Alpha(0.14), rad)
+	pt.StrokeDashed(r, ui.Hex("#0A84FF").Alpha(0.78), rad, 1.25)
 }
 
 // RecognizeTextFromImage runs offline OCR (PP-OCRv6 when selected & installed,
@@ -223,26 +398,29 @@ func (o *ocrResultWindow) view(c *ui.Context) {
 	}
 
 	kind := glasswork.KindLight
+	cardBg := ui.Hex("#F7F9FC")
+	cardBorder := ui.RGBA(15, 23, 42, 0.14)
 	textPrimary := ui.Hex("#0F172A")
 	textSecondary := ui.Hex("#475569")
-	fieldBg := ui.RGBA(255, 255, 255, 0.78)
-	secBtnBg := ui.RGBA(255, 255, 255, 0.68)
-	hairline := ui.RGBA(15, 23, 42, 0.12)
+	fieldBg := ui.Hex("#FFFFFF")
+	secBtnBg := ui.Hex("#FFFFFF")
+	hairline := ui.RGBA(15, 23, 42, 0.11)
 	if dark {
 		kind = glasswork.KindDark
+		cardBg = ui.Hex("#1B1E26")
+		cardBorder = ui.RGBA(255, 255, 255, 0.14)
 		textPrimary = ui.Hex("#F8FAFC")
 		textSecondary = ui.Hex("#CBD5E1")
-		fieldBg = ui.RGBA(15, 23, 42, 0.56)
-		secBtnBg = ui.RGBA(255, 255, 255, 0.12)
-		hairline = ui.RGBA(255, 255, 255, 0.14)
+		fieldBg = ui.Hex("#13161D")
+		secBtnBg = ui.Hex("#252A35")
+		hairline = ui.RGBA(255, 255, 255, 0.12)
 	}
 	inks := kind.Inks()
 
-	ui.Box(c).Fill().Padding(10).Children(func() {
-		card := ui.Column(c.Key("ocr-card")).
-			Fill().Padding(18).Gap(12).Radius(24).
-			Material(glasswork.Card(kind))
-		card.Children(func() {
+	card := ui.Column(c.Key("ocr-card")).
+		Fill().Padding(18).Gap(12).Radius(20).
+		Background(cardBg).Border(1, cardBorder)
+	card.Children(func() {
 			// Draggable header bar
 			ui.Row(c).AlignItems(ui.Center).Gap(8).DragWindow().Children(func() {
 				ui.Icon(c, icons.OCR.Idle).Size(19, 19).TextColor(inks.Accent).Shrink(0)
@@ -356,8 +534,8 @@ func (o *ocrResultWindow) view(c *ui.Context) {
 						Cursor(ui.CursorPointer).Tooltip("复制全部文本并关闭 (Ctrl+Enter)")
 					glasswork.ApplyLiquidButton(copyClose, glasswork.PrimaryButtonOpts())
 					copyClose.Children(func() {
-						ui.Icon(c, icons.Check.Active).Size(15, 15).TextColor(ui.Hex("#FFFFFF"))
-						ui.Text(c, "复制并关闭").FontSize(12).FontWeight(600).TextColor(ui.Hex("#FFFFFF")).SingleLine()
+						ui.Icon(c, icons.Check.Active).Size(15, 15).TextColor(ui.Hex("#FFFFFF")).Shrink(0)
+						ui.Text(c, "复制并关闭").FontSize(12).FontWeight(600).TextColor(ui.Hex("#FFFFFF")).SingleLine().Shrink(0)
 					})
 					if copyClose.Clicked() {
 						o.copyAllAndClose()
@@ -365,7 +543,6 @@ func (o *ocrResultWindow) view(c *ui.Context) {
 				}
 			})
 		})
-	})
 }
 
 // NewTestOCRView builds a headless-testable OCR result view for automated UI testing.

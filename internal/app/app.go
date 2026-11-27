@@ -91,6 +91,9 @@ type App struct {
 	ocrDownloadErr  string
 	ocrDownloadStop context.CancelFunc
 
+	// Custom sensitive keywords for offline smart redaction (comma/newline separated)
+	redactKeywords string
+
 	// Auto-updater state (backed by MyGo's native updater plugin when running)
 	updaterReady     bool
 	autoCheckUpdates bool

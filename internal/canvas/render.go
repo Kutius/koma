@@ -143,7 +143,7 @@ func RenderRasterEffects(base *image.RGBA, anns []Annotation) *image.RGBA {
 			if bs < 4 {
 				bs = 12
 			}
-			applyPixelate(out, r, bs)
+			applyMosaic(out, r, bs, a.MosaicStyle)
 		case ToolBlur:
 			rad := a.BlockSize
 			if rad < 3 {
@@ -298,7 +298,385 @@ func MakeThumbnail(src *image.RGBA, maxW, maxH int) *image.RGBA {
 	return dst
 }
 
+func adaptiveMosaicRadius(w, h int) float64 {
+	short := float64(min(w, h))
+	rad := short * 0.28
+	if rad > 10.0 {
+		rad = 10.0
+	}
+	if rad < 2.0 && short >= 6 {
+		rad = 2.0
+	}
+	return rad
+}
+
+// roundedRectSDF returns the signed distance from pixel center (px, py) to the
+// boundary of a rounded rectangle [x0, x1] x [y0, y1] with corner radius rad.
+// Negative values are inside the shape, positive values are outside.
+func roundedRectSDF(px, py, x0, y0, x1, y1, rad float64) float64 {
+	cx := (x0 + x1) * 0.5
+	cy := (y0 + y1) * 0.5
+	hx := (x1-x0)*0.5 - rad
+	hy := (y1-y0)*0.5 - rad
+	if hx < 0 {
+		hx = 0
+	}
+	if hy < 0 {
+		hy = 0
+	}
+	dx := math.Abs(px-cx) - hx
+	dy := math.Abs(py-cy) - hy
+	ox := dx
+	if ox < 0 {
+		ox = 0
+	}
+	oy := dy
+	if oy < 0 {
+		oy = 0
+	}
+	inside := math.Max(dx, dy)
+	if inside > 0 {
+		inside = 0
+	}
+	return math.Hypot(ox, oy) + inside - rad
+}
+
+func sdfCoverage(sdf float64) float64 {
+	if sdf <= -0.75 {
+		return 1.0
+	}
+	if sdf >= 0.75 {
+		return 0.0
+	}
+	t := (0.75 - sdf) / 1.5
+	return t * t * (3.0 - 2.0*t)
+}
+
+func clampByteF(v float64) uint8 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 255 {
+		return 255
+	}
+	return uint8(v + 0.5)
+}
+
+func fastHashNoise(x, y int) float64 {
+	h := uint32(x)*374761393 + uint32(y)*668265263
+	h = (h ^ (h >> 13)) * 1274126177
+	h ^= h >> 16
+	return (float64(h&0xFF)/255.0 - 0.5) * 2.0 // [-1, 1]
+}
+
+func sampleBorderLuminance(img *image.RGBA, r image.Rectangle) float64 {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return 128
+	}
+	var sum float64
+	var cnt int
+	add := func(x, y int) {
+		if x < 0 {
+			x = 0
+		} else if x >= w {
+			x = w - 1
+		}
+		if y < 0 {
+			y = 0
+		} else if y >= h {
+			y = h - 1
+		}
+		off := y*img.Stride + x*4
+		sum += 0.2126*float64(img.Pix[off]) + 0.7152*float64(img.Pix[off+1]) + 0.0722*float64(img.Pix[off+2])
+		cnt++
+	}
+	stepX := max(1, r.Dx()/16)
+	stepY := max(1, r.Dy()/16)
+	for x := r.Min.X; x < r.Max.X; x += stepX {
+		add(x, r.Min.Y-2)
+		add(x, r.Max.Y+1)
+	}
+	for y := r.Min.Y; y < r.Max.Y; y += stepY {
+		add(r.Min.X-2, y)
+		add(r.Max.X+1, y)
+	}
+	if cnt == 0 {
+		return 128
+	}
+	return sum / float64(cnt)
+}
+
+func applyMosaic(img *image.RGBA, r image.Rectangle, blockSize int, style MosaicStyle) {
+	switch style {
+	case MosaicBlur:
+		applyBlur(img, r, blockSize)
+	case MosaicPixel:
+		applyPixelate(img, r, blockSize)
+	case MosaicRedact:
+		applyRedactBar(img, r)
+	default:
+		applyCrystalMosaic(img, r, blockSize)
+	}
+}
+
+// applyCrystalMosaic renders a modern, Apple Liquid Glass inspired frosted
+// prism tile mosaic: rounded anti-aliased silhouette, neighbor-softened glass
+// tile colors, subtle convex lens specular gradient per tile, micro-frosted
+// grain, and an adaptive 1px hairline rim.
+func applyCrystalMosaic(img *image.RGBA, r image.Rectangle, blockSize int) {
+	w, h := r.Dx(), r.Dy()
+	if w <= 0 || h <= 0 {
+		return
+	}
+	if blockSize < 6 {
+		blockSize = 6
+	}
+	// Keep tile size proportional on narrow single-line text chips so at least ~2 rows of tiles appear.
+	tile := blockSize
+	if h < tile*2 && h >= 12 {
+		tile = max(6, (h+1)/2)
+	}
+
+	cols := (w + tile - 1) / tile
+	rows := (h + tile - 1) / tile
+	type rgbF struct{ r, g, b float64 }
+	grid := make([]rgbF, cols*rows)
+
+	pix := img.Pix
+	stride := img.Stride
+	for gy := 0; gy < rows; gy++ {
+		y0 := r.Min.Y + gy*tile
+		y1 := min(y0+tile, r.Max.Y)
+		for gx := 0; gx < cols; gx++ {
+			x0 := r.Min.X + gx*tile
+			x1 := min(x0+tile, r.Max.X)
+			var sr, sg, sb, cnt int
+			for y := y0; y < y1; y++ {
+				row := y * stride
+				for x := x0; x < x1; x++ {
+					off := row + x*4
+					sr += int(pix[off])
+					sg += int(pix[off+1])
+					sb += int(pix[off+2])
+					cnt++
+				}
+			}
+			if cnt > 0 {
+				inv := 1.0 / float64(cnt)
+				grid[gy*cols+gx] = rgbF{float64(sr) * inv, float64(sg) * inv, float64(sb) * inv}
+			}
+		}
+	}
+
+	// Gently cross-blend neighboring tiles so sharp glyph edges dissolve into
+	// cohesive frosted glass color fields that are harder to reverse and far cleaner.
+	soft := make([]rgbF, len(grid))
+	for gy := 0; gy < rows; gy++ {
+		for gx := 0; gx < cols; gx++ {
+			c := grid[gy*cols+gx]
+			wr, wg, wb := c.r*0.64, c.g*0.64, c.b*0.64
+			wSum := 0.64
+			for _, d := range [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
+				nx, ny := gx+d[0], gy+d[1]
+				if nx >= 0 && nx < cols && ny >= 0 && ny < rows {
+					nb := grid[ny*cols+nx]
+					wr += nb.r * 0.09
+					wg += nb.g * 0.09
+					wb += nb.b * 0.09
+					wSum += 0.09
+				}
+			}
+			inv := 1.0 / wSum
+			// Add a subtle deterministic per-tile color micro-jitter (±3) to further defeat reconstruction.
+			j := fastHashNoise(gx*7+r.Min.X, gy*11+r.Min.Y) * 3.0
+			soft[gy*cols+gx] = rgbF{wr*inv + j, wg*inv + j, wb*inv + j}
+		}
+	}
+
+	rad := adaptiveMosaicRadius(w, h)
+	radInt := int(math.Ceil(rad)) + 2
+	x0F, y0F := float64(r.Min.X), float64(r.Min.Y)
+	x1F, y1F := float64(r.Max.X), float64(r.Max.Y)
+	bgLum := sampleBorderLuminance(img, r)
+	darkBg := bgLum < 128
+
+	invTile := 1.0 / float64(tile)
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		ly := y - r.Min.Y
+		gy := ly / tile
+		v := (float64(ly-gy*tile) + 0.5) * invTile
+		row := y * stride
+		nearEdgeY := ly < 2 || ly >= h-2
+		nearCornerY := ly < radInt || ly >= h-radInt
+		rowTileBase := gy * cols
+		for x := r.Min.X; x < r.Max.X; x++ {
+			lx := x - r.Min.X
+			needSDF := nearEdgeY || lx < 2 || lx >= w-2 || (nearCornerY && (lx < radInt || lx >= w-radInt))
+
+			cov := 1.0
+			sdf := -10.0
+			if needSDF {
+				sdf = roundedRectSDF(float64(x)+0.5, float64(y)+0.5, x0F, y0F, x1F, y1F, rad)
+				cov = sdfCoverage(sdf)
+				if cov <= 0 {
+					continue
+				}
+			}
+
+			gx := lx / tile
+			u := (float64(lx-gx*tile) + 0.5) * invTile
+			col := soft[rowTileBase+gx]
+
+			// Diagonal frosted prism curvature: gentle top-left specular, soft bottom-right depth.
+			sheen := (0.48 - (u*0.58 + v*0.42)) * 20.0
+			// Fine frosted bevel at tile edges (fluted/reeded architectural glass feel).
+			edge := math.Min(math.Min(u, 1.0-u), math.Min(v, 1.0-v))
+			if edge < 0.14 {
+				t := 1.0 - edge/0.14
+				if u+v < 1.0 {
+					sheen += t * 9.0
+				} else {
+					sheen -= t * 8.0
+				}
+			}
+			// Subtle organic sandblasted frosted grain.
+			grain := fastHashNoise(x, y) * 2.8
+
+			cr := col.r + sheen + grain
+			cg := col.g + sheen + grain
+			cb := col.b + sheen + grain
+
+			// Adaptive 1px inner glass rim along the rounded silhouette.
+			if needSDF && sdf > -1.8 && sdf < -0.1 {
+				rimT := 1.0 - math.Abs(sdf+0.95)/0.85
+				if rimT > 0 {
+					if darkBg {
+						cr += rimT * 28.0
+						cg += rimT * 32.0
+						cb += rimT * 38.0
+					} else {
+						cr -= rimT * 18.0
+						cg -= rimT * 18.0
+						cb -= rimT * 16.0
+					}
+				}
+			}
+
+			off := row + x*4
+			if cov >= 0.999 {
+				pix[off] = clampByteF(cr)
+				pix[off+1] = clampByteF(cg)
+				pix[off+2] = clampByteF(cb)
+				pix[off+3] = 255
+			} else {
+				inv := 1.0 - cov
+				pix[off] = clampByteF(cr*cov + float64(pix[off])*inv)
+				pix[off+1] = clampByteF(cg*cov + float64(pix[off+1])*inv)
+				pix[off+2] = clampByteF(cb*cov + float64(pix[off+2])*inv)
+				pix[off+3] = 255
+			}
+		}
+	}
+}
+
+// applyRedactBar renders a clean, completely irreversible rounded matte redaction
+// capsule with subtle diagonal security striping and adaptive light/dark contrast.
+func applyRedactBar(img *image.RGBA, r image.Rectangle) {
+	w, h := r.Dx(), r.Dy()
+	if w <= 0 || h <= 0 {
+		return
+	}
+	rad := adaptiveMosaicRadius(w, h)
+	radInt := int(math.Ceil(rad)) + 2
+	x0F, y0F := float64(r.Min.X), float64(r.Min.Y)
+	x1F, y1F := float64(r.Max.X), float64(r.Max.Y)
+	darkBg := sampleBorderLuminance(img, r) < 128
+
+	// Refined charcoal matte pill on light surfaces; elevated slate pill on dark surfaces.
+	var baseR, baseG, baseB float64
+	if darkBg {
+		baseR, baseG, baseB = 54, 60, 72
+	} else {
+		baseR, baseG, baseB = 28, 31, 38
+	}
+
+	pix := img.Pix
+	stride := img.Stride
+	invH := 1.0 / float64(max(1, h))
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		ly := y - r.Min.Y
+		lift := (0.5 - float64(ly)*invH) * 8.0
+		row := y * stride
+		nearEdgeY := ly < 2 || ly >= h-2
+		nearCornerY := ly < radInt || ly >= h-radInt
+		for x := r.Min.X; x < r.Max.X; x++ {
+			lx := x - r.Min.X
+			needSDF := nearEdgeY || lx < 2 || lx >= w-2 || (nearCornerY && (lx < radInt || lx >= w-radInt))
+			cov := 1.0
+			sdf := -10.0
+			if needSDF {
+				sdf = roundedRectSDF(float64(x)+0.5, float64(y)+0.5, x0F, y0F, x1F, y1F, rad)
+				cov = sdfCoverage(sdf)
+				if cov <= 0 {
+					continue
+				}
+			}
+
+			// Very subtle 45° matte diagonal micro-weave + top specular lift.
+			stripe := 0.0
+			if (x+y)&7 < 2 {
+				stripe = 5.5
+			}
+			grain := fastHashNoise(x, y) * 1.6
+
+			cr := baseR + lift + stripe + grain
+			cg := baseG + lift + stripe + grain
+			cb := baseB + lift + stripe + grain
+
+			if needSDF && sdf > -1.7 && sdf < -0.1 {
+				rimT := 1.0 - math.Abs(sdf+0.9)/0.8
+				if rimT > 0 {
+					if darkBg {
+						cr += rimT * 36.0
+						cg += rimT * 40.0
+						cb += rimT * 48.0
+					} else {
+						cr += rimT * 22.0
+						cg += rimT * 24.0
+						cb += rimT * 28.0
+					}
+				}
+			}
+
+			off := row + x*4
+			if cov >= 0.999 {
+				pix[off] = clampByteF(cr)
+				pix[off+1] = clampByteF(cg)
+				pix[off+2] = clampByteF(cb)
+				pix[off+3] = 255
+			} else {
+				inv := 1.0 - cov
+				pix[off] = clampByteF(cr*cov + float64(pix[off])*inv)
+				pix[off+1] = clampByteF(cg*cov + float64(pix[off+1])*inv)
+				pix[off+2] = clampByteF(cb*cov + float64(pix[off+2])*inv)
+				pix[off+3] = 255
+			}
+		}
+	}
+}
+
 func applyPixelate(img *image.RGBA, r image.Rectangle, blockSize int) {
+	w, h := r.Dx(), r.Dy()
+	if w <= 0 || h <= 0 {
+		return
+	}
+	rad := adaptiveMosaicRadius(w, h)
+	radInt := int(math.Ceil(rad)) + 2
+	x0F, y0F := float64(r.Min.X), float64(r.Min.Y)
+	x1F, y1F := float64(r.Max.X), float64(r.Max.Y)
+
 	pix := img.Pix
 	stride := img.Stride
 	for by := r.Min.Y; by < r.Max.Y; by += blockSize {
@@ -319,14 +697,33 @@ func applyPixelate(img *image.RGBA, r image.Rectangle, blockSize int) {
 			if cnt == 0 {
 				continue
 			}
-			ar, ag, ab := uint8(sr/cnt), uint8(sg/cnt), uint8(sb/cnt)
+			arU, agU, abU := uint8(sr/cnt), uint8(sg/cnt), uint8(sb/cnt)
+			ar, ag, ab := float64(arU), float64(agU), float64(abU)
 			for y := by; y < yEnd; y++ {
+				ly := y - r.Min.Y
+				nearCornerY := ly < radInt || ly >= h-radInt
 				row := y * stride
 				for x := bx; x < xEnd; x++ {
 					off := row + x*4
-					pix[off] = ar
-					pix[off+1] = ag
-					pix[off+2] = ab
+					lx := x - r.Min.X
+					if nearCornerY && (lx < radInt || lx >= w-radInt) {
+						sdf := roundedRectSDF(float64(x)+0.5, float64(y)+0.5, x0F, y0F, x1F, y1F, rad)
+						cov := sdfCoverage(sdf)
+						if cov <= 0 {
+							continue
+						}
+						if cov < 0.999 {
+							inv := 1.0 - cov
+							pix[off] = clampByteF(ar*cov + float64(pix[off])*inv)
+							pix[off+1] = clampByteF(ag*cov + float64(pix[off+1])*inv)
+							pix[off+2] = clampByteF(ab*cov + float64(pix[off+2])*inv)
+							pix[off+3] = 255
+							continue
+						}
+					}
+					pix[off] = arU
+					pix[off+1] = agU
+					pix[off+2] = abU
 					pix[off+3] = 255
 				}
 			}
@@ -489,13 +886,32 @@ func applyBlur(img *image.RGBA, r image.Rectangle, radius int) {
 		}
 	}
 
-	// Unpack back to RGBA image.
+	// Unpack back to RGBA image with an anti-aliased rounded silhouette.
+	radF := adaptiveMosaicRadius(w, h)
+	radInt := int(math.Ceil(radF)) + 2
+	x0F, y0F := float64(r.Min.X), float64(r.Min.Y)
+	x1F, y1F := float64(r.Max.X), float64(r.Max.Y)
 	for y := 0; y < h; y++ {
 		dRow := (r.Min.Y+y)*stride + r.Min.X*4
 		sRow := y * rowW3
+		nearCornerY := y < radInt || y >= h-radInt
 		for x := 0; x < w; x++ {
 			so := sRow + x*3
 			do := dRow + x*4
+			if nearCornerY && (x < radInt || x >= w-radInt) {
+				sdf := roundedRectSDF(float64(r.Min.X+x)+0.5, float64(r.Min.Y+y)+0.5, x0F, y0F, x1F, y1F, radF)
+				cov := sdfCoverage(sdf)
+				if cov <= 0 {
+					continue
+				}
+				if cov < 0.999 {
+					inv := 1.0 - cov
+					pix[do] = clampByteF(float64(bufA[so])*cov + float64(pix[do])*inv)
+					pix[do+1] = clampByteF(float64(bufA[so+1])*cov + float64(pix[do+1])*inv)
+					pix[do+2] = clampByteF(float64(bufA[so+2])*cov + float64(pix[do+2])*inv)
+					continue
+				}
+			}
 			pix[do] = bufA[so]
 			pix[do+1] = bufA[so+1]
 			pix[do+2] = bufA[so+2]

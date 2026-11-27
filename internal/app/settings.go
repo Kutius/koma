@@ -84,10 +84,11 @@ type persistedSettings struct {
 	HotkeyFull  *string `json:"hotkey_full,omitempty"`
 	HotkeyDelay *string `json:"hotkey_delay,omitempty"`
 	HotkeyPin   *string `json:"hotkey_pin,omitempty"`
-	SaveDir     *string `json:"save_dir,omitempty"`
-	SaveFormat  *string `json:"save_format,omitempty"`
-	QuickSave   *bool   `json:"quick_save,omitempty"`
-	OCREngine   *string `json:"ocr_engine,omitempty"`
+	SaveDir        *string `json:"save_dir,omitempty"`
+	SaveFormat     *string `json:"save_format,omitempty"`
+	QuickSave      *bool   `json:"quick_save,omitempty"`
+	OCREngine      *string `json:"ocr_engine,omitempty"`
+	RedactKeywords *string `json:"redact_keywords,omitempty"`
 }
 
 // SetSettingsPath overrides where settings.json is stored (used by tests and startup).
@@ -166,6 +167,9 @@ func (a *App) LoadSettings() error {
 	if ps.OCREngine != nil {
 		a.ocrEngine = ocr.NormalizeEngine(*ps.OCREngine)
 	}
+	if ps.RedactKeywords != nil {
+		a.redactKeywords = strings.TrimSpace(*ps.RedactKeywords)
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -185,6 +189,7 @@ func (a *App) SaveSettings() error {
 	saveFmt := normalizeSaveFormat(a.saveFormat)
 	quickSave := a.quickSave
 	ocrEng := string(ocr.NormalizeEngine(string(a.ocrEngine)))
+	redactKw := a.redactKeywords
 	a.mu.Unlock()
 
 	if path == "" {
@@ -194,17 +199,18 @@ func (a *App) SaveSettings() error {
 		return err
 	}
 	ps := persistedSettings{
-		ThemeMode:   &themeMode,
-		DarkMode:    &dark,
-		HotkeyArea:  &hkArea,
-		HotkeyLong:  &hkLong,
-		HotkeyFull:  &hkFull,
-		HotkeyDelay: &hkDelay,
-		HotkeyPin:   &hkPin,
-		SaveDir:     &saveDir,
-		SaveFormat:  &saveFmt,
-		QuickSave:   &quickSave,
-		OCREngine:   &ocrEng,
+		ThemeMode:      &themeMode,
+		DarkMode:       &dark,
+		HotkeyArea:     &hkArea,
+		HotkeyLong:     &hkLong,
+		HotkeyFull:     &hkFull,
+		HotkeyDelay:    &hkDelay,
+		HotkeyPin:      &hkPin,
+		SaveDir:        &saveDir,
+		SaveFormat:     &saveFmt,
+		QuickSave:      &quickSave,
+		OCREngine:      &ocrEng,
+		RedactKeywords: &redactKw,
 	}
 	data, err := json.MarshalIndent(ps, "", "  ")
 	if err != nil {
@@ -270,6 +276,25 @@ func (a *App) SetOCREngine(eng ocr.Engine) {
 	a.ocrEngine = eng
 	a.mu.Unlock()
 	_ = a.SaveSettings()
+}
+
+// RedactKeywords returns the user-configured custom sensitive keywords string.
+func (a *App) RedactKeywords() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.redactKeywords
+}
+
+// SetRedactKeywords updates and persists custom sensitive keywords for smart redaction.
+func (a *App) SetRedactKeywords(raw string) {
+	raw = strings.TrimSpace(raw)
+	a.mu.Lock()
+	changed := a.redactKeywords != raw
+	a.redactKeywords = raw
+	a.mu.Unlock()
+	if changed {
+		_ = a.SaveSettings()
+	}
 }
 
 // PPOCRInstalled reports whether PP-OCRv6 models and ONNX Runtime are installed locally.

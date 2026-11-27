@@ -103,6 +103,29 @@ type PointF struct {
 	X, Y float32
 }
 
+// MosaicStyle selects the visual finish of ToolPixelate redaction regions.
+type MosaicStyle int
+
+const (
+	MosaicCrystal MosaicStyle = iota // 晶格：现代琉璃压花磨砂马赛克（默认）
+	MosaicBlur                       // 模糊：液态圆角高斯模糊
+	MosaicPixel                      // 像素：经典圆角像素马赛克
+	MosaicRedact                     // 遮盖：不可逆净色磨砂脱敏胶囊
+)
+
+func (s MosaicStyle) Name() string {
+	switch s {
+	case MosaicBlur:
+		return "模糊"
+	case MosaicPixel:
+		return "像素"
+	case MosaicRedact:
+		return "遮盖"
+	default:
+		return "晶格"
+	}
+}
+
 // Annotation represents a single vector or raster-region annotation in image coordinates.
 type Annotation struct {
 	ID          int
@@ -112,12 +135,13 @@ type Annotation struct {
 	Points      []PointF // used by ToolPen, ToolHighlighter
 	Color       ui.Color
 	StrokeWidth float32
-	Filled      bool    // Rect/Ellipse filled translucent; Text pill background
-	Rounded     bool    // Rect rounded corners
-	Text        string  // ToolText
-	FontSize    float32 // ToolText
-	CounterNum  int     // ToolCounter
-	BlockSize   int     // ToolPixelate / ToolBlur intensity (px)
+	Filled      bool        // Rect/Ellipse filled translucent; Text pill background
+	Rounded     bool        // Rect rounded corners
+	Text        string      // ToolText
+	FontSize    float32     // ToolText
+	CounterNum  int         // ToolCounter
+	BlockSize   int         // ToolPixelate / ToolBlur intensity (px)
+	MosaicStyle MosaicStyle // ToolPixelate visual finish
 	// Measure spans (in image pixels)
 	MeasLeft   int
 	MeasRight  int

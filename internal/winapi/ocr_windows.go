@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"math"
 	"runtime"
 	"strings"
 	"syscall"
@@ -54,10 +55,23 @@ var (
 // ErrOCRNoLanguage indicates Windows has no OCR language pack installed for the current profile.
 var ErrOCRNoLanguage = errors.New("未检测到可用的 Windows OCR 语言包，请在系统「设置 → 时间和语言 → 语言」中安装中文或英文语言功能")
 
-// OCRResult holds recognized text lines returned by Windows native OCR.
+// OCRWord represents a single recognized text token/segment with its bounding
+// box in the original input image's pixel coordinate space.
+type OCRWord struct {
+	Text string
+	Rect image.Rectangle
+}
+
+// OCRResult holds recognized text lines and optional per-word bounding boxes
+// returned by offline OCR engines.
 type OCRResult struct {
 	Text  string
 	Lines []string
+	Words []OCRWord
+}
+
+type winrtRectF struct {
+	X, Y, W, H float32
 }
 
 type comObj struct {
@@ -208,7 +222,8 @@ func recognizeTextOnThread(img *image.RGBA) (OCRResult, error) {
 	defer engine.release()
 
 	// 2. Prepare image (upscale tiny snippets for better recognition, clamp > maxDim).
-	prep := prepareOCRImage(img, int(maxDim))
+	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
+	prep, prepScale, prepPad := prepareOCRImage(img, int(maxDim))
 	w, h := prep.Bounds().Dx(), prep.Bounds().Dy()
 	byteLen := uint32(w * h * 4)
 
@@ -338,9 +353,10 @@ done:
 	}
 	defer ocrRes.release()
 
-	// 6. Read lines from IOcrResult::get_Lines (slot 6) to preserve line breaks cleanly.
+	// 6. Read lines from IOcrResult::get_Lines (slot 6) and per-word bounding boxes.
 	var linesView *comObj
 	var lines []string
+	var words []OCRWord
 	if rLV, _, _ := syscall.SyscallN(ocrRes.vtblSlot(6), uintptr(unsafe.Pointer(ocrRes)), uintptr(unsafe.Pointer(&linesView))); uint32(rLV) == hrOK && linesView != nil {
 		defer linesView.release()
 		var count uint32
@@ -358,6 +374,42 @@ done:
 						if cleaned != "" {
 							lines = append(lines, cleaned)
 						}
+					}
+					// IOcrLine::get_Words is slot 6.
+					var wordsView *comObj
+					if rWV, _, _ := syscall.SyscallN(lineObj.vtblSlot(6), uintptr(unsafe.Pointer(lineObj)), uintptr(unsafe.Pointer(&wordsView))); uint32(rWV) == hrOK && wordsView != nil {
+						var wCount uint32
+						if rWC, _, _ := syscall.SyscallN(wordsView.vtblSlot(7), uintptr(unsafe.Pointer(wordsView)), uintptr(unsafe.Pointer(&wCount))); uint32(rWC) == hrOK && wCount > 0 {
+							for wi := uint32(0); wi < wCount; wi++ {
+								var wordObj *comObj
+								if rWA, _, _ := syscall.SyscallN(wordsView.vtblSlot(6), uintptr(unsafe.Pointer(wordsView)), uintptr(wi), uintptr(unsafe.Pointer(&wordObj))); uint32(rWA) == hrOK && wordObj != nil {
+									var rc winrtRectF
+									var whs uintptr
+									// IOcrWord::get_BoundingRect is slot 6, get_Text is slot 7.
+									rBR, _, _ := syscall.SyscallN(wordObj.vtblSlot(6), uintptr(unsafe.Pointer(wordObj)), uintptr(unsafe.Pointer(&rc)))
+									rWT, _, _ := syscall.SyscallN(wordObj.vtblSlot(7), uintptr(unsafe.Pointer(wordObj)), uintptr(unsafe.Pointer(&whs)))
+									wTxt := ""
+									if uint32(rWT) == hrOK && whs != 0 {
+										wTxt = strings.TrimSpace(hstringToGo(whs))
+										deleteHString(whs)
+									}
+									wordObj.release()
+									if uint32(rBR) == hrOK && wTxt != "" && rc.W > 0 && rc.H > 0 && prepScale > 0 {
+										x0 := ClampInt(int(math.Floor((float64(rc.X)-float64(prepPad))/prepScale)), 0, max(0, origW-1))
+										y0 := ClampInt(int(math.Floor((float64(rc.Y)-float64(prepPad))/prepScale)), 0, max(0, origH-1))
+										x1 := ClampInt(int(math.Ceil((float64(rc.X+rc.W)-float64(prepPad))/prepScale)), x0+1, origW)
+										y1 := ClampInt(int(math.Ceil((float64(rc.Y+rc.H)-float64(prepPad))/prepScale)), y0+1, origH)
+										if x1 > x0 && y1 > y0 {
+											words = append(words, OCRWord{
+												Text: wTxt,
+												Rect: image.Rect(x0, y0, x1, y1),
+											})
+										}
+									}
+								}
+							}
+						}
+						wordsView.release()
 					}
 					lineObj.release()
 				}
@@ -380,6 +432,7 @@ done:
 	return OCRResult{
 		Text:  strings.Join(lines, "\n"),
 		Lines: lines,
+		Words: words,
 	}, nil
 }
 
@@ -450,7 +503,7 @@ func tryCreatePreferredOcrEngine(ocrStatics *comObj) *comObj {
 //  1. Bilinear 2× upscale (desktop 12-14px UI fonts are too small for WinRT OCR);
 //  2. Auto-invert dark-background screenshots into crisp dark-text-on-light-background;
 //  3. Add 24px solid background-matched border padding so edge glyphs never clip.
-func prepareOCRImage(src *image.RGBA, maxDim int) *image.RGBA {
+func prepareOCRImage(src *image.RGBA, maxDim int) (*image.RGBA, float64, int) {
 	if maxDim < 256 {
 		maxDim = 4096
 	}
@@ -532,7 +585,7 @@ func prepareOCRImage(src *image.RGBA, maxDim int) *image.RGBA {
 			dst.Pix[do+3] = 255
 		}
 	}
-	return dst
+	return dst, scale, pad
 }
 
 func sampleEdgeColor(src *image.RGBA) (r, g, b uint8) {
