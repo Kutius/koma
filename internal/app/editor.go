@@ -1720,7 +1720,7 @@ func (e *EditorState) renderFloatingBottomDock(c *ui.Context, tk appleTokens) {
 						glasswork.ApplyLiquidButton(smartBtn, glasswork.CompactButtonOpts())
 						smartBtn.Children(func() {
 							ui.Icon(c, icons.SmartRedact.For(busy || smartBtn.Hovered() || smartBtn.Pressed())).
-								Size(14.5, 14.5).TextColor(sFg).Shrink(0).ContentTransition(ui.ContentTransition{})
+								Size(14.5, 14.5).TextColor(sFg).Shrink(0).ContentTransition(glasswork.ContentIcon)
 							ui.Text(c, smartLabel).FontSize(11.5).FontWeight(600).TextColor(sFg).SingleLine().Shrink(0)
 						})
 						if smartBtn.Clicked() && !busy {
@@ -2037,7 +2037,7 @@ func (e *EditorState) renderThemeAndHelpBtns(c *ui.Context, tk appleTokens) {
 	themeBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
 	glasswork.ApplyLiquidButton(themeBtn, glasswork.CompactButtonOpts())
 	themeBtn.Children(func() {
-		ui.Icon(c, themeIcon).Size(15.5, 15.5).TextColor(col).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, themeIcon).Size(15.5, 15.5).TextColor(col).ContentTransition(glasswork.ContentIcon)
 	})
 	if themeBtn.Clicked() {
 		e.app.ToggleDarkMode()
@@ -2062,7 +2062,7 @@ func (e *EditorState) renderThemeAndHelpBtns(c *ui.Context, tk appleTokens) {
 	glasswork.ApplyLiquidButton(settingsBtn, glasswork.CompactButtonOpts())
 	sGlyph := icons.Settings.For(e.settingsOpen || settingsBtn.Hovered() || settingsBtn.Pressed())
 	settingsBtn.Children(func() {
-		ui.Icon(c, sGlyph).Size(15, 15).TextColor(sCol).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, sGlyph).Size(15, 15).TextColor(sCol).ContentTransition(glasswork.ContentIcon)
 		if availUpdate != "" && !e.settingsOpen {
 			ui.Box(c).Absolute().Top(2).Right(2).Size(6, 6).Radius(3).
 				Background(tk.accent).PassThrough()
@@ -3061,7 +3061,7 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 								}
 								glasswork.ApplyLiquidButton(checkBtn, glasswork.CompactButtonOpts())
 								checkBtn.Children(func() {
-									ui.Icon(c, icons.Restart.For(avail != "" || checkBtn.Pressed())).Size(14, 14).Shrink(0).TextColor(btnFg).ContentTransition(ui.ContentTransition{})
+									ui.Icon(c, icons.Restart.For(avail != "" || checkBtn.Pressed())).Size(14, 14).Shrink(0).TextColor(btnFg).ContentTransition(glasswork.ContentIcon)
 									ui.Text(c, btnLabel).FontSize(11.5).FontWeight(600).TextColor(btnFg).SingleLine().Shrink(0)
 								})
 								if checkBtn.Clicked() {
@@ -3198,7 +3198,7 @@ func (e *EditorState) renderSettingsSheet(c *ui.Context, tk appleTokens) {
 										clrBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
 										glasswork.ApplyLiquidButton(clrBtn, glasswork.CompactButtonOpts())
 										clrBtn.Children(func() {
-											ui.Icon(c, icons.Close.For(hov || clrBtn.Pressed())).Size(14, 14).TextColor(cCol).ContentTransition(ui.ContentTransition{})
+											ui.Icon(c, icons.Close.For(hov || clrBtn.Pressed())).Size(14, 14).TextColor(cCol).ContentTransition(glasswork.ContentIcon)
 										})
 										if clrBtn.Clicked() {
 											e.commitHotkey(m.Action, "")
@@ -3498,7 +3498,7 @@ func appleIconBtn(c *ui.Context, tk appleTokens, ic icons.IconPair, label, tip s
 	glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
 	glyph := ic.For(active || btn.Pressed())
 	btn.Children(func() {
-		ui.Icon(c, glyph).Size(17, 17).TextColor(col).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, glyph).Size(17, 17).TextColor(col).ContentTransition(glasswork.ContentIcon)
 	})
 	return btn.Clicked()
 }
@@ -3531,7 +3531,7 @@ func appleDockToolBtn(c *ui.Context, tk appleTokens, ic icons.IconPair, label, t
 		if active {
 			glasswork.SlidingAccentLens(c, "studio-tool", 17, tk.inks.AccentFill, tk.inks.AccentBorder)
 		}
-		ui.Icon(c, glyph).Size(17.5, 17.5).TextColor(col).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, glyph).Size(17.5, 17.5).TextColor(col).ContentTransition(glasswork.ContentIcon)
 	})
 	return btn.Clicked()
 }
@@ -3549,7 +3549,7 @@ func appleDockPillBtn(c *ui.Context, tk appleTokens, ic icons.IconPair, label st
 	glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
 	glyph := ic.For(hov || btn.Pressed())
 	btn.Children(func() {
-		ui.Icon(c, glyph).Size(16.5, 16.5).TextColor(col).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, glyph).Size(16.5, 16.5).TextColor(col).ContentTransition(glasswork.ContentIcon)
 		ui.Text(c, label).FontSize(12.5).FontWeight(500).TextColor(tk.textPrimary)
 	})
 	return btn.Clicked()
@@ -3597,7 +3597,7 @@ func appleMiniBtn(c *ui.Context, tk appleTokens, ic icons.IconPair, tip string) 
 	glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
 	glyph := ic.For(hov || btn.Pressed())
 	btn.Children(func() {
-		ui.Icon(c, glyph).Size(15, 15).TextColor(col).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, glyph).Size(15, 15).TextColor(col).ContentTransition(glasswork.ContentIcon)
 	})
 	return btn.Clicked()
 }

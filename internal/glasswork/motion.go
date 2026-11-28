@@ -7,81 +7,117 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// Physical spring presets ported directly from bilalgursen/liquid-glass (engine.ts & physics.ts).
-// Conversion from angular frequency (omega, rad/s) & damping ratio (zeta) with Mass=1:
-//   Stiffness = omega^2,  Damping = 2 * zeta * omega
+// Physical spring presets calibrated with Apple's Fluid Interfaces philosophy
+// (WWDC "Designing Fluid Interfaces": Response + Damping Ratio, critically damped
+// by default for functional UI, subtle bounce reserved for tactile/momentum actions)
+// while preserving bilalgursen/liquid-glass's organic optical character on desktop.
+//
+// Conversion from SwiftUI/MyGo Duration (response = 2*pi/omega) & Bounce (1 - zeta):
+//   - Critically damped (Bounce=0, zeta=1.0) reaches 90% at 0.62*response and 95% at 0.75*response.
+//   - Mass/Stiffness/Damping is retained only where explicit out-of-phase angular frequencies
+//     are needed (SpringHoverX vs SpringHoverY liquid droplet wobble).
 var (
-	// SpringPress: press & release liquid bounce (omega=16, zeta=0.6).
-	SpringPress = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 256, Damping: 19.2},
+	// SpringSnap: ultra-crisp critically-damped window auto-snap reticle in the capture overlay
+	// (response=180ms, zeta=1.0; 95% in ~135ms, zero overshoot past pixel-exact DWM window edges).
+	SpringSnap = ui.Animation{
+		Spring: ui.SpringOptions{Duration: 180 * time.Millisecond, Bounce: 0},
 	}
 
-	// SpringHoverX & SpringHoverY: out-of-phase hover swell springs (omega=17/zeta=0.42 vs omega=12/zeta=0.34).
-	// Width and height overshoot out of phase so the glass wobbles subtly like a liquid droplet.
+	// SpringPress: immediate tactile press compression & crisp liquid rebound on release
+	// (response=210ms, bounce=0.22 / zeta=0.78).
+	SpringPress = ui.Animation{
+		Spring: ui.SpringOptions{Duration: 210 * time.Millisecond, Bounce: 0.22},
+	}
+
+	// SpringHoverX & SpringHoverY: out-of-phase hover swell springs (omega=26/zeta=0.62 vs omega=19/zeta=0.52).
+	// Width and height diverge mid-flight for the signature liquid droplet wobble, then settle crisply (~350ms).
 	SpringHoverX = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 289, Damping: 14.28},
+		Spring: ui.SpringOptions{Mass: 1, Stiffness: 676, Damping: 32.24},
 	}
 	SpringHoverY = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 144, Damping: 8.16},
+		Spring: ui.SpringOptions{Mass: 1, Stiffness: 361, Damping: 19.76},
 	}
 
-	// SpringSlide: sliding liquid glass selection lens gliding across toolbar tools & chips (omega=14, zeta=0.75).
+	// SpringSlide: crisp sliding Liquid Glass selection lens across toolbar tools, chips & toggle switches
+	// (response=220ms, bounce=0.12 / zeta=0.88; decisive desktop glide with a whisper of organic settle).
 	SpringSlide = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 196, Damping: 21.0},
+		Spring: ui.SpringOptions{Duration: 220 * time.Millisecond, Bounce: 0.12},
 		Oklab:  true,
 	}
 
-	// SpringPanel: critically damped calm spring for floating toolbars, drawers & sheets (zeta=1.0, zero overshoot/flicker).
+	// SpringToolbar: critically damped ultra-crisp spring for high-frequency capture toolbars & HUDs
+	// (response=200ms, zeta=1.0; arrives in ~150ms with zero overshoot or D3D11 backdrop flicker).
+	SpringToolbar = ui.Animation{
+		Spring: ui.SpringOptions{Duration: 200 * time.Millisecond, Bounce: 0},
+		Oklab:  true,
+	}
+
+	// SpringPanel: critically damped calm spring for larger drawers, sheets & bottom docks
+	// (response=240ms, zeta=1.0; composed yet brisk, zero overshoot/flicker).
 	SpringPanel = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 400, Damping: 40.0},
+		Spring: ui.SpringOptions{Duration: 240 * time.Millisecond, Bounce: 0},
 		Oklab:  true,
 	}
 
-	// SpringCursor: inertial spring for cursor-leaning rim light (never snaps harshly to raw pointer).
+	// SpringCursor: critically damped inertial spring for cursor-leaning optical rim light
+	// (response=180ms, zeta=1.0; tracks fast desktop pointers like liquid mercury without lagging behind).
 	SpringCursor = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 225, Damping: 24.0},
+		Spring: ui.SpringOptions{Duration: 180 * time.Millisecond, Bounce: 0},
 	}
 
-	// SpringGlowRise & SpringGlowFade: asymmetric internal press light from bilalgursen LIGHT:
-	// rises crisply with a subtle luminous pop (240ms, bounce 0.2), sinks back calmly (420ms, no bounce).
+	// SpringGlowRise & SpringGlowFade: asymmetric internal press light (bilalgursen LIGHT tuned for desktop):
+	// ignites crisply on pointer-down (150ms, bounce 0.12), exhales calmly on release (280ms, no bounce).
 	SpringGlowRise = ui.Animation{
-		Spring:    ui.SpringOptions{Duration: 240 * time.Millisecond, Bounce: 0.2},
+		Spring:    ui.SpringOptions{Duration: 150 * time.Millisecond, Bounce: 0.12},
 		NonMotion: true,
 	}
 	SpringGlowFade = ui.Animation{
-		Spring:    ui.SpringOptions{Duration: 420 * time.Millisecond, Bounce: 0},
+		Spring:    ui.SpringOptions{Duration: 280 * time.Millisecond, Bounce: 0},
 		NonMotion: true,
 	}
 	SpringGlowSpread = ui.Animation{
-		Spring:    ui.SpringOptions{Mass: 1, Stiffness: 144, Damping: 24.0},
+		Spring:    ui.SpringOptions{Duration: 240 * time.Millisecond, Bounce: 0},
 		NonMotion: true,
 	}
 
-	// SpringPullFollow & SpringPullRelease: gel-like pointer pull rubberband & bouncy rebound (PULL in engine.ts).
+	// SpringPullFollow & SpringPullRelease: direct 1:1-leaning gel pull (110ms) & momentum-driven rebound (340ms).
 	SpringPullFollow = ui.Animation{
-		Spring: ui.SpringOptions{Duration: 180 * time.Millisecond, Bounce: 0},
+		Spring: ui.SpringOptions{Duration: 110 * time.Millisecond, Bounce: 0},
 	}
 	SpringPullRelease = ui.Animation{
-		Spring: ui.SpringOptions{Duration: 500 * time.Millisecond, Bounce: 0.42},
+		Spring: ui.SpringOptions{Duration: 340 * time.Millisecond, Bounce: 0.32},
 	}
 
-	// AnimColorFade: silky Oklab color crossfade for hover/active highlights.
+	// SpringContent: crisp critically damped spring for rolling numeric digits & Solar icon symbol swaps
+	// (response=220ms, zeta=1.0; faster than MyGo's 350ms default to stay cohesive with desktop interactions).
+	SpringContent = ui.Animation{
+		Spring: ui.SpringOptions{Duration: 220 * time.Millisecond, Bounce: 0},
+	}
+
+	// AnimColorFade: crisp Oklab color crossfade for hover/active highlights & modal scrims.
 	AnimColorFade = ui.Animation{
-		Duration:  150 * time.Millisecond,
+		Duration:  115 * time.Millisecond,
 		Ease:      ui.EaseOut,
 		Oklab:     true,
 		NonMotion: true,
 	}
 
+	// ContentIcon: crisp Solar Line-Duotone <-> Bold-Duotone symbol replace transition.
+	ContentIcon = ui.ContentTransition{
+		Animation: &SpringContent,
+	}
+
 	// ContentNumeric: SwiftUI-style rolling digits for zoom %, sliders, and counters.
 	ContentNumeric = ui.ContentTransition{
-		Numeric: true,
+		Numeric:   true,
+		Animation: &SpringContent,
 	}
 
 	// ContentNumericDown: downward rolling digits for countdowns.
 	ContentNumericDown = ui.ContentTransition{
-		Numeric: true,
-		Down:    true,
+		Numeric:   true,
+		Down:      true,
+		Animation: &SpringContent,
 	}
 )
 
@@ -231,8 +267,8 @@ func ApplyLiquidButton(e ui.Element, opts LiquidButtonOpts) {
 		hovTarget = 1
 	}
 
-	// Out-of-phase hover springs: X settles faster (omega=17) than Y (omega=12),
-	// creating the subtle organic liquid droplet wobble on enter & exit.
+	// Out-of-phase hover springs: X settles faster (omega=26) than Y (omega=19),
+	// creating the subtle organic liquid droplet wobble on enter & exit without lingering.
 	wx := e.AnimateTo(liquidKeyX{}, hovTarget, SpringHoverX)
 	wy := e.AnimateTo(liquidKeyY{}, hovTarget, SpringHoverY)
 
@@ -293,14 +329,14 @@ func ApplyLiquidButton(e ui.Element, opts LiquidButtonOpts) {
 }
 
 // PanelTransition returns an asymmetric, flicker-free enter/exit transition for
-// floating liquid-glass toolbars, drawers, sheets, and popovers.
+// floating liquid-glass drawers, sheets, bottom docks, and popovers.
 // Deliberately avoids element-level Blur on BackdropBlur shader surfaces so D3D11
 // never flickers between offscreen blur and live backdrop sampling.
 func PanelTransition(enterX, enterY float32) ui.ElementTransition {
 	anim := SpringPanel
 	return ui.ElementTransition{
 		Animation:    &anim,
-		ExitDuration: 130 * time.Millisecond,
+		ExitDuration: 100 * time.Millisecond,
 		ExitEase:     ui.EaseOut,
 		Enter: &ui.Motion{
 			X:     enterX,
@@ -316,13 +352,13 @@ func PanelTransition(enterX, enterY float32) ui.ElementTransition {
 }
 
 // ToolbarAppearTransition is a rock-solid, zero-flicker fade+rise entrance for
-// capture overlay floating toolbars (avoids scaling parent bounds so child buttons
-// never re-measure or flicker on mount).
+// high-frequency capture overlay toolbars & HUDs (avoids scaling parent bounds so
+// child buttons never re-measure or flicker on mount).
 func ToolbarAppearTransition(enterY float32) ui.ElementTransition {
-	anim := SpringPanel
+	anim := SpringToolbar
 	return ui.ElementTransition{
 		Animation:    &anim,
-		ExitDuration: 110 * time.Millisecond,
+		ExitDuration: 85 * time.Millisecond,
 		ExitEase:     ui.EaseOut,
 		Enter: &ui.Motion{
 			Y: enterY,
@@ -336,11 +372,11 @@ func ToolbarAppearTransition(enterY float32) ui.ElementTransition {
 // MorphBarTransition smoothly positions and reveals a floating liquid glass secondary bar
 // when contextual tool options change, without cramping/wrapping text or D3D11 blur flicker.
 func MorphBarTransition(enterY float32) ui.ElementTransition {
-	anim := SpringPanel
+	anim := SpringToolbar
 	return ui.ElementTransition{
 		Position:     true,
 		Animation:    &anim,
-		ExitDuration: 120 * time.Millisecond,
+		ExitDuration: 95 * time.Millisecond,
 		ExitEase:     ui.EaseOut,
 		Enter: &ui.Motion{
 			Y: enterY,
@@ -404,18 +440,18 @@ func SlidingRingLens(c *ui.Context, scope string, radius float32, stroke ui.Colo
 		})
 }
 
-// StaggeredEnterTransition returns a calm cascading entrance for list/history cards (30ms stagger, capped).
+// StaggeredEnterTransition returns a brisk cascading entrance for list/history cards (18ms stagger, capped at 90ms).
 func StaggeredEnterTransition(index int) ui.ElementTransition {
-	if index > 6 {
-		index = 6
+	if index > 5 {
+		index = 5
 	}
 	anim := SpringPanel
-	anim.Delay = time.Duration(index) * 28 * time.Millisecond
+	anim.Delay = time.Duration(index) * 18 * time.Millisecond
 	return ui.ElementTransition{
 		Animation: &anim,
 		ExitDelay: -1,
 		Enter: &ui.Motion{
-			Y:     10,
+			Y:     8,
 			Scale: 0.97,
 		},
 	}

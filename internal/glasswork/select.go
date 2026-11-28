@@ -13,31 +13,32 @@ import (
 
 // Physical spring presets for Liquid Glass Select & GlassPopup neck stretch,
 // adapted from bilalgursen/liquid-glass (GOOEY + ATTACH + LET_GO in engine.ts / glass-popup.tsx)
-// and tuned for snappy, zero-flicker Windows Direct3D 11 desktop interaction.
+// and calibrated to Apple's Fluid Interfaces desktop timing (crisp critically-damped popovers,
+// asymmetric faster exit, zero-flicker Direct3D 11 rendering).
 var (
-	// SpringSelectOpen: smooth critically-damped swell as the popup emerges from its trigger (omega=15, zeta=1).
+	// SpringSelectOpen: crisp critically-damped swell as the popup emerges from its trigger (response=250ms, zeta=1).
 	SpringSelectOpen = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 225, Damping: 30.0},
+		Spring: ui.SpringOptions{Duration: 250 * time.Millisecond, Bounce: 0},
 	}
 
-	// SpringSelectClose: brisk reverse rewind back into the trigger pill (~1.5x opening pace, omega=23, zeta=1).
+	// SpringSelectClose: brisk asymmetric rewind back into the trigger pill (~1.5x opening pace, response=165ms, zeta=1).
 	SpringSelectClose = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 529, Damping: 46.0},
+		Spring: ui.SpringOptions{Duration: 165 * time.Millisecond, Bounce: 0},
 	}
 
-	// SpringNeckAttach: fast meniscus bridge formation as the popup separates from the trigger (omega=28, zeta=1).
+	// SpringNeckAttach: fast meniscus bridge formation as the popup separates from the trigger (response=140ms, zeta=1).
 	SpringNeckAttach = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 784, Damping: 56.0},
+		Spring: ui.SpringOptions{Duration: 140 * time.Millisecond, Bounce: 0},
 	}
 
-	// SpringNeckSnap: crisp release once the liquid neck thins past the snap threshold (omega=18, zeta=1).
+	// SpringNeckSnap: crisp surface-tension release once the liquid neck thins past snap threshold (response=210ms, zeta=1).
 	SpringNeckSnap = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 324, Damping: 36.0},
+		Spring: ui.SpringOptions{Duration: 210 * time.Millisecond, Bounce: 0},
 	}
 
-	// SpringSelectChevron: smooth 180-degree rotation of the trigger chevron.
+	// SpringSelectChevron: decisive 180-degree rotation of the trigger chevron in lockstep with open/close.
 	SpringSelectChevron = ui.Animation{
-		Spring: ui.SpringOptions{Mass: 1, Stiffness: 256, Damping: 26.0},
+		Spring: ui.SpringOptions{Duration: 210 * time.Millisecond, Bounce: 0.10},
 	}
 )
 
@@ -405,7 +406,7 @@ func Select[T comparable](c *ui.Context, props SelectProps[T]) bool {
 			ui.Icon(c, icons.ChevronDown.For(isActivelyOpen || trig.Pressed())).
 				Size(13, 13).Shrink(0).TextColor(chevCol).
 				Rotate(chevDeg).
-				ContentTransition(ui.ContentTransition{})
+				ContentTransition(ContentIcon)
 		})
 
 		// Build floating Liquid Glass Popup
@@ -473,14 +474,14 @@ func Select[T comparable](c *ui.Context, props SelectProps[T]) bool {
 					item.Cursor(ui.CursorPointer)
 				}
 
-				// Staggered queue entrance (--glass-i): each item rises 5px and fades in cleanly
+				// Staggered queue entrance (--glass-i): each item rises 4px and fades in crisply
 				itemAlpha := listOpacity
 				var itemY float32
 				if !reduceMotion && !pClosing {
-					start := 0.14 + float32(min(i, 6))*0.075
-					inT := smoothstep32(start, min(start+0.38, 0.98), pOpen)
+					start := 0.10 + float32(min(i, 6))*0.06
+					inT := smoothstep32(start, min(start+0.34, 0.96), pOpen)
 					itemAlpha *= inT
-					itemY = pDir * (1.0 - inT) * 5.0
+					itemY = pDir * (1.0 - inT) * 4.0
 				}
 				if itemAlpha < 0.999 {
 					item.Opacity(itemAlpha)

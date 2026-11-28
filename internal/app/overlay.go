@@ -100,6 +100,7 @@ type overlayPane struct {
 	// Color picker format cycled via Shift before selection (0=HEX, 1=RGB, 2=HSL)
 	colorFmt      int
 	surfaceHandle ui.Handle
+	hadSnapTarget bool
 
 	// In-place QQ-style annotation state (monitor physical pixels)
 	activeTool      canvas.Tool
@@ -1644,10 +1645,23 @@ func (p *overlayPane) view(c *ui.Context) {
 			lw := p.localWins[p.hoveredWinIdx]
 			snapGoalX0, snapGoalY0, snapGoalX1, snapGoalY1 = lw.x0, lw.y0, lw.x1, lw.y1
 		}
-		animSnapX0 := surface.AnimateTo("snapX0", snapGoalX0, ui.Snappy)
-		animSnapY0 := surface.AnimateTo("snapY0", snapGoalY0, ui.Snappy)
-		animSnapX1 := surface.AnimateTo("snapX1", snapGoalX1, ui.Snappy)
-		animSnapY1 := surface.AnimateTo("snapY1", snapGoalY1, ui.Snappy)
+		var animSnapX0, animSnapY0, animSnapX1, animSnapY1 float32
+		if hasSnapTarget {
+			if !p.hadSnapTarget {
+				// First window acquisition: appear directly on the hovered window rather than
+				// sweeping in from (0,0) at the top-left corner of the monitor.
+				animSnapX0 = surface.Jump("snapX0", snapGoalX0)
+				animSnapY0 = surface.Jump("snapY0", snapGoalY0)
+				animSnapX1 = surface.Jump("snapX1", snapGoalX1)
+				animSnapY1 = surface.Jump("snapY1", snapGoalY1)
+			} else {
+				animSnapX0 = surface.AnimateTo("snapX0", snapGoalX0, glasswork.SpringSnap)
+				animSnapY0 = surface.AnimateTo("snapY0", snapGoalY0, glasswork.SpringSnap)
+				animSnapX1 = surface.AnimateTo("snapX1", snapGoalX1, glasswork.SpringSnap)
+				animSnapY1 = surface.AnimateTo("snapY1", snapGoalY1, glasswork.SpringSnap)
+			}
+		}
+		p.hadSnapTarget = hasSnapTarget
 
 		surface.HandleInput(func(ev ui.InputEvent) bool {
 			switch ev.Kind {
@@ -2614,7 +2628,7 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 				glasswork.ApplyLiquidButton(smartBtn, glasswork.CompactButtonOpts())
 				smartBtn.Children(func() {
 					ui.Icon(c, icons.SmartRedact.For(busy || smartBtn.Hovered() || smartBtn.Pressed())).
-						Size(14.5, 14.5).TextColor(fg).Shrink(0).ContentTransition(ui.ContentTransition{})
+						Size(14.5, 14.5).TextColor(fg).Shrink(0).ContentTransition(glasswork.ContentIcon)
 					ui.Text(c, smartLabel).FontSize(11.5).FontWeight(600).TextColor(fg).SingleLine().Shrink(0)
 				})
 				if smartBtn.Clicked() && !busy {
@@ -2906,7 +2920,7 @@ func glassToolBtnScoped(c *ui.Context, inks glasswork.InkColors, ic icons.IconPa
 		if active && lensScope != "" {
 			glasswork.SlidingAccentLens(c, lensScope, 16, inks.AccentFill, inks.AccentBorder)
 		}
-		ui.Icon(c, glyph).Size(17, 17).TextColor(iconCol).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, glyph).Size(17, 17).TextColor(iconCol).ContentTransition(glasswork.ContentIcon)
 	})
 	return btn.Clicked()
 }

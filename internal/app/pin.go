@@ -626,7 +626,7 @@ func (p *PinWindow) view(c *ui.Context) {
 				Radius(16).
 				Material(glasswork.Dark()).
 				AlignItems(ui.Center).
-				Transition(glasswork.PanelTransition(0, -6))
+				Transition(glasswork.ToolbarAppearTransition(-6))
 			bar.Clicked()
 			bar.Children(func() {
 				if pinIconBtn(c, icons.Copy, "复制 (Ctrl+C)", false) {
@@ -675,7 +675,7 @@ func pinIconBtn(c *ui.Context, ic icons.IconPair, tip string, danger bool) bool 
 	glasswork.ApplyLiquidButton(btn, glasswork.CompactButtonOpts())
 	glyph := ic.For(hov || btn.Pressed())
 	btn.Children(func() {
-		ui.Icon(c, glyph).Size(15, 15).TextColor(col).ContentTransition(ui.ContentTransition{})
+		ui.Icon(c, glyph).Size(15, 15).TextColor(col).ContentTransition(glasswork.ContentIcon)
 	})
 	return btn.Clicked()
 }
