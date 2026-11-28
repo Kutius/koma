@@ -8,17 +8,21 @@ import (
 )
 
 type Monitor struct {
-	Handle  uintptr
-	Bounds  image.Rectangle
-	Work    image.Rectangle
-	DPI     int
-	Scale   float64
-	Primary bool
+	Handle       uintptr
+	DeviceName   string
+	Bounds       image.Rectangle
+	Work         image.Rectangle
+	DPI          int
+	Scale        float64
+	Primary      bool
+	HDREnabled   bool
+	SDRWhiteNits float32
 }
 
 type MonitorCapture struct {
 	Monitor Monitor
 	Image   *image.RGBA
+	HDR     *HDRFrame
 }
 
 type WindowInfo struct {
@@ -30,6 +34,9 @@ type WindowInfo struct {
 func ListMonitors() []Monitor                       { return nil }
 func VirtualDesktopBounds() image.Rectangle         { return image.Rectangle{} }
 func CaptureRect(image.Rectangle) (*image.RGBA, error) { return nil, errors.New("unsupported platform") }
+func CaptureMonitor(Monitor) (MonitorCapture, error) {
+	return MonitorCapture{}, errors.New("unsupported platform")
+}
 func CaptureAllMonitors() ([]MonitorCapture, error) { return nil, errors.New("unsupported platform") }
 func CapturePrimaryMonitor() (*image.RGBA, Monitor, error) {
 	return nil, Monitor{}, errors.New("unsupported platform")

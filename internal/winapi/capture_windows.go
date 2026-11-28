@@ -5,6 +5,7 @@ package winapi
 import (
 	"fmt"
 	"image"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -99,18 +100,24 @@ type bitmapInfo struct {
 
 // Monitor describes a physical display on Windows.
 type Monitor struct {
-	Handle  uintptr
-	Bounds  image.Rectangle // physical pixels in virtual desktop coordinates
-	Work    image.Rectangle // physical pixels
-	DPI     int
-	Scale   float64
-	Primary bool
+	Handle       uintptr
+	DeviceName   string
+	Bounds       image.Rectangle // physical pixels in virtual desktop coordinates
+	Work         image.Rectangle // physical pixels
+	DPI          int
+	Scale        float64
+	Primary      bool
+	HDREnabled   bool
+	SDRWhiteNits float32
 }
 
 // MonitorCapture holds the frozen full-resolution capture of a single monitor.
+// HDR is populated only when the monitor was actively captured in Windows HDR
+// (DXGI_FORMAT_R16G16B16A16_FLOAT) and must be cleared once the capture closes.
 type MonitorCapture struct {
 	Monitor Monitor
-	Image   *image.RGBA // 0,0 .. W,H in physical pixels
+	Image   *image.RGBA // 0,0 .. W,H in physical pixels (tone-mapped to sRGB when HDR)
+	HDR     *HDRFrame   // optional raw scRGB float16 buffer for lossless HDR PNG export
 }
 
 var (
@@ -139,19 +146,22 @@ func initEnumMonitorsCB() {
 				dpi = int(dpiX)
 			}
 			*out = append(*out, Monitor{
-				Handle:  hMon,
-				Bounds:  image.Rect(int(mi.RcMonitor.Left), int(mi.RcMonitor.Top), int(mi.RcMonitor.Right), int(mi.RcMonitor.Bottom)),
-				Work:    image.Rect(int(mi.RcWork.Left), int(mi.RcWork.Top), int(mi.RcWork.Right), int(mi.RcWork.Bottom)),
-				DPI:     dpi,
-				Scale:   float64(dpi) / 96.0,
-				Primary: (mi.DwFlags & monitorPrimary) != 0,
+				Handle:       hMon,
+				DeviceName:   windows.UTF16ToString(mi.SzDevice[:]),
+				Bounds:       image.Rect(int(mi.RcMonitor.Left), int(mi.RcMonitor.Top), int(mi.RcMonitor.Right), int(mi.RcMonitor.Bottom)),
+				Work:         image.Rect(int(mi.RcWork.Left), int(mi.RcWork.Top), int(mi.RcWork.Right), int(mi.RcWork.Bottom)),
+				DPI:          dpi,
+				Scale:        float64(dpi) / 96.0,
+				Primary:      (mi.DwFlags & monitorPrimary) != 0,
+				SDRWhiteNits: 80.0,
 			})
 			return 1
 		})
 	})
 }
 
-// ListMonitors enumerates all active monitors with physical pixel rects and DPI.
+// ListMonitors enumerates all active monitors with physical pixel rects, DPI,
+// and Windows HDR / SDR white-level state.
 func ListMonitors() []Monitor {
 	initEnumMonitorsCB()
 	enumMonitorsMu.Lock()
@@ -160,6 +170,15 @@ func ListMonitors() []Monitor {
 	procEnumDisplayMonitors.Call(0, 0, enumMonitorsCB, 0)
 	enumMonitorsOut = nil
 	enumMonitorsMu.Unlock()
+
+	if hdrMap := queryMonitorsHDRInfo(); len(hdrMap) > 0 {
+		for i := range mons {
+			if info, ok := hdrMap[strings.ToUpper(mons[i].DeviceName)]; ok {
+				mons[i].HDREnabled = info.HDREnabled
+				mons[i].SDRWhiteNits = info.SDRWhiteNits
+			}
+		}
+	}
 	return mons
 }
 
@@ -248,6 +267,25 @@ func CaptureRect(rect image.Rectangle) (*image.RGBA, error) {
 	return dst, nil
 }
 
+// CaptureMonitor captures a single monitor at full physical resolution.
+// Monitors with Windows HDR enabled use DXGI Desktop Duplication (scRGB float16)
+// + SDR-faithful soft-shoulder tone mapping, falling back automatically to GDI
+// BitBlt if DXGI duplication is unavailable. SDR monitors stay on zero-overhead GDI.
+func CaptureMonitor(m Monitor) (MonitorCapture, error) {
+	if m.HDREnabled {
+		if hdrFrame, err := captureMonitorHDRDXGI(m); err == nil && hdrFrame != nil {
+			if sdr := ToneMapHDRToSDR(hdrFrame); sdr != nil {
+				return MonitorCapture{Monitor: m, Image: sdr, HDR: hdrFrame}, nil
+			}
+		}
+	}
+	img, err := CaptureRect(m.Bounds)
+	if err != nil {
+		return MonitorCapture{}, err
+	}
+	return MonitorCapture{Monitor: m, Image: img}, nil
+}
+
 // CaptureAllMonitors captures every active monitor in one pass.
 func CaptureAllMonitors() ([]MonitorCapture, error) {
 	mons := ListMonitors()
@@ -258,33 +296,34 @@ func CaptureAllMonitors() ([]MonitorCapture, error) {
 			return nil, err
 		}
 		return []MonitorCapture{{
-			Monitor: Monitor{Bounds: b, Work: b, DPI: 96, Scale: 1, Primary: true},
+			Monitor: Monitor{Bounds: b, Work: b, DPI: 96, Scale: 1, Primary: true, SDRWhiteNits: 80.0},
 			Image:   img,
 		}}, nil
 	}
 	out := make([]MonitorCapture, 0, len(mons))
 	for _, m := range mons {
-		img, err := CaptureRect(m.Bounds)
+		mc, err := CaptureMonitor(m)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, MonitorCapture{Monitor: m, Image: img})
+		out = append(out, mc)
 	}
 	return out, nil
 }
 
-// CapturePrimaryMonitor captures the primary display at full physical resolution.
+// CapturePrimaryMonitor captures the primary display at full physical resolution
+// (with automatic HDR tone mapping when HDR is enabled on the primary display).
 func CapturePrimaryMonitor() (*image.RGBA, Monitor, error) {
 	mons := ListMonitors()
 	for _, m := range mons {
 		if m.Primary {
-			img, err := CaptureRect(m.Bounds)
-			return img, m, err
+			mc, err := CaptureMonitor(m)
+			return mc.Image, m, err
 		}
 	}
 	b := VirtualDesktopBounds()
 	img, err := CaptureRect(b)
-	return img, Monitor{Bounds: b, Work: b, DPI: 96, Scale: 1, Primary: true}, err
+	return img, Monitor{Bounds: b, Work: b, DPI: 96, Scale: 1, Primary: true, SDRWhiteNits: 80.0}, err
 }
 
 // TrimWorkingSet asks Windows to trim idle pages from the current process's

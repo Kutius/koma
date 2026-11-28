@@ -1070,6 +1070,80 @@ func (a *App) SaveImageWithDialogPNG(img *image.RGBA, pngBytes []byte, parent *m
 	a.NotifyToast("已保存 " + filepath.Base(savePath))
 }
 
+// QuickSaveHDR encodes and writes a cropped HDRFrame directly into EffectiveSaveDir
+// as a lossless 16-bit BT.2020 PQ PNG (with cICP chunk) without a save dialog.
+func (a *App) QuickSaveHDR(hdr *winapi.HDRFrame) (string, error) {
+	if hdr == nil {
+		return "", fmt.Errorf("koma: nil HDR frame")
+	}
+	dir := a.EffectiveSaveDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	stamp := time.Now().Format("20060102_150405")
+	savePath := filepath.Join(dir, fmt.Sprintf("Koma_%s_HDR.png", stamp))
+	for i := 1; i < 100; i++ {
+		if _, err := os.Stat(savePath); os.IsNotExist(err) {
+			break
+		}
+		savePath = filepath.Join(dir, fmt.Sprintf("Koma_%s_HDR_%d.png", stamp, i))
+	}
+	encoded, err := winapi.EncodeHDRPNG(hdr, image.Rectangle{})
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(savePath, encoded, 0o644); err != nil {
+		return "", err
+	}
+	return savePath, nil
+}
+
+// SaveHDRPreferred saves a cropped HDRFrame as a lossless 16-bit BT.2020 PQ PNG
+// (silently when QuickSave is enabled, or via the native Save dialog otherwise).
+func (a *App) SaveHDRPreferred(hdr *winapi.HDRFrame, parent *mygo.Window) {
+	if hdr == nil {
+		return
+	}
+	if a.QuickSave() {
+		path, err := a.QuickSaveHDR(hdr)
+		if err != nil {
+			a.NotifyToast("HDR 原图快速保存失败")
+			return
+		}
+		a.NotifyToast("已保存无损 HDR 原图 " + filepath.Base(path))
+		return
+	}
+
+	defaultName := fmt.Sprintf("Koma_%s_HDR.png", time.Now().Format("20060102_150405"))
+	if dir := a.EffectiveSaveDir(); dir != "" {
+		defaultName = filepath.Join(dir, defaultName)
+	}
+	savePath, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
+		Parent:      parent,
+		Title:       "保存无损 HDR 原图",
+		DefaultPath: defaultName,
+		Filters: []mygo.FileFilter{
+			{Name: "HDR 无损图片 (16-bit PQ PNG)", Extensions: []string{"png"}},
+		},
+	})
+	if err != nil || savePath == "" {
+		return
+	}
+	if strings.ToLower(filepath.Ext(savePath)) != ".png" {
+		savePath += ".png"
+	}
+	encoded, err := winapi.EncodeHDRPNG(hdr, image.Rectangle{})
+	if err != nil {
+		a.NotifyToast("HDR 图片编码失败")
+		return
+	}
+	if err := os.WriteFile(savePath, encoded, 0o644); err != nil {
+		a.NotifyToast("写入文件失败")
+		return
+	}
+	a.NotifyToast("已保存无损 HDR 原图 " + filepath.Base(savePath))
+}
+
 // NotifyToast shows a calm floating Liquid Glass toast inside Studio, or falls
 // back to a transient global Liquid Glass HUD pill when Studio is closed in tray.
 func (a *App) NotifyToast(msg string) {

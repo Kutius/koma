@@ -204,6 +204,7 @@ func (p *overlayPane) releaseBuffers() {
 	p.loupeBmp = nil
 	p.selEffectBmp = nil
 	p.capture.Image = nil
+	p.capture.HDR = nil
 	p.localWins = nil
 	p.annotations = nil
 	p.undoStack = nil
@@ -1119,6 +1120,30 @@ func (p *overlayPane) commitSave(viewW, viewH float32) {
 	go app.SaveImagePreferred(finalImg, nil, nil)
 }
 
+func (p *overlayPane) commitSaveHDR(viewW, viewH float32) {
+	if p.capture.HDR == nil {
+		p.commitSave(viewW, viewH)
+		return
+	}
+	p.commitTextEdit()
+	r := p.selectionPxRect(viewW, viewH)
+	if r.Dx() < 2 || r.Dy() < 2 {
+		return
+	}
+	hdrCrop := p.capture.HDR.Crop(r)
+	if hdrCrop == nil {
+		p.commitSave(viewW, viewH)
+		return
+	}
+	sdrPreview := winapi.CropRGBA(p.capture.Image, r)
+	app := p.session.app
+	p.session.closeAll()
+	if sdrPreview != nil {
+		app.AddHistoryEntry(sdrPreview, "HDR 原图")
+	}
+	go app.SaveHDRPreferred(hdrCrop, nil)
+}
+
 func (p *overlayPane) commitOCR(viewW, viewH float32) {
 	p.commitTextEdit()
 	finalImg := p.renderFinalSelection(viewW, viewH)
@@ -1451,6 +1476,10 @@ func (p *overlayPane) view(c *ui.Context) {
 		}
 		if c.Shortcut(ui.Ctrl, ui.KeyS) {
 			p.commitSave(viewW, viewH)
+			return
+		}
+		if p.capture.HDR != nil && c.Shortcut(ui.Shift, ui.KeyS) && !c.FocusTakesText() {
+			p.commitSaveHDR(viewW, viewH)
 			return
 		}
 		if c.Shortcut(0, ui.KeyE) && !c.FocusTakesText() {
@@ -2518,6 +2547,28 @@ func (p *overlayPane) renderQQGlassToolbar(c *ui.Context, viewW, viewH float32) 
 		}
 		if glassToolBtn(c, inks, icons.Save, "保存", "保存 (Ctrl+S)", false, false) {
 			p.commitSave(viewW, viewH)
+		}
+		if p.capture.HDR != nil {
+			hdrBtn := ui.Row(c.Key("qq-save-hdr-btn")).
+				Height(28).Padding(0, 8, 0, 8).Margin(0, 2, 0, 2).
+				Radius(14).AlignItems(ui.Center).Shrink(0).
+				Role(ui.RoleButton).Label("保存 HDR 原图").
+				Cursor(ui.CursorPointer).
+				Tooltip("保存无损 16-bit HDR 原图 (BT.2020 PQ PNG · Shift+S)")
+			hFg := inks.Accent
+			if hdrBtn.Hovered() || hdrBtn.Pressed() {
+				hdrBtn.Background(inks.AccentFill).Border(1, inks.AccentBorder)
+			} else {
+				hdrBtn.Background(inks.AccentFill.Alpha(0.55)).Border(1, inks.AccentBorder.Alpha(0.75))
+			}
+			hdrBtn.Transition(ui.ElementTransition{Colors: true, Animation: &glasswork.AnimColorFade})
+			glasswork.ApplyLiquidButton(hdrBtn, glasswork.CompactButtonOpts())
+			hdrBtn.Children(func() {
+				ui.Text(c, "HDR").FontSize(11).FontWeight(700).TextColor(hFg).SingleLine().Shrink(0)
+			})
+			if hdrBtn.Clicked() {
+				p.commitSaveHDR(viewW, viewH)
+			}
 		}
 		if glassToolBtn(c, inks, icons.Close, "取消", "取消 (Esc)", false, true) {
 			p.session.closeAll()

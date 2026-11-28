@@ -126,21 +126,30 @@ func TestOverlayReleaseBuffersFreesCaptureAndLoupe(t *testing.T) {
 	a := New()
 	img := GenerateSampleCanvas()
 	ov := NewTestOverlayView(a, img, canvas.ToolPixelate)
+	hdrBuf := &winapi.HDRFrame{
+		Width:        16,
+		Height:       16,
+		SDRWhiteNits: 240,
+		Float16:      make([]uint16, 16*16*4),
+	}
+	ov.pane.capture.HDR = hdrBuf
 	tt := ui.NewTester(ov.View, 860, 520)
 	tt.Move(300, 200)
 	tt.Frame()
 
 	weakImg := weak.Make(img)
 	weakBmp := weak.Make(ov.pane.bmp)
+	weakHDR := weak.Make(hdrBuf)
 	img = nil
+	hdrBuf = nil
 
 	ov.pane.releaseBuffers()
 	tt = nil
 
 	runtime.GC()
 	runtime.GC()
-	if weakImg.Value() != nil || weakBmp.Value() != nil {
-		t.Fatalf("expected overlay capture image and bitmap to be garbage-collected after releaseBuffers")
+	if weakImg.Value() != nil || weakBmp.Value() != nil || weakHDR.Value() != nil {
+		t.Fatalf("expected overlay capture image, HDR frame, and bitmap to be garbage-collected after releaseBuffers")
 	}
 	runtime.KeepAlive(ov)
 }
